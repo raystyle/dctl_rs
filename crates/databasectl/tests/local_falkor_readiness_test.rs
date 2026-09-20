@@ -480,9 +480,20 @@ fn fresh_start_waits_for_authenticated_ping_then_succeeds() {
     let cmd: Vec<&str> = cmd.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(cmd.first(), Some(&"redis-cli"));
     assert!(cmd.contains(&"--no-auth-warning"));
-    assert!(cmd.contains(&"-a"));
     assert_eq!(cmd.last(), Some(&"ping"));
-    assert!(cmd.contains(&password), "probe carries the password");
+    // G3: authentication rides the exec env (REDISCLI_AUTH), never argv —
+    // argv would leak the password into the container's process listing.
+    assert!(
+        !cmd.contains(&"-a"),
+        "probe argv must not carry the password: {cmd:?}"
+    );
+    let exec_env = exec_body["Env"].as_array().expect("exec env array");
+    assert!(
+        exec_env
+            .iter()
+            .any(|e| e.as_str() == Some(&format!("REDISCLI_AUTH={password}"))),
+        "probe env carries the password: {exec_env:?}"
+    );
 
     // Slow Docker work (image inspect / pull) happens outside the metadata
     // lock; create and start are fast state mutations that hold it by design.

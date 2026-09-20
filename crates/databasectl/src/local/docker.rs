@@ -23,6 +23,10 @@ use std::error::Error as StdError;
 use std::io::{self, IsTerminal, Write};
 
 pub const LABEL_ENGINE: &str = "dctl.engine";
+/// Engine label values (G8: shared constants, so filter strings and label
+/// writes cannot drift apart).
+pub const ENGINE_POSTGRES: &str = "postgres";
+pub const ENGINE_FALKORDB: &str = "falkordb";
 pub const LABEL_NAME: &str = "dctl.name";
 pub const LABEL_MAJOR: &str = "dctl.major";
 pub const LABEL_PROJECT: &str = "dctl.project";
@@ -406,7 +410,7 @@ pub async fn create_postgres(docker: &Docker, opts: PostgresRunOpts<'_>) -> Resu
     env.extend(opts.extra_env);
 
     let mut labels: HashMap<String, String> = HashMap::new();
-    labels.insert(LABEL_ENGINE.into(), "postgres".into());
+    labels.insert(LABEL_ENGINE.into(), ENGINE_POSTGRES.into());
     labels.insert(LABEL_NAME.into(), opts.user_name.into());
     labels.insert(LABEL_MAJOR.into(), opts.major.into());
     labels.insert(LABEL_PROJECT.into(), opts.project_cwd.into());
@@ -523,7 +527,7 @@ pub async fn create_falkordb(docker: &Docker, opts: FalkorRunOpts<'_>) -> Result
     env.extend(opts.extra_env);
 
     let mut labels: HashMap<String, String> = HashMap::new();
-    labels.insert(LABEL_ENGINE.into(), "falkordb".into());
+    labels.insert(LABEL_ENGINE.into(), ENGINE_FALKORDB.into());
     labels.insert(LABEL_NAME.into(), opts.user_name.into());
     labels.insert(LABEL_MAJOR.into(), opts.version.into());
     labels.insert(LABEL_PROJECT.into(), opts.project_cwd.into());
@@ -566,10 +570,9 @@ pub async fn falkor_is_ready(docker: &Docker, id: &str, password: &str) -> Resul
                 cmd: Some(vec![
                     "redis-cli".to_string(),
                     "--no-auth-warning".to_string(),
-                    "-a".to_string(),
-                    password.to_string(),
                     "ping".to_string(),
                 ]),
+                env: Some(env_lines(redis_auth_env(password))),
                 ..Default::default()
             },
         )
@@ -833,6 +836,10 @@ pub struct DiscoveredContainer {
     pub major: String,
     pub image: String,
     pub host_port: Option<u16>,
+    /// Host port mapped to the engine's secondary container port when it has
+    /// one (FalkorDB's browser on 3000); None for Postgres and for stopped
+    /// containers (the list API omits published ports when not running).
+    pub browser_port: Option<u16>,
 }
 
 /// Find Postgres containers we created in `project_cwd`. Filtered on the
@@ -843,7 +850,7 @@ pub async fn list_project_postgres(
     docker: &Docker,
     project_cwd: &str,
 ) -> Result<Vec<DiscoveredContainer>> {
-    list_project_engine(docker, project_cwd, "postgres", 5432).await
+    list_project_engine(docker, project_cwd, ENGINE_POSTGRES, 5432).await
 }
 
 /// Find FalkorDB containers we created in `project_cwd`; same label contract
@@ -852,7 +859,7 @@ pub async fn list_project_falkor(
     docker: &Docker,
     project_cwd: &str,
 ) -> Result<Vec<DiscoveredContainer>> {
-    list_project_engine(docker, project_cwd, "falkordb", 6379).await
+    list_project_engine(docker, project_cwd, ENGINE_FALKORDB, 6379).await
 }
 
 async fn list_project_engine(
@@ -906,12 +913,23 @@ async fn list_project_engine(
                 .find(|p| p.private_port == protocol_port)
                 .and_then(|p| p.public_port)
         });
+        let browser_port = if engine == ENGINE_FALKORDB {
+            c.ports.as_ref().and_then(|ports| {
+                ports
+                    .iter()
+                    .find(|p| p.private_port == 3000)
+                    .and_then(|p| p.public_port)
+            })
+        } else {
+            None
+        };
         out.push(DiscoveredContainer {
             container_id: id,
             user_name,
             major,
             image,
             host_port,
+            browser_port,
         });
     }
     Ok(out)
@@ -927,19 +945,22 @@ pub async fn exec_psql_one_shot(
 ) -> Result<()> {
     let mut cmd = vec!["psql".to_string()];
     cmd.extend(psql_args.iter().cloned());
-    exec_command_one_shot(docker, container_id, cmd, reader).await
+    exec_command_one_shot(docker, container_id, cmd, Vec::new(), reader).await
 }
 
-/// Run `redis-cli` without a TTY, same streaming contract as the psql variant.
+/// Run `redis-cli` without a TTY, same streaming contract as the psql
+/// variant. `password` travels through the exec's REDISCLI_AUTH env, never
+/// through argv (visible in container process listings otherwise).
 pub async fn exec_redis_cli_one_shot(
     docker: &Docker,
     container_id: &str,
     cli_args: &[String],
+    password: &str,
     reader: Option<Box<dyn io::Read + Send>>,
 ) -> Result<()> {
     let mut cmd = vec!["redis-cli".to_string()];
     cmd.extend(cli_args.iter().cloned());
-    exec_command_one_shot(docker, container_id, cmd, reader).await
+    exec_command_one_shot(docker, container_id, cmd, redis_auth_env(password), reader).await
 }
 
 /// Run a command without a TTY, streaming an optional host input source into
@@ -948,6 +969,7 @@ async fn exec_command_one_shot(
     docker: &Docker,
     container_id: &str,
     cmd: Vec<String>,
+    env: Vec<(String, String)>,
     reader: Option<Box<dyn io::Read + Send>>,
 ) -> Result<()> {
     use bollard::exec::StartExecResults;
@@ -963,6 +985,7 @@ async fn exec_command_one_shot(
                 attach_stdin: Some(reader.is_some()),
                 tty: Some(false),
                 cmd: Some(cmd),
+                env: Some(env_lines(env)),
                 ..Default::default()
             },
         )
@@ -1083,25 +1106,43 @@ pub async fn exec_psql_in_container(
 ) -> Result<()> {
     let mut cmd = vec!["psql".to_string()];
     cmd.extend(psql_args.iter().cloned());
-    exec_command_tty(docker, container_id, cmd).await
+    exec_command_tty(docker, container_id, cmd, Vec::new()).await
 }
 
 /// Run `redis-cli` inside a container with a full interactive TTY; same
-/// contract as the psql variant.
+/// contract as the psql variant, with REDISCLI_AUTH carried in the exec env.
 pub async fn exec_redis_cli_in_container(
     docker: &Docker,
     container_id: &str,
     cli_args: &[String],
+    password: &str,
 ) -> Result<()> {
     let mut cmd = vec!["redis-cli".to_string()];
     cmd.extend(cli_args.iter().cloned());
-    exec_command_tty(docker, container_id, cmd).await
+    exec_command_tty(docker, container_id, cmd, redis_auth_env(password)).await
+}
+
+fn redis_auth_env(password: &str) -> Vec<(String, String)> {
+    vec![("REDISCLI_AUTH".to_string(), password.to_string())]
+}
+
+/// Exec env is a Vec of KEY=VALUE strings on the wire.
+fn env_lines(pairs: Vec<(String, String)>) -> Vec<String> {
+    pairs
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect()
 }
 
 /// Run a command inside a container with a full interactive TTY:
 /// host stdin/stdout are wired to the docker exec stream, the host terminal
 /// goes into raw mode, and SIGWINCH is forwarded as `resize_exec`.
-async fn exec_command_tty(docker: &Docker, container_id: &str, cmd: Vec<String>) -> Result<()> {
+async fn exec_command_tty(
+    docker: &Docker,
+    container_id: &str,
+    cmd: Vec<String>,
+    env: Vec<(String, String)>,
+) -> Result<()> {
     use bollard::exec::StartExecResults;
     use bollard::models::ExecConfig;
     use bollard::query_parameters::ResizeExecOptionsBuilder;
@@ -1117,6 +1158,7 @@ async fn exec_command_tty(docker: &Docker, container_id: &str, cmd: Vec<String>)
                 attach_stdin: Some(true),
                 tty: Some(true),
                 cmd: Some(cmd),
+                env: Some(env_lines(env)),
                 ..Default::default()
             },
         )
@@ -1460,7 +1502,11 @@ pub fn recover_project_falkor_blocking(
                 // Canonical stored form, matching what `start` writes, so a
                 // later resume parses the same tag (the raw image ref would).
                 version: format!("falkordb:v{}", c.major),
-                http_port: 0,
+                // The browser port rides http_port. The list API only reports
+                // published ports for running containers; a stopped container
+                // recovers 0 here and the next resume refreshes both ports
+                // from the container's port bindings.
+                http_port: c.browser_port.unwrap_or(0),
                 tcp_port: c.host_port.unwrap_or(0),
                 started_at: "recovered".to_string(),
                 cwd: cwd_owned.clone(),

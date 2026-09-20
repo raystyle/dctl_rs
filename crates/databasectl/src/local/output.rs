@@ -67,6 +67,8 @@ enum LocalErrorCode {
     /// A Postgres validation or state error whose text (and recovery
     /// guidance) dctl composes itself, rendered verbatim.
     PostgresError,
+    /// A FalkorDB validation or state error; text is dctl's own.
+    FalkorError,
     SqlInputOpenFailed,
     SqlInputReadFailed,
     /// A managed server metadata file contains invalid JSON. The structured
@@ -405,7 +407,9 @@ impl LocalErrorOutput {
             Error::PortInUse { kind, .. } | Error::PortUnavailable(kind) => {
                 Mapping::parity(LocalErrorCode::PortInUse).command(match kind {
                     PortKind::Postgres => "dctl local postgres start --help",
-                    PortKind::Falkordb => "dctl local falkordb start --help",
+                    PortKind::Falkordb | PortKind::FalkordbBrowser => {
+                        "dctl local falkordb start --help"
+                    }
                     PortKind::Http | PortKind::Tcp => "dctl local server start --help",
                 })
             }
@@ -483,7 +487,7 @@ impl LocalErrorOutput {
             Error::PostgresUsage(_) => Mapping::parity(LocalErrorCode::PostgresError),
 
             // ── falkordb ────────────────────────────────────────────────────
-            Error::FalkorUsage(_) => Mapping::parity(LocalErrorCode::PostgresError),
+            Error::FalkorUsage(_) => Mapping::parity(LocalErrorCode::FalkorError),
             Error::SqlInputOpen { .. } => Mapping::redacted(
                 LocalErrorCode::SqlInputOpenFailed,
                 "Could not open SQL input file; check that --queries-file exists and is readable",

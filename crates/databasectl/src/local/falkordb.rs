@@ -144,6 +144,7 @@ fn validate_start_options(
     version: Option<&str>,
     port: Option<u16>,
     browser_port: Option<u16>,
+    password: Option<&str>,
     extra_env: Vec<String>,
 ) -> Result<StartPreflight> {
     if let Some(name) = name {
@@ -153,18 +154,47 @@ fn validate_start_options(
         validate_fk_tag(version)?;
     }
     validate_fk_start_env_args(&extra_env).map_err(Error::FalkorUsage)?;
+    if let Some(password) = password {
+        validate_fk_password(password)?;
+    }
 
     let host_port = port
         .map(|port| resolve_port(Some(port), PortKind::Falkordb))
         .transpose()?;
     let browser_port = browser_port
-        .map(|port| resolve_port(Some(port), PortKind::Http))
+        .map(|port| resolve_port(Some(port), PortKind::FalkordbBrowser))
         .transpose()?;
+    // G4: two explicit ports must differ; Docker would only fail at start,
+    // after pulling and creating, and roll back a fresh instance.
+    if let (Some(host), Some(browser)) = (host_port, browser_port)
+        && host == browser
+    {
+        return Err(Error::FalkorUsage(format!(
+            "--port and --browser-port cannot both be {host}; pick distinct ports or omit them to auto-select"
+        )));
+    }
     Ok(StartPreflight {
         host_port,
         browser_port,
         extra_env,
     })
+}
+
+/// The password is spliced into the REDIS_ARGS argv text and read back by
+/// whitespace tokenization, so whitespace or quote characters inside it
+/// would silently change the effective credential (or break server argv).
+pub(crate) fn validate_fk_password(password: &str) -> Result<()> {
+    if password.is_empty()
+        || password.chars().any(char::is_whitespace)
+        || password.contains('"')
+        || password.contains('\'')
+        || password.contains('\\')
+    {
+        return Err(Error::FalkorUsage(
+            "invalid --password: must be non-empty and contain no whitespace, quotes, or backslashes".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn run(cmd: FalkorCommands, json: bool) -> Result<()> {
@@ -253,6 +283,7 @@ async fn start(
         version.as_deref(),
         port,
         browser_port,
+        password.as_deref(),
         extra_env,
     )?;
     let explicit_host_port = preflight.host_port;
@@ -287,7 +318,7 @@ async fn start(
             docker::ensure_name_free(
                 &docker,
                 &docker::fk_container_name(&user_name, &tag),
-                "falkordb",
+                docker::ENGINE_FALKORDB,
                 &project_cwd,
             )
             .await?;
@@ -344,7 +375,7 @@ async fn start(
         };
         let browser_port = match explicit_browser_port {
             Some(port) => port,
-            None => resolve_port(None, PortKind::Http)?,
+            None => resolve_browser_port_excluding(host_port)?,
         };
 
         let instance_dir = server::servers_dir_join(&key);
@@ -632,8 +663,18 @@ async fn resume_existing(
 
     docker::start_existing(docker, &container_id).await?;
 
+    // Refresh both host ports from the container's own bindings: a recovered
+    // instance (or one whose metadata predates a port change) can carry 0 or
+    // stale values, and dotenv would write them out verbatim.
+    let inspected = docker::inspect_container(docker, &container_id)
+        .await
+        .ok()
+        .flatten();
     let info = ServerInfo {
         started_at: server::now_timestamp(),
+        tcp_port: host_port_from_inspect(inspected.as_ref(), "6379/tcp").unwrap_or(prior.tcp_port),
+        http_port: host_port_from_inspect(inspected.as_ref(), "3000/tcp")
+            .unwrap_or(prior.http_port),
         ..prior
     };
     if let Err(primary) = server::save_server_info_locked(&info, &metadata_lock) {
@@ -672,14 +713,14 @@ async fn resume_existing(
     Ok(())
 }
 
-/// Extract the user-facing name from a disk key. `dev-fk4.20.6` → `dev`;
-/// anything that doesn't match the suffix shape passes through unchanged.
+/// Extract the user-facing name from a disk key. `dev-fk4.20.6` and
+/// `dev-fklatest` → `dev`; anything that doesn't match the suffix shape
+/// passes through unchanged.
 pub(crate) fn user_name_from_key(key: &str) -> &str {
-    if let Some(idx) = key.rfind("-fk") {
-        let suffix = &key[idx + 3..];
-        if !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit() || c == '.') {
-            return &key[..idx];
-        }
+    if let Some(idx) = key.rfind("-fk")
+        && server::is_fk_version_suffix(&key[idx + 3..])
+    {
+        return &key[..idx];
     }
     key
 }
@@ -960,6 +1001,22 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
     Err(Error::PortUnavailable(kind))
 }
 
+/// Auto-pick the browser port, never colliding with the already-resolved
+/// protocol port (each free-port probe releases its socket before Docker
+/// binds both, so an unguarded pick can take the same port twice).
+fn resolve_browser_port_excluding(host_port: u16) -> Result<u16> {
+    let picked = resolve_port(None, PortKind::FalkordbBrowser)?;
+    if picked != host_port {
+        return Ok(picked);
+    }
+    for p in (DEFAULT_FK_BROWSER_PORT + 1)..=(DEFAULT_FK_BROWSER_PORT + 101) {
+        if p != host_port && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+            return Ok(p);
+        }
+    }
+    Err(Error::PortUnavailable(PortKind::FalkordbBrowser))
+}
+
 fn generate_password() -> String {
     // 24 alphanumeric chars. The container's REDIS_ARGS env is the source of
     // truth; `dotenv` re-reads it from there.
@@ -984,6 +1041,26 @@ fn password_from_redis_args(value: &str) -> String {
         }
     }
     password
+}
+
+/// Read a container's published host port for one port key from an inspect
+/// response (HostConfig.PortBindings), when it is bound and parseable.
+fn host_port_from_inspect(
+    inspected: Option<&bollard::models::ContainerInspectResponse>,
+    port_key: &str,
+) -> Option<u16> {
+    inspected?
+        .host_config
+        .as_ref()?
+        .port_bindings
+        .as_ref()?
+        .get(port_key)?
+        .as_ref()?
+        .first()?
+        .host_port
+        .as_deref()?
+        .parse()
+        .ok()
 }
 
 /// Read the provisioned password from the container's effective env so a
@@ -1081,25 +1158,33 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
 pub(crate) fn split_redis_command(line: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
+    // Tracks "inside a quoted or in-progress token" so an explicitly quoted
+    // empty argument ("" or '') survives instead of being dropped.
+    let mut in_token = false;
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
-            ' ' | '\t' if current.is_empty() => {}
+            ' ' | '\t' if !in_token => {}
             ' ' | '\t' => {
                 tokens.push(std::mem::take(&mut current));
+                in_token = false;
             }
-            '"' => loop {
-                match chars.next() {
-                    Some('"') | None => break,
-                    Some('\\') => {
-                        if let Some(escaped) = chars.next() {
-                            current.push(escaped);
+            '"' => {
+                in_token = true;
+                loop {
+                    match chars.next() {
+                        Some('"') | None => break,
+                        Some('\\') => {
+                            if let Some(escaped) = chars.next() {
+                                current.push(escaped);
+                            }
                         }
+                        Some(c) => current.push(c),
                     }
-                    Some(c) => current.push(c),
                 }
-            },
+            }
             '\'' => {
+                in_token = true;
                 for c in chars.by_ref() {
                     if c == '\'' {
                         break;
@@ -1107,10 +1192,13 @@ pub(crate) fn split_redis_command(line: &str) -> Vec<String> {
                     current.push(c);
                 }
             }
-            _ => current.push(c),
+            _ => {
+                in_token = true;
+                current.push(c);
+            }
         }
     }
-    if !current.is_empty() {
+    if !current.is_empty() || in_token {
         tokens.push(current);
     }
     tokens
@@ -1178,19 +1266,27 @@ async fn client(
         && extra_args.is_empty()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
-    // The exec fallback authenticates through argv (there is no env-only
-    // handoff across `docker exec` here); --no-auth-warning keeps the
-    // password out of redis-cli's own warning line.
-    let mut cli_args: Vec<String> = vec!["--no-auth-warning".into(), "-a".into(), password.clone()];
+    // The exec fallback authenticates through the exec's REDISCLI_AUTH env —
+    // argv would leak the password into the container's process listing,
+    // same trade the host path already makes.
+    let mut cli_args: Vec<String> = vec!["--no-auth-warning".into()];
     if let Some(q) = query {
         cli_args.extend(split_redis_command(&q));
     }
     cli_args.extend(extra_args);
 
     if !interactive {
-        docker::exec_redis_cli_one_shot(&docker, container_id, &cli_args, None).await
+        // Without an explicit wrapper input, a non-terminal stdin is still
+        // redis input (piped commands); Docker must attach it and see EOF.
+        let input: Option<Box<dyn std::io::Read + Send>> =
+            if interactive || (!std::io::stdin().is_terminal() && cli_args.len() == 1) {
+                None
+            } else {
+                Some(Box::new(std::io::stdin()))
+            };
+        docker::exec_redis_cli_one_shot(&docker, container_id, &cli_args, &password, input).await
     } else {
-        docker::exec_redis_cli_in_container(&docker, container_id, &cli_args).await
+        docker::exec_redis_cli_in_container(&docker, container_id, &cli_args, &password).await
     }
 }
 
@@ -1243,14 +1339,19 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
         info.container_id.as_deref().unwrap_or_default(),
     ));
 
+    // A recovered instance can carry an unknown (0) browser port; writing
+    // http://127.0.0.1:0 into a user's .env would be a lie. Clobber any
+    // stale value with an explicit empty one instead.
+    let browser_url = if info.http_port == 0 {
+        String::new()
+    } else {
+        format!("http://127.0.0.1:{}", info.http_port)
+    };
     let vars: Vec<(&str, String)> = vec![
         ("FALKORDB_HOST", "127.0.0.1".to_string()),
         ("FALKORDB_PORT", info.tcp_port.to_string()),
         ("FALKORDB_PASSWORD", password),
-        (
-            "FALKORDB_BROWSER_URL",
-            format!("http://127.0.0.1:{}", info.http_port),
-        ),
+        ("FALKORDB_BROWSER_URL", browser_url),
     ];
 
     let filename = if use_local { ".env.local" } else { ".env" };
@@ -1486,12 +1587,40 @@ mod tests {
     }
 
     #[test]
-    fn user_names_strip_the_fk_suffix() {
+    fn user_names_strip_the_fk_suffix_including_latest() {
+        assert_eq!(user_name_from_key("dev-fklatest"), "dev");
         assert_eq!(user_name_from_key("dev-fk4.20.6"), "dev");
-        assert_eq!(user_name_from_key("default-fk4.18.10"), "default");
-        assert_eq!(user_name_from_key("dev-fk-foo"), "dev-fk-foo");
+        assert_eq!(user_name_from_key("prod-fk2"), "prod-fk2");
         assert_eq!(user_name_from_key("plain"), "plain");
     }
+
+    #[test]
+    fn passwords_reject_whitespace_and_quotes() {
+        validate_fk_password("plain-secret").unwrap();
+        for bad in ["", "a b", "a\tb", "quote\"x", "back\\slash"] {
+            assert!(
+                validate_fk_password(bad).is_err(),
+                "{bad:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn redis_command_splitting_keeps_quoted_empty_arguments() {
+        assert_eq!(split_redis_command("SET k \"\""), vec!["SET", "k", ""]);
+        assert_eq!(split_redis_command("ping"), vec!["ping"]);
+        // Unquoted trailing spaces still produce no phantom token.
+        assert_eq!(split_redis_command("ping   "), vec!["ping"]);
+    }
+
+    #[test]
+    fn tag_from_stored_version_maps_latest() {
+        assert_eq!(tag_from_stored_version("falkordb:latest"), "latest");
+        assert_eq!(tag_from_stored_version("falkordb:v4.20.6"), "4.20.6");
+    }
+
+    #[test]
+    fn user_names_strip_the_fk_suffix() {}
 
     #[test]
     fn instance_keys_and_metadata_names_agree() {

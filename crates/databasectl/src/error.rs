@@ -123,12 +123,15 @@ pub enum PortKind {
     Tcp,
     Postgres,
     Falkordb,
+    /// The FalkorDB Browser UI port (3000); a distinct kind so machine
+    /// envelopes point at `falkordb start --help`, not the ClickHouse hint.
+    FalkordbBrowser,
 }
 
 impl PortKind {
     fn human_guidance(self) -> &'static str {
         match self {
-            Self::Postgres | Self::Falkordb => {
+            Self::Postgres | Self::Falkordb | Self::FalkordbBrowser => {
                 "; choose another --port or omit --port to auto-select a free port"
             }
             Self::Http | Self::Tcp => "",
@@ -143,6 +146,7 @@ impl fmt::Display for PortKind {
             Self::Tcp => "TCP",
             Self::Postgres => "Postgres",
             Self::Falkordb => "FalkorDB",
+            Self::FalkordbBrowser => "FalkorDB Browser",
         })
     }
 }

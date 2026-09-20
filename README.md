@@ -1,6 +1,6 @@
 # dctl
 
-**dctl**(DataBase Control)是本地数据库服务器管理 CLI:以官方二进制管理 ClickHouse,以 Docker 容器管理 Postgres。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 部分,保留本地与 Docker 引擎生命周期作为核心。
+**dctl**(DataBase Control)是本地数据库服务器管理 CLI:以官方二进制管理 ClickHouse,以 Docker 容器管理 Postgres 与 FalkorDB 图数据库。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 部分,保留本地与 Docker 引擎生命周期作为核心。
 
 一条命令在项目目录里跑起数据库,无需手写配置:
 
@@ -45,7 +45,7 @@ $ cargo build --release -p databasectl
 
 `dctl update` 自更新到最新 GitHub release,`dctl update --check` 仅检查不安装。没有 crates.io、npm、PyPI 渠道;GitHub Releases 是唯一分发点。
 
-环境要求:Linux 或 macOS;Postgres 引擎需要 Docker;下载 ClickHouse 二进制需要能访问 builds.clickhouse.com 与 packages.clickhouse.com(产品下载源,与上游一致)。
+环境要求:Linux 或 macOS;Postgres 与 FalkorDB 引擎需要 Docker;下载 ClickHouse 二进制需要能访问 builds.clickhouse.com 与 packages.clickhouse.com(产品下载源,与上游一致)。
 
 ## 配置
 
@@ -82,7 +82,7 @@ $ dctl local remove 25.12       # 带守卫:拒绝删除使用中或默认版本
 ### ClickHouse 服务器
 
 ```console
-$ dctl local init                       # 脚手架 .dctl/、clickhouse/、postgres/ 目录
+$ dctl local init                       # 脚手架 .dctl/、clickhouse/、postgres/、falkordb/ 目录
 $ dctl local server start               # default 服务器,端口被占自动选空闲口
 $ dctl local server start dev --http-port 8333
 $ dctl local server status              # --global 可跨项目列出

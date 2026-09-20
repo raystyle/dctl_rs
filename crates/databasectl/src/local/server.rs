@@ -203,13 +203,21 @@ pub fn fk_instance_key(name: &str, version: &str) -> String {
     format!("{}-fk{}", name, version)
 }
 
+/// The version grammar of an fk instance-key suffix: a full `X.Y.Z` (the
+/// image publishes no major-only tags) or the literal `latest` (F1: both
+/// spellings must be first-class, or latest instances become invisible to
+/// discovery and a second start silently creates another container).
+pub(crate) fn is_fk_version_suffix(version: &str) -> bool {
+    version == "latest"
+        || version.split('.').count() == 3
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
 pub(crate) fn is_fk_instance_key(name: &str) -> bool {
-    name.rsplit_once("-fk").is_some_and(|(name, version)| {
-        !name.is_empty()
-            && !version.is_empty()
-            && version.chars().all(|c| c.is_ascii_digit() || c == '.')
-            && version.starts_with(|c: char| c.is_ascii_digit())
-    })
+    name.rsplit_once("-fk")
+        .is_some_and(|(name, version)| !name.is_empty() && is_fk_version_suffix(version))
 }
 
 /// Data directory for a FalkorDB instance.
@@ -261,10 +269,10 @@ pub(crate) fn find_fk_instances_locked(name: &str, lock: &MetadataLock) -> Resul
         if !stem.starts_with(&prefix) {
             continue;
         }
-        // Version must be digits and dots to match — guards against e.g.
-        // `dev-fk-foo` matching when `name = "dev"`.
+        // The suffix must be a full X.Y.Z or latest — guards against e.g.
+        // `dev-fk-foo` or a bare `prod-fk2` matching when `name = "dev"`.
         let version = &stem[prefix.len()..];
-        if version.is_empty() || !version.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        if !is_fk_version_suffix(version) {
             continue;
         }
         if let Some(info) = load_info_locked(stem, lock)?
@@ -1319,6 +1327,75 @@ pub fn ensure_stopped_by_pid(pid: u32) -> Result<()> {
     match kill_server_by_pid(pid) {
         Err(Error::ServerNotRunning(_)) => Ok(()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod fk_key_tests {
+    use super::*;
+
+    fn temp_lock() -> (tempfile::TempDir, MetadataLock) {
+        let dir = tempfile::tempdir().expect("temp servers dir");
+        let lock = MetadataLock::acquire_at(dir.path()).expect("acquire lock");
+        (dir, lock)
+    }
+
+    fn info(key: &str, engine: Engine) -> ServerInfo {
+        ServerInfo {
+            name: key.to_string(),
+            pid: 0,
+            version: format!(
+                "{}:v{}",
+                engine.as_str(),
+                key.rsplit("-fk").next().unwrap_or("")
+            ),
+            http_port: 0,
+            tcp_port: 6379,
+            started_at: "test".into(),
+            cwd: "/tmp".into(),
+            engine,
+            container_id: Some("cid".into()),
+        }
+    }
+
+    #[test]
+    fn fk_version_suffix_accepts_full_versions_and_latest_only() {
+        assert!(is_fk_version_suffix("4.20.6"));
+        assert!(is_fk_version_suffix("latest"));
+        // Bare numbers and partials are not fk keys (G8 tightening).
+        assert!(!is_fk_version_suffix("2"));
+        assert!(!is_fk_version_suffix("4.20"));
+        assert!(!is_fk_version_suffix(""));
+        assert!(!is_fk_version_suffix("4.20.6-alpine"));
+    }
+
+    #[test]
+    fn fk_instance_keys_cover_latest() {
+        assert!(is_fk_instance_key("default-fk4.20.6"));
+        assert!(is_fk_instance_key("default-fklatest"));
+        assert!(!is_fk_instance_key("default-fk"));
+        assert!(!is_fk_instance_key("prod-fk2"));
+        assert!(!is_fk_instance_key("plain"));
+    }
+
+    /// F1 regression: a `latest` instance must be discoverable by name, or a
+    /// second `start` silently creates another container under the default tag.
+    #[test]
+    fn find_fk_instances_returns_latest_instances() {
+        let (_dir, lock) = temp_lock();
+        save_server_info_locked(&info("default-fklatest", Engine::Falkordb), &lock).unwrap();
+        let found = find_fk_instances_locked("default", &lock).unwrap();
+        assert_eq!(found.len(), 1, "the latest instance must be found");
+        assert_eq!(found[0].name, "default-fklatest");
+        // A different name sees nothing.
+        assert!(find_fk_instances_locked("other", &lock).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fk_latest_does_not_masquerade_as_clickhouse_directory() {
+        // The CH legacy-name scan must keep excluding fk keys, latest included.
+        assert!(is_fk_instance_key("dev-fklatest"));
+        assert!(crate::local::falkordb::user_name_from_key("dev-fklatest") == "dev");
     }
 }
 

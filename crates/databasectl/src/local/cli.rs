@@ -173,10 +173,10 @@ impl LocalArgs {
 
 #[derive(Subcommand)]
 pub enum LocalCommands {
-    /// Install a ClickHouse version or Postgres image
+    /// Install a ClickHouse version or a database engine image
     #[command(after_help = INSTALL_AFTER_HELP)]
     Install {
-        /// Version ("latest", "stable", "lts", 25.12, 25.12.9.61) or image selector (postgres@18)
+        /// Version ("latest", "stable", "lts", 25.12, 25.12.9.61) or image selector (postgres@18, falkordb@4.20.6)
         version: InstallVersionArg,
 
         /// Re-install even if already installed
@@ -234,11 +234,11 @@ CONTEXT FOR AGENTS:
     /// Show the current default ClickHouse version
     Which,
 
-    /// Initialize a project directory for ClickHouse and Postgres
+    /// Initialize a project directory for ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  `.dctl/` holds runtime data and is git-ignored; the `clickhouse/` and `postgres/` SQL
-  scaffolds are meant to be committed.
+  `.dctl/` holds runtime data and is git-ignored; the `clickhouse/`, `postgres/` and
+  `falkordb/` scaffolds are meant to be committed.
   Idempotent — re-running only creates what is missing.
   Next: `dctl local server start`")]
     Init,
@@ -356,7 +356,7 @@ pub enum FalkorCommands {
     /// Start a FalkorDB instance
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Ports: 6379 (Redis protocol) and 3000 (Browser UI); both auto-pick when busy.
+  Ports: 6379 (Redis protocol) and 3000 (Browser UI); auto-picked when busy, never the same port.
   --query content is a redis command; quote the Cypher, e.g.
   `falkordb client -q 'GRAPH.QUERY g \"MATCH (n) RETURN n\"'`.
   FALKORDB_ARGS (module tuning) may be set with --env; REDIS_ARGS is managed.")]
@@ -660,7 +660,7 @@ CONTEXT FOR AGENTS:
         project: Option<String>,
     },
 
-    /// Stop all ClickHouse and Postgres servers in this project
+    /// Stop all servers of every engine in this project
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   ClickHouse processes get SIGTERM, then SIGKILL if they do not exit in time.")]
@@ -1072,6 +1072,44 @@ mod tests {
             &["client", "--host", "remote", "--version", "25.12.9.61.2"],
             expected,
         );
+    }
+
+    #[test]
+    fn falkordb_image_selectors_parse_for_install_only() {
+        let LocalCommands::Install {
+            version: InstallVersionArg::Falkordb(version),
+            ..
+        } = local_command(&["install", "falkordb@4.20.6"])
+        else {
+            panic!("expected Falkordb install version");
+        };
+        assert_eq!(version, "4.20.6");
+        let LocalCommands::Install {
+            version: InstallVersionArg::Falkordb(version),
+            ..
+        } = local_command(&["install", "falkordb:latest"])
+        else {
+            panic!("expected Falkordb install version for the colon form");
+        };
+        assert_eq!(version, "latest");
+
+        for rejected in [
+            &["use", "falkordb@4.20.6"][..],
+            &["server", "start", "--version", "falkordb@4.20.6"][..],
+            &["client", "--version", "falkordb:latest"][..],
+        ] {
+            let mut argv = vec!["dctl", "local"];
+            argv.extend(rejected.iter().copied());
+            let error = crate::cli::Cli::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("falkordb selector should be rejected: {rejected:?}"));
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            let message = error.to_string();
+            assert!(
+                message.contains("Docker image selectors"),
+                "{rejected:?}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -2072,7 +2110,7 @@ mod tests {
         assert_eq!(name.as_deref(), Some("warehouse"));
     }
 
-    fn instance_commands() -> [&'static [&'static str]; 10] {
+    fn instance_commands() -> [&'static [&'static str]; 15] {
         [
             &["server", "start"],
             &["server", "stop"],
@@ -2084,6 +2122,11 @@ mod tests {
             &["postgres", "remove"],
             &["postgres", "dotenv"],
             &["postgres", "client"],
+            &["falkordb", "start"],
+            &["falkordb", "stop"],
+            &["falkordb", "remove"],
+            &["falkordb", "dotenv"],
+            &["falkordb", "client"],
         ]
     }
 
@@ -2091,6 +2134,36 @@ mod tests {
         match command {
             LocalCommands::Client {
                 name, name_flag, ..
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Start {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Stop {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Remove {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Dotenv {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Client {
+                        name, name_flag, ..
+                    },
             }
             | LocalCommands::Server {
                 command:
