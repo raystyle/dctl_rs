@@ -2,7 +2,7 @@
 
 > 本文件 = 兄弟仓(hst_rs、reader_rs、ark_rs)ledger 集成实现与 dctl 的对照,产出对齐矩阵与行动清单;数据源为各仓源码一手抽查(2026-09-20),服务端契据为 ohmycloud workers/ledger/src/index.ts 与 codex 评审实证。结论供家族标准裁定,已对齐项与偏离项各留痕。
 
-## 家族共性(四仓一致,dctl 亦已达标)
+## 家族共性四仓一致,dctl 亦已达标
 
 - 签名道:v1 七行签名基(方法/路径/时间戳/nonce/幂等键/body-sha256)、五头、Ed25519 base64url、kid = sha256(紧凑字母序 JWK) [实证: hst ledger.rs:111-129、reader ledger.rs:136-138、ark ledger.rs:107-116、dctl sign.rs]
 - 事件体嵌套 payload:{type, body?, payload:{...}};close = result(payload:{digest}) 先行 + status(payload:{to:"done"}) 收尾 [实证: hst ledger.rs:423-449、reader ledger.rs:321-336、ark ledger.rs:338-364]
@@ -11,7 +11,7 @@
 - 读面免签、写面签名、401/409/429 归因文案
 - 命令帮助注明真源 ledger.ohmygh.com
 
-## 对齐矩阵(dctl 偏离项)
+## 对齐矩阵dctl 偏离项
 
 | 维度 | 家族(三仓) | dctl 现状 | 裁定 |
 | --- | --- | --- | --- |
@@ -22,7 +22,7 @@
 | 读面字段渲染 | 各仓自选 | 表格列 + 透传 JSON | 已达标(经 F2 修复) |
 | 翻页 | limit+before+has_more+count 语义 | 同 + more=1 | 已达标(经 F3 修复);more=1 为 dctl 补齐的服务端要求,家族或同 |
 
-## dctl 独有防御(正向超集,家族可反向吸收)
+## dctl 独有防御正向超集,家族可反向吸收
 
 - 写面路径含 query 本地拒绝(签名基只盖 pathname)
 - base_url 尾斜杠 trim

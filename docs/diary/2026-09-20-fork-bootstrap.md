@@ -73,7 +73,7 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - G3(b 案:从私钥推导 kid 并警告不匹配)与 G9(/events?since= 读面)记 backlog
 - 教训:对有真源的服务做集成,桩形状必须从服务端源码抄,不能从契约摘要想象:三高一全因虚构形状而全绿
 
-## 家族标准对齐轮(herdr-flywheel 纯讨论轮)
+## 家族标准对齐轮herdr-flywheel 纯讨论轮
 
 - 用户令「看其他项目如何实现的,形成标准对齐」;抽查 hst_rs/reader_rs/ark_rs 一手源码,成文 S002
 - 核心发现:hst 的 close 链确定性幂等键(sha256 锚 issue 号+类型+digest)是家族对 G4 半链问题的既证解法,dctl 应对齐
