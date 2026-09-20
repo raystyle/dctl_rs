@@ -108,14 +108,19 @@ pub struct RegisteredOutput {
 impl fmt::Display for RegisteredOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Real write responses: {"ok":true,"issue":<n>} for issues,
-        // {"ok":true,"artifact_id":...,"digest":...} for artifacts.
+        // {"ok":true,"artifact_id":...,"digest":...} for artifacts, and
+        // {"ok":true,"event":{seq,type}} for attestations.
         let issue = field(&self.registered, "issue");
         let artifact = field(&self.registered, "artifact_id");
+        let event_type = self.registered["event"]["type"].as_str();
+        let seq = field(&self.registered["event"], "seq");
         if issue != "-" {
             write!(f, "Opened issue {issue}")?;
         } else if artifact != "-" {
             let digest = field(&self.registered, "digest");
             write!(f, "Published artifact {artifact} ({digest})")?;
+        } else if let Some(event_type) = event_type {
+            write!(f, "Event posted: {event_type} (seq {seq})")?;
         } else {
             write!(f, "Registered")?;
         }
@@ -130,9 +135,14 @@ pub struct KeyEventOutput {
 
 impl fmt::Display for KeyEventOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Write responses nest the event: {"ok":true,"event":{seq,type}}.
         for value in &self.events {
-            let kind = field(value, "type");
-            writeln!(f, "Event posted: {kind}")?;
+            let kind = value["event"]["type"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| field(value, "type"));
+            let seq = field(&value["event"], "seq");
+            writeln!(f, "Event posted: {kind} (seq {seq})")?;
         }
         write!(f, "Issue closed")
     }

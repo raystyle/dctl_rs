@@ -42,9 +42,10 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
         .collect()
 }
 
-/// The complete set of headers for one signed POST. `path` is the URL path
-/// with query (the server signs over `url.pathname` — path only, no query;
-/// POST bodies carry everything, so signed writes use bare paths).
+/// The complete set of headers for one signed POST. `path` is the bare URL
+/// path: the server signs over `url.pathname` (path only, no query) and
+/// POST bodies carry everything, so signed writes never use query strings.
+#[derive(Debug)]
 pub(crate) struct SignedRequest {
     pub path: String,
     pub body: Vec<u8>,
@@ -62,6 +63,14 @@ pub(crate) fn sign_post(
     nonce: String,
     idempotency_key: String,
 ) -> Result<SignedRequest> {
+    // A query on a write path would be invisible to the signature base, so
+    // the server would reject a request this CLI believes it signed. Fail
+    // locally instead of misreporting it as timestamp drift.
+    if path.contains('?') {
+        return Err(Error::Ledger(format!(
+            "ledger write paths must not carry a query string: {path}"
+        )));
+    }
     let timestamp = timestamp.to_string();
     let body_hash = sha256_hex(&body);
     let base = signing_base(
@@ -218,6 +227,34 @@ mod tests {
             &wrong,
             signature
         ));
+    }
+
+    #[test]
+    fn write_paths_with_a_query_are_rejected_before_signing() {
+        let signing = ed25519_dalek::SigningKey::generate(&mut rand::rng());
+        let error = sign_post(
+            &signing,
+            "kid",
+            "POST",
+            "/repos/r/issues?x=1",
+            b"{}".to_vec(),
+            1700000000,
+            "n".into(),
+            "k".into(),
+        )
+        .expect_err("query on a write path must fail locally");
+        assert!(error.to_string().contains("query string"), "{error}");
+        sign_post(
+            &signing,
+            "kid",
+            "POST",
+            "/repos/r/issues",
+            b"{}".to_vec(),
+            1700000000,
+            "n".into(),
+            "k".into(),
+        )
+        .expect("bare paths still sign");
     }
 
     #[test]

@@ -68,9 +68,10 @@ pub(crate) fn load_signing_key() -> Result<SigningKey> {
         let path = std::path::PathBuf::from(text);
         let bytes = std::fs::read_to_string(&path).map_err(|source| {
             Error::Ledger(format!(
-                "could not read the ledger private key at {}: {source}. {}",
-                path.display(),
-                key_guidance()
+                "could not read the ledger private key at {}: {source}. Check the \
+                 DCTL_LEDGER_KEY path; the default archive lives at \
+                 ~/.dctl/ledger/dctl_rs.pem",
+                path.display()
             ))
         })?;
         return parse_pem(&bytes);
