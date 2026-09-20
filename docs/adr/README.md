@@ -9,3 +9,4 @@
 | ADR-0003 | accepted | telemetry 默认编译排除且上报端点置空 | 无 |
 | ADR-0004 | accepted | 分发只走 GitHub Releases | 无 |
 | ADR-0005 | accepted | 接入 FalkorDB 图数据库引擎,Docker 托管全功能镜像 | 无 |
+| ADR-0006 | accepted | 集成 ledger 公共账本,顶层 ledger 命令域与本地密档签名道 | 无 |
