@@ -78,3 +78,10 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 用户令「看其他项目如何实现的,形成标准对齐」;抽查 hst_rs/reader_rs/ark_rs 一手源码,成文 S002
 - 核心发现:hst 的 close 链确定性幂等键(sha256 锚 issue 号+类型+digest)是家族对 G4 半链问题的既证解法,dctl 应对齐
 - 保持项裁定:命令挂载(dctl 组式)、私钥形态(PEM)、表格渲染;三项 dctl 独有防御(query 拒绝、尾斜杠 trim、0600 警告)列为家族可反向吸收项
+
+## 确定性幂等键对齐单
+
+- PR #3 合入 main 后开工(deterministic-close-idem 分支):close 链两事件改锚定 (repo, issue, type, digest) 的确定性幂等键,半链重跑变幂等回放(S002 建议项落地)
+- signed_post_with_idem 增固定键通道;wiremock 套件钉 64 位 hex 键形;close 帮助文案改 replay 语义
+- 语义边界留痕(codex G3):确定性键锚 (repo, issue, type, digest),同 issue 同 digest 再关一次会回放不落新痕;当前服务端只增无改模型下合理,要留新痕须换 digest
+- G1 采纳:wiremock 补端到端回放断言(同 close 跑两次,键对逐位相等);G2 采纳:409 文案分场景 + close CONTEXT 补 --note 复用纪律

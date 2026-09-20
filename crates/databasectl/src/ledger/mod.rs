@@ -88,9 +88,19 @@ async fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
             }
             let done = json!({"type": "status", "payload": {"to": "done"}});
             // Ordered chain per the contract: done is only accepted on top of
-            // a result event referencing a registered digest.
-            let first = client::signed_post(&events_path(&number), result).await?;
-            let second = client::signed_post(&events_path(&number), done).await?;
+            // a result event referencing a registered digest. Both events
+            // carry deterministic idempotency keys anchored on (issue, type,
+            // digest): a rerun after a half-completed close replays both
+            // events instead of appending duplicates (S002, family standard
+            // from hst_rs).
+            let result_idem = deterministic_event_idem(&number, "result", &digest);
+            let status_idem = deterministic_event_idem(&number, "status", &digest);
+            let first =
+                client::signed_post_with_idem(&events_path(&number), result, Some(&result_idem))
+                    .await?;
+            let second =
+                client::signed_post_with_idem(&events_path(&number), done, Some(&status_idem))
+                    .await?;
             output::print(
                 &output::KeyEventOutput {
                     events: vec![first, second],
@@ -253,6 +263,26 @@ impl std::fmt::Display for ArtifactListOutputShim {
     }
 }
 
+/// Deterministic idempotency key for a close-chain event: the same
+/// (issue, event type, digest) triple always maps to the same key, so
+/// reruns replay instead of duplicating.
+fn deterministic_event_idem(number: &str, event_type: &str, digest: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(format!(
+        "{}-issue-{}-{}-{}",
+        keys::REPO_ID,
+        number,
+        event_type,
+        digest
+    ));
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 fn issues_path() -> String {
     format!("/repos/{}/issues", keys::REPO_ID)
 }
@@ -267,4 +297,21 @@ fn artifacts_path() -> String {
 
 fn attestations_path(id: &str) -> String {
     format!("/repos/{}/artifacts/{}/attestations", keys::REPO_ID, id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn close_chain_idempotency_keys_are_deterministic_and_distinct() {
+        let result = deterministic_event_idem("3", "result", "sha256:aa");
+        let status = deterministic_event_idem("3", "status", "sha256:aa");
+        assert_eq!(result.len(), 64);
+        assert_ne!(result, status, "the two chain events must not share a key");
+        // Same triple replays; any varying component mints a new key.
+        assert_eq!(result, deterministic_event_idem("3", "result", "sha256:aa"));
+        assert_ne!(result, deterministic_event_idem("4", "result", "sha256:aa"));
+        assert_ne!(result, deterministic_event_idem("3", "result", "sha256:bb"));
+    }
 }

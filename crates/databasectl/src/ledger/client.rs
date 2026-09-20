@@ -129,13 +129,27 @@ pub(crate) async fn list_artifacts(
     })
 }
 
-/// A signed POST write. Idempotency key and nonce are minted per call;
-/// the same key with different content would be a 409 (server-side rule —
-/// the CLI never reuses a key).
+/// A signed POST write with a fresh idempotency key; the same key with
+/// different content would be a 409 (server-side rule — the CLI never
+/// reuses a key).
 pub(crate) async fn signed_post(path: &str, body: serde_json::Value) -> Result<Json> {
+    signed_post_with_idem(path, body, None).await
+}
+
+/// A signed POST write. `fixed_idem` pins the idempotency key: re-running
+/// the same logical write replays the original event instead of appending
+/// a duplicate (the close chain uses this; family standard, S002).
+pub(crate) async fn signed_post_with_idem(
+    path: &str,
+    body: serde_json::Value,
+    fixed_idem: Option<&str>,
+) -> Result<Json> {
     let key = keys::load_signing_key()?;
     let kid = keys::key_id();
     let body_bytes = serde_json::to_vec(&body)?;
+    let idem = fixed_idem
+        .map(str::to_string)
+        .unwrap_or_else(sign::new_idempotency_key);
     let signed = sign::sign_post(
         &key,
         &kid,
@@ -144,7 +158,7 @@ pub(crate) async fn signed_post(path: &str, body: serde_json::Value) -> Result<J
         body_bytes,
         sign::unix_timestamp(),
         sign::new_nonce(),
-        sign::new_idempotency_key(),
+        idem,
     )?;
 
     let client = crate::http::client_builder()
@@ -173,7 +187,9 @@ fn api_error(status: u16, body: &str) -> Error {
         401 => {
             " (X-Timestamp drift, or the private key is not the pair of the built-in kid — the server verifies X-Key-Id against the registered public key; see `dctl ledger key`)"
         }
-        409 => " (idempotency key collision with different content; rerun to mint a fresh key)",
+        409 => {
+            " (same idempotency key with different content: fresh-key writes can be rerun as-is; deterministic-key writes like issue close must reuse the original content, e.g. the same --note or none)"
+        }
         429 => " (per-key daily quota reached; writes resume next UTC day)",
         _ => "",
     };

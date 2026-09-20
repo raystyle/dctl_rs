@@ -237,7 +237,9 @@ async fn issue_close_posts_result_then_status_done_in_order() {
     // parsePayload requires an object (or absent) — neither may be null.
     assert!(first["payload"].is_object());
     assert!(second["payload"].is_object());
-    // Each write mints its own idempotency key.
+    // Deterministic chain keys: distinct per event type, and a rerun of the
+    // same close would send the same pair (server replays instead of
+    // appending duplicates).
     let key = |request: &wiremock::Request| {
         request
             .headers
@@ -246,6 +248,9 @@ async fn issue_close_posts_result_then_status_done_in_order() {
             .unwrap_or_default()
     };
     assert_ne!(key(&requests[0]), key(&requests[1]));
+    for request in &requests {
+        assert_eq!(key(request).len(), 64, "sha256 hex key: {}", key(request));
+    }
 }
 
 #[tokio::test]
@@ -354,7 +359,10 @@ async fn artifact_publish_carries_metadata_and_409_surfaces_hint() {
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("409"), "{stderr}");
-    assert!(stderr.contains("idempotency key collision"), "{stderr}");
+    assert!(
+        stderr.contains("same idempotency key with different content"),
+        "{stderr}"
+    );
 
     let requests = sandbox.mock.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -389,4 +397,56 @@ fn expected_kid() -> String {
     sha256_hex(
         br#"{"crv":"Ed25519","kty":"OKP","x":"pTGDDfC8KyzxMbEVcJieS8wddmF4S7XgCT8eWsx_wWE"}"#,
     )
+}
+
+#[tokio::test]
+async fn rerunning_a_close_replays_the_same_key_pair() {
+    let sandbox = sandbox().await;
+    let events_path = format!("{ISSUES_PATH}/5/events");
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path(&events_path))
+        .respond_with(
+            wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "ok": true, "event": {"seq": 9},
+            })),
+        )
+        .mount(&sandbox.mock)
+        .await;
+
+    let digest = format!("sha256:{}", "d".repeat(64));
+    let first = sandbox.run(&[
+        "ledger", "--json", "issue", "close", "5", "--digest", &digest,
+    ]);
+    assert!(
+        first.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = sandbox.run(&[
+        "ledger", "--json", "issue", "close", "5", "--digest", &digest,
+    ]);
+    assert!(
+        second.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    // The rerun must send the exact same idempotency-key pair (in order):
+    // replay, not duplicate.
+    let keys = |requests: &[wiremock::Request]| {
+        requests
+            .iter()
+            .map(|request| {
+                request
+                    .headers
+                    .get("idempotency-key")
+                    .map(|value| value.to_str().unwrap_or_default().to_string())
+                    .unwrap_or_default()
+            })
+            .collect::<Vec<_>>()
+    };
+    let requests = sandbox.mock.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4, "two closes of two events each");
+    assert_eq!(keys(&requests[0..2]), keys(&requests[2..4]));
+    assert_ne!(keys(&requests[0..1]), keys(&requests[1..2]));
 }

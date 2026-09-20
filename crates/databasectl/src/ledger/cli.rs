@@ -22,8 +22,8 @@ CONTEXT FOR AGENTS:
   only a carrier for the SAME keypair as the built-in kid — swapping in a
   different key fails verification until the new public JWK ships in the CLI).
   `issue close` posts result (digest reference) then status=done; the done event
-  is what closes. If a close fails halfway, rerunning appends another result
-  event — harmless, but the issue stays open until done lands.
+  is what closes. Deterministic idempotency keys make reruns replay, not
+  duplicate — the issue stays open until done lands.
   Typical flow: `ledger issue new` -> work -> `ledger artifact publish` -> `ledger issue close --digest <digest>`.")]
     Issue {
         #[command(subcommand)]
@@ -89,9 +89,11 @@ pub enum IssueCommands {
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Posts a result event referencing the digest, then a status=done event — done
-  is what closes the issue. No chain-level idempotency: rerunning after a
-  partial failure appends another result event (append-only ledger).
-  Publish the artifact first (`ledger artifact publish`) and paste its digest.")]
+  is what closes the issue. Both events carry deterministic idempotency keys:
+  rerunning after a partial failure replays both events instead of appending
+  duplicates. Retrying with the same digest must reuse the same --note (or
+  none) — a different note is different content under the same key (409).
+  Publish the artifact first (`ledger artifact publish`).")]
     Close {
         /// Issue number
         number: String,
