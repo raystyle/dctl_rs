@@ -93,6 +93,45 @@ $ dctl local client [-q 'SELECT 1']     # exec 匹配的 clickhouse-client
 
 start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置叠加到托管服务器配置上。孤儿服务器(在项目里启动过但元数据被移动)通过进程 cwd 扫描被发现。
 
+### init 后的项目目录结构
+
+`dctl local init` 在当前目录创建以下结构(幂等,已有则跳过):
+
+```text
+<project>/
+├── .dctl/                  # 运行时状态(gitignore 自动写入,不入库)
+│   ├── .gitignore          # 内容恒为 *,忽略整个 .dctl/
+│   ├── credentials.json    # ledger 凭据(有写操作时生成)
+│   └── servers/            # 各服务器实例元数据与数据
+│       ├── default.json    # ClickHouse 服务器元数据(名称/PID/端口/版本)
+│       ├── default/        # ClickHouse 服务器数据目录
+│       │   └── data/
+│       ├── default-pg18.json   # Postgres 实例元数据
+│       ├── default-pg18/
+│       │   └── data/       # Postgres 数据(bind mount 到容器)
+│       ├── default-fk4.20.6.json  # FalkorDB 实例元数据
+│       └── default-fk4.20.6/
+│           └── data/       # FalkorDB 数据(bind mount 到容器)
+├── clickhouse/             # ClickHouse SQL 脚手架(可提交)
+│   ├── tables/
+│   ├── materialized_views/
+│   ├── queries/
+│   └── seed/
+├── postgres/               # Postgres SQL 脚手架(可提交)
+│   ├── tables/
+│   ├── views/
+│   ├── functions/
+│   ├── queries/
+│   └── seed/
+└── falkordb/               # FalkorDB Cypher 脚手架(可提交)
+    ├── queries/
+    └── seed/
+```
+
+**入库规则**:`clickhouse/`、`postgres/`、`falkordb/` 是你项目的 SQL/Cypher 脚手架,随代码提交;`.dctl/` 是运行时状态(服务器数据、元数据、凭据),`init` 自动写入 `.dctl/.gitignore`(内容为 `*`)确保整目录不入库。
+
+**多实例命名**:同一名字可有多版本实例(如 `default-pg18` 与 `default-pg17` 并存),元数据文件名 = `<name>-<engine><version>`;`stop`/`remove` 不带 `--version` 时,单实例直接选中,多实例报错要求指定。
+
 ### Postgres 与 Docker
 
 ```console

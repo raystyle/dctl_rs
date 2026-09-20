@@ -20,6 +20,29 @@ fn command(project: &Path, home: &Path) -> Command {
     command
 }
 
+/// Two free loopback ports, for pinning `server start` away from the host
+/// defaults (8123/9000): a busy default makes the CLI auto-assign and print
+/// an extra note line that breaks the exact-stderr assertions in this suite.
+fn free_port_pair() -> (u16, u16) {
+    let http = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve http port")
+        .local_addr()
+        .expect("http addr")
+        .port();
+    let tcp = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .expect("reserve tcp port")
+        .local_addr()
+        .expect("tcp addr")
+        .port();
+    (http, tcp)
+}
+
+/// Suite-wide pinned ports, reserved once on first use.
+static HTTP_PORT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| free_port_pair().0.to_string());
+static TCP_PORT: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| free_port_pair().1.to_string());
+
 fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
     command(project, home)
         .args(args)
@@ -241,6 +264,10 @@ fn version_port_and_startup_failures_have_typed_safe_shapes() {
             "--json",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--no-wait",
@@ -324,6 +351,10 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "--json",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--config",
@@ -349,6 +380,10 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "local",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--config",
@@ -372,6 +407,10 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "--json",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--config",
@@ -396,6 +435,10 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "--json",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--",
@@ -487,6 +530,10 @@ fn foreground_child_exit_is_not_wrapped_as_a_local_error() {
             "--json",
             "server",
             "start",
+            "--http-port",
+            &HTTP_PORT,
+            "--tcp-port",
+            &TCP_PORT,
             "--version",
             VERSION,
             "--foreground",
