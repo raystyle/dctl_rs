@@ -1178,7 +1178,10 @@ async fn client(
         && extra_args.is_empty()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
-    let mut cli_args: Vec<String> = Vec::new();
+    // The exec fallback authenticates through argv (there is no env-only
+    // handoff across `docker exec` here); --no-auth-warning keeps the
+    // password out of redis-cli's own warning line.
+    let mut cli_args: Vec<String> = vec!["--no-auth-warning".into(), "-a".into(), password.clone()];
     if let Some(q) = query {
         cli_args.extend(split_redis_command(&q));
     }

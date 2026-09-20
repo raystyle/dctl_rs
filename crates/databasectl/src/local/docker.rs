@@ -1457,7 +1457,9 @@ pub fn recover_project_falkor_blocking(
             let info = ServerInfo {
                 name: key,
                 pid: 0,
-                version: c.image.clone(),
+                // Canonical stored form, matching what `start` writes, so a
+                // later resume parses the same tag (the raw image ref would).
+                version: format!("falkordb:v{}", c.major),
                 http_port: 0,
                 tcp_port: c.host_port.unwrap_or(0),
                 started_at: "recovered".to_string(),
