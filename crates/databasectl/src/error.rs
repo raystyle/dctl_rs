@@ -122,12 +122,18 @@ pub enum PortKind {
     Http,
     Tcp,
     Postgres,
+    Falkordb,
+    /// The FalkorDB Browser UI port (3000); a distinct kind so machine
+    /// envelopes point at `falkordb start --help`, not the ClickHouse hint.
+    FalkordbBrowser,
 }
 
 impl PortKind {
     fn human_guidance(self) -> &'static str {
         match self {
-            Self::Postgres => "; choose another --port or omit --port to auto-select a free port",
+            Self::Postgres | Self::Falkordb | Self::FalkordbBrowser => {
+                "; choose another --port or omit --port to auto-select a free port"
+            }
             Self::Http | Self::Tcp => "",
         }
     }
@@ -139,6 +145,8 @@ impl fmt::Display for PortKind {
             Self::Http => "HTTP",
             Self::Tcp => "TCP",
             Self::Postgres => "Postgres",
+            Self::Falkordb => "FalkorDB",
+            Self::FalkordbBrowser => "FalkorDB Browser",
         })
     }
 }
@@ -147,6 +155,7 @@ impl fmt::Display for PortKind {
 pub enum StartupKind {
     ClickHouse,
     Postgres,
+    Falkordb,
 }
 
 impl fmt::Display for StartupKind {
@@ -154,6 +163,7 @@ impl fmt::Display for StartupKind {
         f.write_str(match self {
             Self::ClickHouse => "ClickHouse",
             Self::Postgres => "Postgres",
+            Self::Falkordb => "FalkorDB",
         })
     }
 }
@@ -569,6 +579,12 @@ pub enum Error {
     #[error("Postgres error: {0}")]
     PostgresUsage(String),
 
+    /// A FalkorDB validation or state error whose text dctl composes
+    /// itself, including its recovery guidance; rendered verbatim in
+    /// structured output, like [`Error::PostgresUsage`].
+    #[error("FalkorDB error: {0}")]
+    FalkorUsage(String),
+
     /// A child process whose status must be returned unchanged. This is
     /// intentionally not printed as a dctl error by `run_parsed`.
     #[error("child process exited with code {0}")]
@@ -720,6 +736,13 @@ pub enum Error {
 
     #[error("{primary}\nPostgres startup rollback incomplete: {cleanup}")]
     PostgresStartupRollback {
+        #[source]
+        primary: Box<Error>,
+        cleanup: String,
+    },
+
+    #[error("{primary}\nFalkorDB startup rollback incomplete: {cleanup}")]
+    FalkorStartupRollback {
         #[source]
         primary: Box<Error>,
         cleanup: String,

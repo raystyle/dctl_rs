@@ -12,12 +12,20 @@ const INSTALL_AFTER_HELP: &str = "\
 CONTEXT FOR AGENTS:
   The first ClickHouse version installed becomes the default; later installs do not change it.
   `dctl local use <version>` auto-installs a missing version and sets it as default.
-  `postgres@<tag>` pulls a Docker image instead (needs Docker running) and never sets a default.";
+  `postgres@<tag>` and `falkordb@<version>` pull Docker images instead (needs Docker running)
+  and never set a default.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallVersionArg {
     ClickHouse(VersionSpec),
     Postgres(String),
+    Falkordb(String),
+}
+
+fn is_image_selector(input: &str) -> bool {
+    ["postgres@", "postgres:", "falkordb@", "falkordb:"]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
 }
 
 impl FromStr for InstallVersionArg {
@@ -30,6 +38,12 @@ impl FromStr for InstallVersionArg {
             .or_else(|| input.strip_prefix("postgres:"))
         {
             return Ok(Self::Postgres(tag.to_string()));
+        }
+        if let Some(version) = input
+            .strip_prefix("falkordb@")
+            .or_else(|| input.strip_prefix("falkordb:"))
+        {
+            return Ok(Self::Falkordb(version.to_string()));
         }
 
         version_manager::parse_version_spec(input)
@@ -53,9 +67,9 @@ impl FromStr for UseVersionArg {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let input = input.trim();
-        if input.starts_with("postgres@") || input.starts_with("postgres:") {
+        if is_image_selector(input) {
             return Err(
-                "Postgres image selectors are only supported by `local install`; `local use` requires a ClickHouse version"
+                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local use` requires a ClickHouse version"
                     .to_string(),
             );
         }
@@ -81,9 +95,9 @@ impl FromStr for ServerVersionArg {
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
         let input = input.trim();
-        if input.starts_with("postgres@") || input.starts_with("postgres:") {
+        if is_image_selector(input) {
             return Err(
-                "Postgres image selectors are only supported by `local install`; `local server start --version` requires a ClickHouse version"
+                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local server start --version` requires a ClickHouse version"
                     .to_string(),
             );
         }
@@ -107,9 +121,9 @@ impl FromStr for ClientVersionArg {
     type Err = String;
 
     fn from_str(input: &str) -> Result<Self, Self::Err> {
-        if input.starts_with("postgres@") || input.starts_with("postgres:") {
+        if is_image_selector(input) {
             return Err(
-                "Postgres image selectors are only supported by `local install`; `local client --version` requires an installed ClickHouse version"
+                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local client --version` requires an installed ClickHouse version"
                     .to_string(),
             );
         }
@@ -145,14 +159,24 @@ impl LocalArgs {
         };
         crate::local::postgres::validate_pg_start_env_args(password.as_deref(), env).err()
     }
+
+    pub(crate) fn falkor_start_validation_error(&self) -> Option<String> {
+        let LocalCommands::Falkordb {
+            command: FalkorCommands::Start { env, .. },
+        } = &self.command
+        else {
+            return None;
+        };
+        crate::local::falkordb::validate_fk_start_env_args(env).err()
+    }
 }
 
 #[derive(Subcommand)]
 pub enum LocalCommands {
-    /// Install a ClickHouse version or Postgres image
+    /// Install a ClickHouse version or a database engine image
     #[command(after_help = INSTALL_AFTER_HELP)]
     Install {
-        /// Version ("latest", "stable", "lts", 25.12, 25.12.9.61) or image selector (postgres@18)
+        /// Version ("latest", "stable", "lts", 25.12, 25.12.9.61) or image selector (postgres@18, falkordb@4.20.6)
         version: InstallVersionArg,
 
         /// Re-install even if already installed
@@ -210,11 +234,11 @@ CONTEXT FOR AGENTS:
     /// Show the current default ClickHouse version
     Which,
 
-    /// Initialize a project directory for ClickHouse and Postgres
+    /// Initialize a project directory for ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  `.dctl/` holds runtime data and is git-ignored; the `clickhouse/` and `postgres/` SQL
-  scaffolds are meant to be committed.
+  `.dctl/` holds runtime data and is git-ignored; the `clickhouse/`, `postgres/` and
+  `falkordb/` scaffolds are meant to be committed.
   Idempotent — re-running only creates what is missing.
   Next: `dctl local server start`")]
     Init,
@@ -287,8 +311,8 @@ CONTEXT FOR AGENTS:
     /// Manage local server instances
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  `list` and `stop-all` cover ClickHouse and Docker-backed Postgres; other subcommands are
-  ClickHouse-only.
+  `list` and `stop-all` cover ClickHouse and Docker-backed Postgres/FalkorDB; other subcommands
+  are ClickHouse-only.
   Data persists across stop/start; only `remove` deletes it.
   Retain the name `start` returns (it may be generated) for later `stop`/`remove`.
   `local remove <version>` deletes an installed binary, not server data.
@@ -310,6 +334,219 @@ CONTEXT FOR AGENTS:
     Postgres {
         #[command(subcommand)]
         command: PostgresCommands,
+    },
+
+    /// Manage local FalkorDB graph instances (Docker-backed)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  FalkorDB is a Redis-module graph database; queries are openCypher via GRAPH.QUERY.
+  An existing stopped instance for the same (name, version) is resumed with its stored password;
+  --port/--browser-port/--password/-e are ignored on a resume.
+  Without --version, an existing instance selects the version; two versions under one name error.
+  The generated password is printed once by start — re-read it later with `falkordb dotenv`.
+  A failed fresh start rolls back the container and data it created; pre-existing data is kept.")]
+    Falkordb {
+        #[command(subcommand)]
+        command: FalkorCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum FalkorCommands {
+    /// Start a FalkorDB instance
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Ports: 6379 (Redis protocol) and 3000 (Browser UI); auto-picked when busy, never the same port.
+  --query content is a redis command; quote the Cypher, e.g.
+  `falkordb client -q 'GRAPH.QUERY g \"MATCH (n) RETURN n\"'`.
+  FALKORDB_ARGS (module tuning) may be set with --env; REDIS_ARGS is managed.")]
+    Start {
+        /// Server name (default: "default", or random if default is already running)
+        #[arg(value_name = "NAME", conflicts_with = "name_flag", value_parser = parse_server_name_arg)]
+        name: Option<String>,
+
+        /// Compatibility form for the instance name; prefer positional NAME
+        #[arg(
+            long = "name",
+            value_name = "NAME",
+            conflicts_with = "name",
+            hide = true,
+            value_parser = parse_server_name_arg
+        )]
+        name_flag: Option<String>,
+
+        /// FalkorDB version, full X.Y.Z (e.g. 4.20.6) or latest. Default: 4.20.6
+        ///
+        /// Pulls the image if it is not present locally.
+        #[arg(long, short = 'v', value_parser = crate::local::falkordb::parse_fk_tag_arg)]
+        version: Option<String>,
+
+        /// Host TCP port for the Redis protocol; when omitted, 6379 if free else auto-selected
+        ///
+        /// An explicitly requested port that is already in use is rejected.
+        #[arg(long, value_parser = crate::local::falkordb::parse_fk_port_arg)]
+        port: Option<u16>,
+
+        /// Host TCP port for the Browser UI; when omitted, 3000 if free else auto-selected
+        #[arg(long, value_parser = crate::local::falkordb::parse_fk_port_arg)]
+        browser_port: Option<u16>,
+
+        /// Redis password (default: random 24-char alphanumeric)
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Extra container env vars; repeatable, each key at most once
+        ///
+        /// REDIS_ARGS is managed and rejected here — use --password. FALKORDB_ARGS
+        /// (module tuning) is accepted.
+        #[arg(
+            short = 'e',
+            long = "env",
+            value_name = "KEY=VALUE",
+            value_parser = crate::local::falkordb::parse_fk_env_arg
+        )]
+        env: Vec<String>,
+
+        /// Seconds to wait for FalkorDB readiness (maximum: 600)
+        #[arg(
+            long,
+            default_value_t = 60,
+            value_parser = clap::value_parser!(u16).range(1..=600)
+        )]
+        wait_timeout: u16,
+    },
+
+    /// Stop a running FalkorDB instance
+    Stop {
+        /// Name of the instance to stop (default: "default")
+        #[arg(value_name = "NAME", conflicts_with = "name_flag")]
+        name: Option<String>,
+
+        /// Compatibility form for the instance name; prefer positional NAME
+        #[arg(
+            long = "name",
+            value_name = "NAME",
+            conflicts_with = "name",
+            hide = true
+        )]
+        name_flag: Option<String>,
+
+        /// FalkorDB version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
+    },
+
+    /// Stop all FalkorDB instances in this project
+    StopAll,
+
+    /// Remove a stopped FalkorDB instance and its data
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Irreversible: removes the container and deletes its data directory. Stop the instance first —
+  removing a running one errors.")]
+    Remove {
+        /// Name of the instance to remove (default: "default")
+        #[arg(value_name = "NAME", conflicts_with = "name_flag")]
+        name: Option<String>,
+
+        /// Compatibility form for the instance name; prefer positional NAME
+        #[arg(
+            long = "name",
+            value_name = "NAME",
+            conflicts_with = "name",
+            hide = true
+        )]
+        name_flag: Option<String>,
+
+        /// FalkorDB version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
+    },
+
+    /// Connect to a running FalkorDB instance with redis-cli
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Managed mode (the default; NAME selects one) execs host `redis-cli` when it is on PATH, else
+  runs redis-cli inside the container via `docker exec`; the stored password authenticates.
+  Direct mode (--host/--port) requires `redis-cli` on PATH and reads no managed credentials —
+  bring auth through the passthrough args.
+  --query is a redis command: quote the Cypher, e.g. -q 'GRAPH.QUERY g \"MATCH (n) RETURN n\"'.
+  Put wrapper options before `--`; all arguments after it go to redis-cli.
+  Interactive and --query output stays native, even with --json or a coding agent.")]
+    Client {
+        /// Managed instance to connect to (default: "default")
+        #[arg(value_name = "NAME", conflicts_with_all = ["name_flag", "host", "port"])]
+        #[arg(display_order = 0)]
+        name: Option<String>,
+
+        /// Compatibility form for the instance name; prefer positional NAME
+        #[arg(
+            long = "name",
+            short = 'n',
+            value_name = "NAME",
+            hide = true,
+            conflicts_with_all = ["name", "host", "port"]
+        )]
+        #[arg(display_order = 0)]
+        name_flag: Option<String>,
+
+        /// FalkorDB version to disambiguate when multiple share a name
+        #[arg(long, short = 'v', conflicts_with_all = ["host", "port"])]
+        #[arg(display_order = 3)]
+        version: Option<String>,
+
+        /// Host to connect to directly, bypassing managed lookup (port 6379)
+        #[arg(long)]
+        #[arg(display_order = 1)]
+        host: Option<String>,
+
+        /// TCP port to connect to directly, bypassing managed lookup (host 127.0.0.1)
+        #[arg(
+            long,
+            short,
+            value_parser = clap::value_parser!(u16).range(1..=65535)
+        )]
+        #[arg(display_order = 2)]
+        port: Option<u16>,
+
+        /// Execute a single redis command (quote Cypher arguments)
+        #[arg(long, short)]
+        #[arg(display_order = 4)]
+        query: Option<String>,
+
+        /// Native redis-cli arguments (require --)
+        #[arg(last = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Write FalkorDB connection env vars to a .env file
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Writes FALKORDB_HOST, FALKORDB_PORT, FALKORDB_PASSWORD, FALKORDB_BROWSER_URL.
+  The instance must be running.
+  Managed FALKORDB_* keys are replaced in place; other lines in the file are preserved.
+  Contains the password in plaintext — prefer --local and keep it out of version control.")]
+    Dotenv {
+        /// Instance name (default: "default")
+        #[arg(value_name = "NAME", conflicts_with = "name_flag")]
+        name: Option<String>,
+
+        /// Compatibility form for the instance name; prefer positional NAME
+        #[arg(
+            long = "name",
+            value_name = "NAME",
+            conflicts_with = "name",
+            hide = true
+        )]
+        name_flag: Option<String>,
+
+        /// FalkorDB version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
+
+        /// Write to .env.local instead of .env
+        #[arg(long)]
+        local: bool,
     },
 }
 
@@ -423,7 +660,7 @@ CONTEXT FOR AGENTS:
         project: Option<String>,
     },
 
-    /// Stop all ClickHouse and Postgres servers in this project
+    /// Stop all servers of every engine in this project
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   ClickHouse processes get SIGTERM, then SIGKILL if they do not exit in time.")]
@@ -835,6 +1072,44 @@ mod tests {
             &["client", "--host", "remote", "--version", "25.12.9.61.2"],
             expected,
         );
+    }
+
+    #[test]
+    fn falkordb_image_selectors_parse_for_install_only() {
+        let LocalCommands::Install {
+            version: InstallVersionArg::Falkordb(version),
+            ..
+        } = local_command(&["install", "falkordb@4.20.6"])
+        else {
+            panic!("expected Falkordb install version");
+        };
+        assert_eq!(version, "4.20.6");
+        let LocalCommands::Install {
+            version: InstallVersionArg::Falkordb(version),
+            ..
+        } = local_command(&["install", "falkordb:latest"])
+        else {
+            panic!("expected Falkordb install version for the colon form");
+        };
+        assert_eq!(version, "latest");
+
+        for rejected in [
+            &["use", "falkordb@4.20.6"][..],
+            &["server", "start", "--version", "falkordb@4.20.6"][..],
+            &["client", "--version", "falkordb:latest"][..],
+        ] {
+            let mut argv = vec!["dctl", "local"];
+            argv.extend(rejected.iter().copied());
+            let error = crate::cli::Cli::try_parse_from(argv)
+                .err()
+                .unwrap_or_else(|| panic!("falkordb selector should be rejected: {rejected:?}"));
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            let message = error.to_string();
+            assert!(
+                message.contains("Docker image selectors"),
+                "{rejected:?}: {message}"
+            );
+        }
     }
 
     #[test]
@@ -1835,7 +2110,7 @@ mod tests {
         assert_eq!(name.as_deref(), Some("warehouse"));
     }
 
-    fn instance_commands() -> [&'static [&'static str]; 10] {
+    fn instance_commands() -> [&'static [&'static str]; 15] {
         [
             &["server", "start"],
             &["server", "stop"],
@@ -1847,6 +2122,11 @@ mod tests {
             &["postgres", "remove"],
             &["postgres", "dotenv"],
             &["postgres", "client"],
+            &["falkordb", "start"],
+            &["falkordb", "stop"],
+            &["falkordb", "remove"],
+            &["falkordb", "dotenv"],
+            &["falkordb", "client"],
         ]
     }
 
@@ -1854,6 +2134,36 @@ mod tests {
         match command {
             LocalCommands::Client {
                 name, name_flag, ..
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Start {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Stop {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Remove {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Dotenv {
+                        name, name_flag, ..
+                    },
+            }
+            | LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Client {
+                        name, name_flag, ..
+                    },
             }
             | LocalCommands::Server {
                 command:

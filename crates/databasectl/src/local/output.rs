@@ -67,6 +67,8 @@ enum LocalErrorCode {
     /// A Postgres validation or state error whose text (and recovery
     /// guidance) dctl composes itself, rendered verbatim.
     PostgresError,
+    /// A FalkorDB validation or state error; text is dctl's own.
+    FalkorError,
     SqlInputOpenFailed,
     SqlInputReadFailed,
     /// A managed server metadata file contains invalid JSON. The structured
@@ -298,6 +300,9 @@ impl LocalErrorOutput {
             Error::PostgresStartupRollback { primary, .. } => {
                 return Self::from_error(primary);
             }
+            Error::FalkorStartupRollback { primary, .. } => {
+                return Self::from_error(primary);
+            }
 
             // ── servers ─────────────────────────────────────────────────────
             Error::ServerNotFound(_) => {
@@ -402,6 +407,9 @@ impl LocalErrorOutput {
             Error::PortInUse { kind, .. } | Error::PortUnavailable(kind) => {
                 Mapping::parity(LocalErrorCode::PortInUse).command(match kind {
                     PortKind::Postgres => "dctl local postgres start --help",
+                    PortKind::Falkordb | PortKind::FalkordbBrowser => {
+                        "dctl local falkordb start --help"
+                    }
                     PortKind::Http | PortKind::Tcp => "dctl local server start --help",
                 })
             }
@@ -477,6 +485,9 @@ impl LocalErrorOutput {
             // Self-composed validation and state guidance; the foreign-text
             // sibling `Error::Postgres` stays in the fallback below.
             Error::PostgresUsage(_) => Mapping::parity(LocalErrorCode::PostgresError),
+
+            // ── falkordb ────────────────────────────────────────────────────
+            Error::FalkorUsage(_) => Mapping::parity(LocalErrorCode::FalkorError),
             Error::SqlInputOpen { .. } => Mapping::redacted(
                 LocalErrorCode::SqlInputOpenFailed,
                 "Could not open SQL input file; check that --queries-file exists and is readable",
@@ -964,7 +975,7 @@ pub struct ServerListEntry {
     pub tcp_port: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project: Option<String>,
-    /// "clickhouse" or "postgres".
+    /// "clickhouse", "postgres", or "falkordb".
     pub engine: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
@@ -1052,16 +1063,16 @@ impl fmt::Display for ServerListOutput {
         }
 
         let has_project = self.servers.iter().any(|e| e.project.is_some());
-        let has_postgres = self.servers.iter().any(|e| e.engine == "postgres");
+        let has_docker_engine = self.servers.iter().any(|e| e.engine != "clickhouse");
 
-        if !has_project && has_postgres {
+        if !has_project && has_docker_engine {
             // Show an engine-aware table that combines PID (ClickHouse) and
-            // container short-id (Postgres) into a single "ID" column.
+            // container short-id (Docker engines) into a single "ID" column.
             let rows: Vec<ServerListRowWithEngine> = self
                 .servers
                 .iter()
                 .map(|e| {
-                    let id = if e.engine == "postgres" {
+                    let id = if e.engine != "clickhouse" {
                         e.container_id
                             .as_deref()
                             .map(|s| s.chars().take(12).collect::<String>())
@@ -1169,6 +1180,53 @@ impl fmt::Display for PostgresStartOutput {
         writeln!(f, "  Password: {}", self.password)?;
         writeln!(f, "  Database: {}", self.database)?;
         write!(f, "  Connect:  dctl local postgres client {}", self.name)
+    }
+}
+
+// ── falkordb start ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FalkorStartOutput {
+    pub name: String,
+    pub container_id: String,
+    pub image: String,
+    pub port: u16,
+    pub browser_port: u16,
+    pub password: String,
+}
+
+impl fmt::Display for FalkorStartOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = self.container_id.chars().take(12).collect::<String>();
+        writeln!(f, "FalkorDB '{}' running (container: {})", self.name, short)?;
+        writeln!(f, "  Image:   {}", self.image)?;
+        writeln!(f, "  Port:    {}", self.port)?;
+        writeln!(f, "  Browser: http://127.0.0.1:{}", self.browser_port)?;
+        writeln!(f, "  Password: {}", self.password)?;
+        write!(
+            f,
+            "  Connect:  dctl local falkordb client {} -q 'PING'",
+            self.name
+        )
+    }
+}
+
+// ── falkordb dotenv ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FalkorDotenvOutput {
+    pub file: String,
+    pub server: String,
+    pub vars: Vec<DotenvVar>,
+}
+
+impl fmt::Display for FalkorDotenvOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Wrote to {} (falkordb '{}')", self.file, self.server)?;
+        for var in &self.vars {
+            writeln!(f, "  {}={}", var.key, var.value)?;
+        }
+        Ok(())
     }
 }
 

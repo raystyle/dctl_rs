@@ -29,12 +29,13 @@ const NOUNS: &[&str] = &[
 ];
 
 /// Engine driving a server instance. ClickHouse is a managed binary process;
-/// Postgres is a managed Docker container.
+/// Postgres and FalkorDB are managed Docker containers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
     Clickhouse,
     Postgres,
+    Falkordb,
 }
 
 impl Engine {
@@ -42,6 +43,7 @@ impl Engine {
         match self {
             Engine::Clickhouse => "clickhouse",
             Engine::Postgres => "postgres",
+            Engine::Falkordb => "falkordb",
         }
     }
 }
@@ -60,8 +62,10 @@ pub struct ServerInfo {
     pub name: String,
     /// Active ClickHouse process PID; 0 when stopped or for Postgres.
     pub pid: u32,
-    /// Running ClickHouse version like "25.12.5.44", empty when stopped, or
-    /// "postgres:<tag>" for Postgres.
+    /// Running ClickHouse version like "25.12.5.44", empty when stopped,
+    /// "postgres:<tag>" for Postgres, or "falkordb:v<X.Y.Z>" / "falkordb:latest"
+    /// for FalkorDB — a logical display form, not a directly pullable image
+    /// reference (build refs via `falkordb::fk_image_ref`).
     pub version: String,
     /// Running ClickHouse HTTP port; 0 when stopped or for Postgres.
     pub http_port: u16,
@@ -191,6 +195,95 @@ pub fn pg_data_dir(name: &str, major: &str) -> PathBuf {
     servers_dir()
         .join(pg_instance_key(name, major))
         .join("data")
+}
+
+/// Disk identifier for a FalkorDB instance: `<name>-fk<version>` (full
+/// X.Y.Z, because the image publishes no major-only tag). Used in the
+/// metadata filename, the data dir name, and the container name so that
+/// distinct (name, version) pairs never share state.
+pub fn fk_instance_key(name: &str, version: &str) -> String {
+    format!("{}-fk{}", name, version)
+}
+
+/// The version grammar of an fk instance-key suffix: a full `X.Y.Z` (the
+/// image publishes no major-only tags) or the literal `latest` (F1: both
+/// spellings must be first-class, or latest instances become invisible to
+/// discovery and a second start silently creates another container).
+pub(crate) fn is_fk_version_suffix(version: &str) -> bool {
+    version == "latest"
+        || version.split('.').count() == 3
+            && version
+                .split('.')
+                .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub(crate) fn is_fk_instance_key(name: &str) -> bool {
+    name.rsplit_once("-fk")
+        .is_some_and(|(name, version)| !name.is_empty() && is_fk_version_suffix(version))
+}
+
+/// Data directory for a FalkorDB instance.
+pub fn fk_data_dir(name: &str, version: &str) -> PathBuf {
+    servers_dir()
+        .join(fk_instance_key(name, version))
+        .join("data")
+}
+
+/// Ensure the data directory for a FalkorDB instance exists. Returns whether
+/// this call created the instance directory, for transactional startup cleanup.
+pub fn ensure_fk_data_dir(name: &str, version: &str) -> Result<bool> {
+    ensure_servers_dir()?;
+    let instance_dir = servers_dir().join(fk_instance_key(name, version));
+    let created = match std::fs::create_dir(&instance_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = std::fs::create_dir_all(instance_dir.join("data")) {
+        if created {
+            let _ = std::fs::remove_dir(&instance_dir);
+        }
+        return Err(error.into());
+    }
+    Ok(created)
+}
+
+/// Find every FalkorDB instance whose user-facing name is `name`. Returns
+/// one entry per full version that has a metadata file on disk.
+pub(crate) fn find_fk_instances_locked(name: &str, lock: &MetadataLock) -> Result<Vec<ServerInfo>> {
+    let prefix = format!("{}-fk", name);
+    let dir = match std::fs::read_dir(&lock.dir) {
+        Ok(d) => d,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut out = Vec::new();
+    for entry in dir {
+        let entry = entry?;
+        let fname = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let stem = match fname.strip_suffix(".json") {
+            Some(s) => s,
+            None => continue,
+        };
+        if !stem.starts_with(&prefix) {
+            continue;
+        }
+        // The suffix must be a full X.Y.Z or latest — guards against e.g.
+        // `dev-fk-foo` or a bare `prod-fk2` matching when `name = "dev"`.
+        let version = &stem[prefix.len()..];
+        if !is_fk_version_suffix(version) {
+            continue;
+        }
+        if let Some(info) = load_info_locked(stem, lock)?
+            && info.engine == Engine::Falkordb
+        {
+            out.push(info);
+        }
+    }
+    Ok(out)
 }
 
 /// Ensure the project-local server and ignore paths exist. Idempotent.
@@ -327,7 +420,7 @@ pub(crate) fn mark_server_stopped_locked(name: &str, pid: u32, lock: &MetadataLo
 fn is_alive(info: &ServerInfo) -> Result<bool> {
     match info.engine {
         Engine::Clickhouse => Ok(is_process_alive(info.pid)),
-        Engine::Postgres => match info.container_id.as_deref() {
+        Engine::Postgres | Engine::Falkordb => match info.container_id.as_deref() {
             Some(id) => docker::is_container_running_blocking(id),
             None => Ok(false),
         },
@@ -504,12 +597,12 @@ pub(crate) fn list_clickhouse_server_names_locked(lock: &MetadataLock) -> Result
         };
         if validate_server_name(&name).is_err()
             || is_pg_instance_key(&name)
+            || is_fk_instance_key(&name)
             || entries.iter().any(|entry| {
                 entry.name == name
-                    && entry
-                        .info
-                        .as_ref()
-                        .is_some_and(|info| info.engine == Engine::Postgres)
+                    && entry.info.as_ref().is_some_and(|info| {
+                        info.engine == Engine::Postgres || info.engine == Engine::Falkordb
+                    })
             })
         {
             continue;
@@ -715,12 +808,9 @@ pub(crate) fn kill_server_locked(name: &str, lock: &MetadataLock) -> Result<()> 
             kill_process(info.pid)?;
             mark_server_stopped_locked(name, info.pid, lock)?;
         }
-        Engine::Postgres => {
+        Engine::Postgres | Engine::Falkordb => {
             let id = info.container_id.as_deref().ok_or_else(|| {
-                Error::DockerError(format!(
-                    "Postgres server '{}' has no container_id in metadata",
-                    name
-                ))
+                Error::DockerError(format!("server '{}' has no container_id in metadata", name))
             })?;
             docker::stop_blocking(id)?;
             // Metadata + container preserved so `start` can resume.
@@ -1067,8 +1157,10 @@ fn recover_from_discovered_locked(
         recover_clickhouse_info_locked(&info, lock)?;
     }
 
-    // Also recover orphaned Postgres containers belonging to this project.
-    docker::recover_project_postgres_blocking(&current_dir, lock)
+    // Also recover orphaned Postgres and FalkorDB containers belonging to
+    // this project.
+    docker::recover_project_postgres_blocking(&current_dir, lock)?;
+    docker::recover_project_falkor_blocking(&current_dir, lock)
 }
 
 fn recover_clickhouse_info_locked(info: &ServerInfo, lock: &MetadataLock) -> Result<()> {
@@ -1237,6 +1329,75 @@ pub fn ensure_stopped_by_pid(pid: u32) -> Result<()> {
     match kill_server_by_pid(pid) {
         Err(Error::ServerNotRunning(_)) => Ok(()),
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod fk_key_tests {
+    use super::*;
+
+    fn temp_lock() -> (tempfile::TempDir, MetadataLock) {
+        let dir = tempfile::tempdir().expect("temp servers dir");
+        let lock = MetadataLock::acquire_at(dir.path()).expect("acquire lock");
+        (dir, lock)
+    }
+
+    fn info(key: &str, engine: Engine) -> ServerInfo {
+        ServerInfo {
+            name: key.to_string(),
+            pid: 0,
+            version: format!(
+                "{}:v{}",
+                engine.as_str(),
+                key.rsplit("-fk").next().unwrap_or("")
+            ),
+            http_port: 0,
+            tcp_port: 6379,
+            started_at: "test".into(),
+            cwd: "/tmp".into(),
+            engine,
+            container_id: Some("cid".into()),
+        }
+    }
+
+    #[test]
+    fn fk_version_suffix_accepts_full_versions_and_latest_only() {
+        assert!(is_fk_version_suffix("4.20.6"));
+        assert!(is_fk_version_suffix("latest"));
+        // Bare numbers and partials are not fk keys (G8 tightening).
+        assert!(!is_fk_version_suffix("2"));
+        assert!(!is_fk_version_suffix("4.20"));
+        assert!(!is_fk_version_suffix(""));
+        assert!(!is_fk_version_suffix("4.20.6-alpine"));
+    }
+
+    #[test]
+    fn fk_instance_keys_cover_latest() {
+        assert!(is_fk_instance_key("default-fk4.20.6"));
+        assert!(is_fk_instance_key("default-fklatest"));
+        assert!(!is_fk_instance_key("default-fk"));
+        assert!(!is_fk_instance_key("prod-fk2"));
+        assert!(!is_fk_instance_key("plain"));
+    }
+
+    /// F1 regression: a `latest` instance must be discoverable by name, or a
+    /// second `start` silently creates another container under the default tag.
+    #[test]
+    fn find_fk_instances_returns_latest_instances() {
+        let (_dir, lock) = temp_lock();
+        save_server_info_locked(&info("default-fklatest", Engine::Falkordb), &lock).unwrap();
+        let found = find_fk_instances_locked("default", &lock).unwrap();
+        assert_eq!(found.len(), 1, "the latest instance must be found");
+        assert_eq!(found[0].name, "default-fklatest");
+        // A different name sees nothing.
+        assert!(find_fk_instances_locked("other", &lock).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fk_latest_does_not_masquerade_as_clickhouse_directory() {
+        // The CH legacy-name scan must keep excluding fk keys, latest included.
+        assert!(is_fk_instance_key("dev-fklatest"));
+        assert!(crate::local::falkordb::user_name_from_key("dev-fklatest") == "dev");
     }
 }
 

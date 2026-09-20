@@ -450,7 +450,13 @@ fn run_start(
     telemetry_debug: bool,
     wait_timeout: u16,
     preexisting_data: bool,
-) -> (Output, Vec<DockerRequest>, tempfile::TempDir) {
+) -> (
+    Output,
+    Vec<DockerRequest>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    FakeDocker,
+) {
     let home = tempfile::tempdir().expect("create home tempdir");
     let project = tempfile::tempdir().expect("create project tempdir");
     if resumed {
@@ -484,8 +490,7 @@ fn run_start(
         wait_timeout,
     );
     let requests = docker.requests();
-    drop(docker);
-    (output, requests, project)
+    (output, requests, project, home, docker)
 }
 
 fn run_start_command(
@@ -578,7 +583,7 @@ fn readiness_requests(requests: &[DockerRequest]) -> Vec<&DockerRequest> {
 
 #[test]
 fn fresh_start_waits_for_delayed_postgres_readiness_without_exposing_password() {
-    let (output, requests, _project) = run_start(
+    let (output, requests, _project, _home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::Running,
@@ -755,7 +760,7 @@ fn postgres_start_revalidates_metadata_after_image_inspection() {
 
 #[test]
 fn resumed_start_also_waits_for_postgres_readiness() {
-    let (output, requests, _project) = run_start(
+    let (output, requests, _project, _home, _docker) = run_start(
         DockerScenario {
             existing: true,
             outcome: ContainerOutcome::Running,
@@ -791,7 +796,7 @@ fn resumed_start_also_waits_for_postgres_readiness() {
 
 #[test]
 fn wall_clock_timeout_fails_and_rolls_back_fresh_data() {
-    let (output, requests, project) = run_start(
+    let (output, requests, project, _home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::Running,
@@ -849,7 +854,7 @@ fn immediate_exit_redacts_bounded_logs_without_setup_success_or_telemetry_noise(
         .map(|index| format!("startup line {index}: {}", "x".repeat(300)))
         .collect();
     logs.push("FATAL: startup failed before readiness".to_string());
-    let (output, requests, project) = run_start(
+    let (output, requests, project, _home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -895,7 +900,7 @@ fn immediate_exit_redacts_bounded_logs_without_setup_success_or_telemetry_noise(
 
 #[test]
 fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_selection() {
-    let (output, requests, project) = run_start(
+    let (output, requests, project, home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -943,12 +948,20 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
 
     let clickhouse_data = project.path().join(".dctl/servers/dev/data");
     std::fs::create_dir_all(&clickhouse_data).expect("create ClickHouse data directory");
-    let home = tempfile::tempdir().expect("create selection home");
+    let selection_home = tempfile::tempdir().expect("create selection home");
+    // G-A: point the second subprocess at the still-live fake daemon —
+    // Docker-engine liveness checks need a reachable socket, and a
+    // Docker-absent machine's real socket state must not leak into this
+    // test (run_start keeps home + daemon alive for exactly this).
     let stop = Command::new(dctl_binary())
         .env_clear()
         .env("DO_NOT_TRACK", "1")
-        .env("HOME", home.path())
+        .env("HOME", selection_home.path())
         .env("PATH", "/usr/bin:/bin")
+        .env(
+            "DOCKER_HOST",
+            format!("unix://{}/docker.sock", home.path().display()),
+        )
         .current_dir(project.path())
         .args(["local", "--json", "server", "stop"])
         .output()
@@ -968,7 +981,7 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
 
 #[test]
 fn incomplete_container_cleanup_retains_pgdata_and_recovery_metadata() {
-    let (output, requests, project) = run_start(
+    let (output, requests, project, _home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,

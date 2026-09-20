@@ -45,3 +45,13 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 密钥扫描(scan.py)16 项 HIGH 全部裁定为假阳性:均为上游测试夹具(AWS 文档公开示例访问键、example.test 保留域凭据、HOSTILE 假凭据清单,测的恰是脱敏与不外泄),无真实凭据入库 [实证: 2026-09-20 逐条核对 network.rs 与 telemetry.rs 夹具源码]
 - 骨架合规:check.py 十二项全 PASS [实证: 2026-09-20 PE-01 至 PE-12]
 - 未做:codex 评审闸门待走;main 未推
+
+## FalkorDB 引擎单
+
+同日追加于 falkor-engine 分支:
+
+- 立项:ADR-0005 + REQ-003(当日回填 implemented,trace 为 falkor readiness 套件)
+- 交付:五提交(ADR/REQ、引擎主体、测试与文档、实弹修复);三引擎并存,pg/ch 零回归
+- 实弹发现并修复两缺陷:docker exec 回退 client 未带认证;孤儿恢复把镜像全引用存成 version 致 resume 解析错位 [实证: 2026-09-20 lan-linux 真容器全生命周期 SMOKE OK]
+- 测试写法教训:StartupExit 在 JSON 信封是 redacted 摘要,断言日志尾要用人类模式;串行锁要防毒化(lock 失败转 into_inner);假 Docker 的锁不变量只对慢操作(镜像 inspect/pull)生效,create/start 按设计持锁
+- 环境特性记录:容器内跑 dctl(挂宿主 socket)时,TcpListener 端口探测在容器网络命名空间,看不到宿主端口占用;自动挑口在此环境可能撞宿主已绑端口,冒烟须显式指定端口

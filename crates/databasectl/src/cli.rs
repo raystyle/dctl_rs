@@ -9,7 +9,7 @@ pub(crate) mod help_order {
 
 #[derive(Parser)]
 #[command(name = "dctl")]
-#[command(about = "Manage local ClickHouse and Postgres servers", long_about = None)]
+#[command(about = "Manage local ClickHouse, Postgres and FalkorDB servers", long_about = None)]
 #[command(version, disable_version_flag = true)]
 #[command(arg(clap::Arg::new("version")
     .short('V')
@@ -27,7 +27,7 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Manage local ClickHouse and Postgres
+    /// Manage local ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Project-scoped commands use `.dctl` under the exact current directory; parent directories
