@@ -124,6 +124,16 @@ pub(crate) fn validate_fk_start_env_args(extra_env: &[String]) -> std::result::R
     Ok(())
 }
 
+/// The stored `ServerInfo.version` form for a tag: `falkordb:v4.20.6` or
+/// `falkordb:latest` (latest carries no v — it is not part of that tag).
+pub(crate) fn stored_version_form(tag: &str) -> String {
+    if tag == "latest" {
+        "falkordb:latest".to_string()
+    } else {
+        format!("falkordb:v{tag}")
+    }
+}
+
 /// The tag stored in `ServerInfo.version` back to its bare form:
 /// `falkordb:v4.20.6` or `falkordb:latest` to `4.20.6` / `latest`.
 fn tag_from_stored_version(stored: &str) -> &str {
@@ -402,7 +412,7 @@ async fn start(
         let info = ServerInfo {
             name: key.clone(),
             pid: 0,
-            version: format!("falkordb:v{tag}"),
+            version: stored_version_form(&tag),
             // The browser port rides the http_port slot for FalkorDB; the
             // graph protocol port is tcp_port, matching the list columns.
             http_port: browser_port,

@@ -1501,7 +1501,7 @@ pub fn recover_project_falkor_blocking(
                 pid: 0,
                 // Canonical stored form, matching what `start` writes, so a
                 // later resume parses the same tag (the raw image ref would).
-                version: format!("falkordb:v{}", c.major),
+                version: crate::local::falkordb::stored_version_form(&c.major),
                 // The browser port rides http_port. The list API only reports
                 // published ports for running containers; a stopped container
                 // recovers 0 here and the next resume refreshes both ports
