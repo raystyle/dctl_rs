@@ -23,7 +23,9 @@ trace: cargo test -p databasectl --test ledger_request_test
 - [x] help 注明真源 ledger.ohmygh.com;读面实弹 200,写面待总台注册公钥后补实弹
 - [x] 回执:commit sha、门禁退出码、公钥 JWK 全文与 kid
 
-## 验收补充(2026-09-20 评审闸门后)
+## 验收补充
+
+2026-09-20 评审闸门后:
 
 - 三轮评审(F/G/CONFIRM 至无保留 CONFIRM)全闭合;F1-F6 与 G1-G13 逐条对照记录在评审会话与 diary
 - backlog(不属完成态):G3-b(私钥推导 kid 并告警不匹配)、G9(/events?since= 读面)
