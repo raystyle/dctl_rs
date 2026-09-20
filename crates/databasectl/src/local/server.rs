@@ -1,20 +1,11 @@
-use crate::error::{Error, PortKind, Result, StartupKind};
+use crate::error::{Error, Result};
 use crate::init;
-use crate::local::discovery;
 use crate::local::docker;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
-const DEFAULT_HTTP_PORT: u16 = 8123;
-const DEFAULT_TCP_PORT: u16 = 9000;
-pub const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
-const SPAWN_HEALTH_DELAY: Duration = Duration::from_millis(300);
-const STARTUP_POLL_INTERVAL: Duration = Duration::from_millis(100);
-const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
-const STARTUP_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 const METADATA_LOCK_FILE: &str = ".metadata.lock";
 const METADATA_TEMP_PREFIX: &str = ".metadata-";
 
@@ -161,27 +152,11 @@ pub(crate) fn lock_metadata() -> Result<MetadataLock> {
     MetadataLock::acquire_at(&servers_dir())
 }
 
-/// Data directory for a ClickHouse server: .dctl/servers/<name>/data/.
-pub fn server_data_dir(name: &str) -> PathBuf {
-    servers_dir().join(name).join("data")
-}
-
-/// Combined stdout/stderr log for a background ClickHouse server.
-pub fn server_log_path(name: &str) -> PathBuf {
-    servers_dir().join(name).join("server.log")
-}
-
 /// Disk identifier for a Postgres instance: `<name>-pg<major>`. Used in the
 /// metadata filename, the data dir name, and the container name so that
 /// distinct (name, major) pairs never share state.
 pub fn pg_instance_key(name: &str, major: &str) -> String {
     format!("{}-pg{}", name, major)
-}
-
-fn is_pg_instance_key(name: &str) -> bool {
-    name.rsplit_once("-pg").is_some_and(|(name, major)| {
-        !name.is_empty() && !major.is_empty() && major.chars().all(|c| c.is_ascii_digit())
-    })
 }
 
 /// Join a child name onto the servers directory. Exposed so handlers can
@@ -217,6 +192,7 @@ pub(crate) fn is_fk_version_suffix(version: &str) -> bool {
                 .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
 }
 
+#[cfg(test)]
 pub(crate) fn is_fk_instance_key(name: &str) -> bool {
     name.rsplit_once("-fk")
         .is_some_and(|(name, version)| !name.is_empty() && is_fk_version_suffix(version))
@@ -368,13 +344,6 @@ fn ensure_servers_dir() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the data directory for a ClickHouse server exists.
-pub fn ensure_server_data_dir(name: &str) -> Result<()> {
-    ensure_servers_dir()?;
-    std::fs::create_dir_all(server_data_dir(name))?;
-    Ok(())
-}
-
 /// Ensure the data directory for a Postgres instance exists. Returns whether
 /// this call created the instance directory, for transactional startup cleanup.
 pub fn ensure_pg_data_dir(name: &str, major: &str) -> Result<bool> {
@@ -471,11 +440,6 @@ pub(crate) fn try_remove_server_info_locked(name: &str, lock: &MetadataLock) -> 
 ///
 /// The PID match avoids overwriting metadata when a newer process was already
 /// recorded before this transition began.
-pub fn mark_server_stopped(name: &str, pid: u32) -> Result<()> {
-    let lock = lock_metadata()?;
-    mark_server_stopped_locked(name, pid, &lock)
-}
-
 pub(crate) fn mark_server_stopped_locked(name: &str, pid: u32, lock: &MetadataLock) -> Result<()> {
     let Some(mut info) = load_info_locked(name, lock)? else {
         return Ok(());
@@ -492,15 +456,13 @@ pub(crate) fn mark_server_stopped_locked(name: &str, pid: u32, lock: &MetadataLo
 
 /// Engine-aware liveness check.
 fn is_alive(info: &ServerInfo) -> Result<bool> {
-    match info.engine {
-        Engine::Clickhouse => Ok(is_process_alive(info.pid)),
-        Engine::Postgres | Engine::Falkordb => match info.container_id.as_deref() {
-            Some(id) => docker::is_container_running_blocking(id),
-            None => Ok(false),
-        },
-        Engine::Clickhouse if info.container_id.is_some() => {
-            docker::is_container_running_blocking(info.container_id.as_deref().unwrap_or(""))
-        }
+    match info.container_id.as_deref() {
+        // Docker-managed (all new instances): ask the daemon.
+        Some(id) => docker::is_container_running_blocking(id),
+        // Legacy binary-era entries have no container; dctl can no longer
+        // manage them, so they read as stopped. `server remove` still clears
+        // the metadata and data directory.
+        None => Ok(false),
     }
 }
 
@@ -649,49 +611,6 @@ fn list_all_servers_locked_inner(
     Ok(entries)
 }
 
-/// List persisted ClickHouse identities, including legacy stopped servers that
-/// have a data directory but predate retained metadata.
-pub(crate) fn list_clickhouse_server_names_locked(lock: &MetadataLock) -> Result<Vec<String>> {
-    let entries = list_all_servers_locked(lock)?;
-    let mut names: Vec<_> = entries
-        .iter()
-        .filter(|entry| {
-            entry
-                .info
-                .as_ref()
-                .is_some_and(|info| info.engine == Engine::Clickhouse)
-        })
-        .map(|entry| entry.name.clone())
-        .collect();
-
-    for directory in std::fs::read_dir(&lock.dir)? {
-        let directory = directory?;
-        if !directory.file_type()?.is_dir() || !directory.path().join("data").is_dir() {
-            continue;
-        }
-        let Ok(name) = directory.file_name().into_string() else {
-            continue;
-        };
-        if validate_server_name(&name).is_err()
-            || is_pg_instance_key(&name)
-            || is_fk_instance_key(&name)
-            || entries.iter().any(|entry| {
-                entry.name == name
-                    && entry.info.as_ref().is_some_and(|info| {
-                        info.engine == Engine::Postgres || info.engine == Engine::Falkordb
-                    })
-            })
-        {
-            continue;
-        }
-        names.push(name);
-    }
-
-    names.sort();
-    names.dedup();
-    Ok(names)
-}
-
 pub(crate) fn server_entry_locked(name: &str, lock: &MetadataLock) -> Result<Option<ServerEntry>> {
     server_entry_locked_with(name, lock, || {})
 }
@@ -723,15 +642,6 @@ fn server_entry_locked_with(
     }))
 }
 
-/// List only currently running servers.
-pub fn list_running_servers() -> Result<Vec<ServerInfo>> {
-    Ok(list_all_servers()?
-        .into_iter()
-        .filter(|e| e.running)
-        .filter_map(|e| e.info)
-        .collect())
-}
-
 pub(crate) fn list_running_servers_locked(lock: &MetadataLock) -> Result<Vec<ServerInfo>> {
     Ok(list_all_servers_locked(lock)?
         .into_iter()
@@ -740,189 +650,25 @@ pub(crate) fn list_running_servers_locked(lock: &MetadataLock) -> Result<Vec<Ser
         .collect())
 }
 
-/// Best-effort count used only for the informational notice during start.
-pub(crate) fn advisory_running_server_count_locked(lock: &MetadataLock) -> usize {
-    list_all_servers_locked_inner(lock, true)
-        .map(|entries| entries.iter().filter(|entry| entry.running).count())
-        .unwrap_or_default()
-}
-
-/// Check if a named server is currently running.
-pub fn is_server_running(name: &str) -> Result<bool> {
-    let lock = lock_metadata()?;
-    is_server_running_locked(name, &lock)
-}
-
 pub(crate) fn is_server_running_locked(name: &str, lock: &MetadataLock) -> Result<bool> {
     Ok(load_running_info_locked(name, lock)?.is_some())
-}
-
-fn is_process_alive(pid: u32) -> bool {
-    pid != 0 && i32::try_from(pid).is_ok_and(|pid| unsafe { libc::kill(pid, 0) == 0 })
-}
-
-/// Send a signal to a process and return an error if the signal could not be delivered
-/// (e.g. EPERM from a process owned by another user).
-fn send_signal(pid: u32, signal: i32) -> Result<()> {
-    let ret = unsafe { libc::kill(pid as i32, signal) };
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        Err(Error::Exec(format!(
-            "Failed to send signal to PID {}: {}",
-            pid, err
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-/// How long a SIGTERM is given before the escalation to SIGKILL: the 500 ms
-/// grace period and the 2 s extension the fixed sleeps used to add up to.
-const TERM_TIMEOUT: Duration = Duration::from_millis(2500);
-/// How long a SIGKILLed process is given to be reaped before it is reported as
-/// still running.
-const KILL_TIMEOUT: Duration = Duration::from_millis(500);
-
-/// Poll until `pid` is gone, returning whether it went within `timeout`.
-fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if !is_process_alive(pid) {
-            return true;
-        }
-        if std::time::Instant::now() >= deadline {
-            return !is_process_alive(pid);
-        }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// The direct children of `pid`, read while it is still alive.
-///
-/// The ClickHouse watchdog forwards SIGHUP, SIGINT, SIGQUIT and SIGTERM to the
-/// server it supervises, but a SIGKILL it cannot catch leaves that server
-/// running: the kernel reparents it to init and it keeps holding the ports and
-/// the data directory (issue #664). So the escalation path has to kill the pair,
-/// and it has to read the children before the parent dies, because afterwards
-/// the relation is gone. A process-group kill is not an alternative:
-/// `Command::spawn` leaves the watchdog in dctl's own process group.
-fn child_pids(pid: u32) -> Vec<u32> {
-    let output = std::process::Command::new("pgrep")
-        .args(["-P", &pid.to_string()])
-        .output();
-
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|line| line.trim().parse::<u32>().ok())
-            .filter(|&child| child != 0 && child != pid)
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// Attempt to terminate a process: SIGTERM, wait, SIGKILL if needed, then verify exit.
-///
-/// `pid` is normally a watchdog, which stops the server it supervises with it.
-/// That holds for the SIGTERM it forwards, but not for a SIGKILL, so the
-/// escalation path signals the supervised processes too and reports success only
-/// once every one of them is gone.
-fn kill_process(pid: u32) -> Result<()> {
-    send_signal(pid, libc::SIGTERM)?;
-
-    // A watchdog that takes the SIGTERM passes it to the server and exits with
-    // it, so waiting on the watchdog waits on the pair.
-    if wait_for_exit(pid, TERM_TIMEOUT) {
-        return Ok(());
-    }
-
-    let supervised = child_pids(pid);
-    send_signal(pid, libc::SIGKILL)?;
-    for &child in &supervised {
-        // Losing the race to a child that exited with its parent is not a
-        // failure; the verification below is what decides.
-        if is_process_alive(child) {
-            let _ = send_signal(child, libc::SIGKILL);
-        }
-    }
-
-    if !wait_for_exit(pid, KILL_TIMEOUT) {
-        return Err(Error::Exec(format!(
-            "Process {} did not exit after SIGKILL",
-            pid
-        )));
-    }
-    for child in supervised {
-        if !wait_for_exit(child, KILL_TIMEOUT) {
-            return Err(Error::Exec(format!(
-                "Process {} exited but the server it supervised (PID {}) did not exit after SIGKILL",
-                pid, child
-            )));
-        }
-    }
-
-    Ok(())
 }
 
 /// Stop a running server by name.
 ///
 /// * ClickHouse: SIGTERM (then SIGKILL on timeout); metadata is retained with
 ///   PID 0 so the stopped instance remains discoverable.
-/// * Postgres: stops the container only — does **not** remove it, and keeps
-///   the metadata file so a subsequent `start` resumes the same container
-///   (preserving the password and any other PGDATA-encoded settings).
-pub fn kill_server(name: &str) -> Result<()> {
-    let lock = lock_metadata()?;
-    kill_server_locked(name, &lock)
-}
-
 pub(crate) fn kill_server_locked(name: &str, lock: &MetadataLock) -> Result<()> {
     let info = load_running_info_locked(name, lock)?
         .ok_or_else(|| Error::ServerNotRunning(name.to_string()))?;
 
-    match info.engine {
-        Engine::Clickhouse if info.container_id.is_some() => {
-            // Docker-managed ClickHouse: stop the container like PG/FK.
-            let id = info.container_id.as_deref().unwrap_or("");
-            docker::stop_blocking(id)?;
-        }
-        Engine::Clickhouse => {
-            kill_process(info.pid)?;
-            mark_server_stopped_locked(name, info.pid, lock)?;
-        }
-        Engine::Postgres | Engine::Falkordb => {
-            let id = info.container_id.as_deref().ok_or_else(|| {
-                Error::DockerError(format!("server '{}' has no container_id in metadata", name))
-            })?;
-            docker::stop_blocking(id)?;
-            // Metadata + container preserved so `start` can resume.
-        }
-    }
+    let id = info.container_id.as_deref().ok_or_else(|| {
+        Error::DockerError(format!("server '{}' has no container_id in metadata", name))
+    })?;
+    // Stop the container only; metadata + container are preserved so `start`
+    // can resume with the same credentials and data.
+    docker::stop_blocking(id)?;
     Ok(())
-}
-
-/// Resolve the server name: use provided name, "default" if none and no default running,
-/// or generate a random name if "default" is already running.
-/// Returns an error if the provided name contains path traversal characters.
-pub fn resolve_name(name: Option<&str>) -> Result<String> {
-    let lock = lock_metadata()?;
-    resolve_name_locked(name, &lock)
-}
-
-pub(crate) fn resolve_name_locked(name: Option<&str>, lock: &MetadataLock) -> Result<String> {
-    match name {
-        Some(n) => {
-            validate_server_name(n)?;
-            Ok(n.to_string())
-        }
-        None => {
-            if is_server_running_locked("default", lock)? {
-                generate_random_name_locked(lock)
-            } else {
-                Ok("default".to_string())
-            }
-        }
-    }
 }
 
 pub(crate) fn generate_random_name_locked(lock: &MetadataLock) -> Result<String> {
@@ -953,227 +699,6 @@ fn unique_generated_name_locked(tag: &str, lock: &MetadataLock) -> Result<String
     unreachable!("a finite metadata directory cannot exhaust generated names")
 }
 
-/// Wait a moment after spawn and check if the child exited immediately.
-pub async fn check_spawn_health(
-    child: &mut std::process::Child,
-    name: &str,
-    log_path: &Path,
-) -> Result<()> {
-    tokio::time::sleep(SPAWN_HEALTH_DELAY).await;
-    if let Some(status) = child.try_wait().map_err(|e| Error::Exec(e.to_string()))? {
-        let mut details = format!(
-            "Server '{}' exited immediately after starting ({}). See server log: {}",
-            name,
-            status,
-            log_path.display()
-        );
-        if let Err(metadata_error) = mark_server_stopped(name, child.id()) {
-            details.push_str(&format!(
-                "; additionally failed to record the stopped server: {metadata_error}"
-            ));
-        }
-        return Err(Error::StartupExit {
-            kind: StartupKind::ClickHouse,
-            name: name.to_string(),
-            details,
-        });
-    }
-    Ok(())
-}
-
-async fn stop_starting_child(
-    child: &mut std::process::Child,
-    name: &str,
-) -> std::result::Result<(), String> {
-    let pid = child.id();
-    if child.try_wait().map_err(|e| e.to_string())?.is_none()
-        && let Err(signal_error) = send_signal(pid, libc::SIGTERM)
-        && child.try_wait().map_err(|e| e.to_string())?.is_none()
-    {
-        return Err(signal_error.to_string());
-    }
-
-    let deadline = tokio::time::Instant::now() + STARTUP_SHUTDOWN_TIMEOUT;
-    loop {
-        if child.try_wait().map_err(|e| e.to_string())?.is_some() {
-            return mark_server_stopped(name, pid).map_err(|e| e.to_string());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            break;
-        }
-        tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
-    }
-
-    child.kill().map_err(|e| e.to_string())?;
-    child.wait().map_err(|e| e.to_string())?;
-    mark_server_stopped(name, pid).map_err(|e| e.to_string())
-}
-
-/// Wait until ClickHouse responds to HTTP health checks and accepts TCP connections.
-pub async fn wait_for_server_ready(
-    child: &mut std::process::Child,
-    name: &str,
-    http_port: u16,
-    tcp_port: u16,
-    log_path: &Path,
-    timeout: Duration,
-) -> Result<()> {
-    let started = tokio::time::Instant::now();
-    check_spawn_health(child, name, log_path).await?;
-    let health_client = reqwest::Client::builder()
-        .no_proxy()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(CONNECT_TIMEOUT)
-        .build()?;
-    let health_url = format!("http://localhost:{http_port}/ping");
-
-    loop {
-        if let Some(status) = child.try_wait().map_err(|e| Error::Exec(e.to_string()))? {
-            let mut details = format!(
-                "Server '{}' exited before becoming ready on HTTP port {} and TCP port {} ({}). \
-                 See server log: {}",
-                name,
-                http_port,
-                tcp_port,
-                status,
-                log_path.display()
-            );
-            if let Err(metadata_error) = mark_server_stopped(name, child.id()) {
-                details.push_str(&format!(
-                    "; additionally failed to record the stopped server: {metadata_error}"
-                ));
-            }
-            return Err(Error::StartupExit {
-                kind: StartupKind::ClickHouse,
-                name: name.to_string(),
-                details,
-            });
-        }
-
-        let tcp_ready = matches!(
-            tokio::time::timeout(
-                CONNECT_TIMEOUT,
-                tokio::net::TcpStream::connect(("localhost", tcp_port))
-            )
-            .await,
-            Ok(Ok(_))
-        );
-        let http_ready = if tcp_ready {
-            match health_client.get(&health_url).send().await {
-                Ok(response) if response.status().is_success() => {
-                    response.text().await.is_ok_and(|body| body.trim() == "Ok.")
-                }
-                _ => false,
-            }
-        } else {
-            false
-        };
-        if tcp_ready && http_ready {
-            return Ok(());
-        }
-
-        if started.elapsed() >= timeout {
-            let pid = child.id();
-            let cleanup = match stop_starting_child(child, name).await {
-                Ok(()) => " and was stopped".to_string(),
-                Err(error) => format!("; failed to stop PID {}: {}", pid, error),
-            };
-            return Err(Error::StartupTimeout {
-                kind: StartupKind::ClickHouse,
-                name: name.to_string(),
-                seconds: timeout.as_secs(),
-                details: format!(
-                    "Server '{}' did not become ready on HTTP port {} and TCP port {} within {} seconds{}. \
-                 See server log: {}",
-                    name,
-                    http_port,
-                    tcp_port,
-                    timeout.as_secs(),
-                    cleanup,
-                    log_path.display()
-                ),
-            });
-        }
-
-        tokio::time::sleep(STARTUP_POLL_INTERVAL).await;
-    }
-}
-
-/// Check if a TCP port is available by attempting to bind to it.
-fn is_port_available(port: u16) -> bool {
-    std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
-}
-
-/// Find a free port starting from `start`, incrementing by 1.
-fn find_free_port(start: u16) -> Option<u16> {
-    (start..=start.saturating_add(100)).find(|&p| is_port_available(p))
-}
-
-/// Resolve the HTTP and TCP ports to use.
-/// If explicit ports are given, use them as-is.
-/// Otherwise, try defaults (8123/9000) and auto-assign free ports if they're taken.
-/// Returns (http_port, tcp_port, auto_assigned) where auto_assigned is true if
-/// we picked non-default ports.
-pub fn resolve_ports(http_port: Option<u16>, tcp_port: Option<u16>) -> Result<(u16, u16, bool)> {
-    let http = match http_port {
-        Some(0) => {
-            return Err(Error::UnsupportedArgument(
-                "--http-port 0 is not allowed; pick a specific port or omit the flag".into(),
-            ));
-        }
-        Some(p) if is_port_available(p) => p,
-        Some(p) => {
-            return Err(Error::PortInUse {
-                kind: PortKind::Http,
-                port: p,
-            });
-        }
-        None => {
-            if is_port_available(DEFAULT_HTTP_PORT) {
-                DEFAULT_HTTP_PORT
-            } else {
-                find_free_port(DEFAULT_HTTP_PORT + 1)
-                    .ok_or(Error::PortUnavailable(PortKind::Http))?
-            }
-        }
-    };
-
-    let tcp = match tcp_port {
-        Some(0) => {
-            return Err(Error::UnsupportedArgument(
-                "--tcp-port 0 is not allowed; pick a specific port or omit the flag".into(),
-            ));
-        }
-        Some(p) if is_port_available(p) => p,
-        Some(p) => {
-            return Err(Error::PortInUse {
-                kind: PortKind::Tcp,
-                port: p,
-            });
-        }
-        None => {
-            if is_port_available(DEFAULT_TCP_PORT) {
-                DEFAULT_TCP_PORT
-            } else {
-                find_free_port(DEFAULT_TCP_PORT + 1).ok_or(Error::PortUnavailable(PortKind::Tcp))?
-            }
-        }
-    };
-
-    let auto_assigned = http_port.is_none() && http != DEFAULT_HTTP_PORT
-        || tcp_port.is_none() && tcp != DEFAULT_TCP_PORT;
-
-    Ok((http, tcp, auto_assigned))
-}
-
-/// Build ClickHouse server port flags.
-pub fn port_flags(http_port: u16, tcp_port: u16) -> Vec<String> {
-    vec![
-        format!("--http_port={}", http_port),
-        format!("--tcp_port={}", tcp_port),
-    ]
-}
-
 /// Format a timestamp for now.
 pub fn now_timestamp() -> String {
     let duration = std::time::SystemTime::now()
@@ -1182,236 +707,23 @@ pub fn now_timestamp() -> String {
     format!("{}", duration.as_secs())
 }
 
-/// Recover orphaned servers for the current project via process discovery.
+/// Recover orphaned engine containers for the current project via Docker
+/// labels: a container whose `.dctl/servers/<key>.json` metadata file is
+/// missing gets one written, so the instance shows up in `server list` and
+/// can be stopped/removed normally.
 ///
-/// Scans for running ClickHouse processes whose cwd matches this project's
-/// `.dctl/servers/<name>/data/` path. If a process is found that has no
-/// metadata file, a new `ServerInfo` is saved so it appears in `server list`
-/// and can be managed normally. The recovered `pid` is the one discovery
-/// reports, so it is the process `stop` has to signal — the watchdog when the
-/// server has one — exactly as if `server start` had written it.
-pub fn recover_current_project_servers() -> Result<()> {
-    let lock = lock_metadata()?;
-    recover_current_project_servers_locked(&lock)
-}
-
+/// Covers all three engines. Safe to call repeatedly in one invocation; when
+/// Docker is unreachable the recovery is skipped silently (the per-engine
+/// helpers return `Ok(())` on connect failure).
 pub(crate) fn recover_current_project_servers_locked(lock: &MetadataLock) -> Result<()> {
-    recover_from_discovered_locked(&discovery::discover_clickhouse_processes(), lock)
-}
-
-/// Recovery over an already-completed process scan, so a caller that also needs
-/// the global view pays for `pgrep`/`lsof` once.
-fn recover_from_discovered_locked(
-    processes: &[discovery::DiscoveredProcess],
-    lock: &MetadataLock,
-) -> Result<()> {
-    let current_dir = std::env::current_dir()?
-        .canonicalize()?
-        .display()
-        .to_string();
-
-    for proc in processes {
-        // Canonicalize the discovered project root for comparison
-        let discovered_root = match std::path::Path::new(&proc.project_root).canonicalize() {
-            Ok(p) => p.display().to_string(),
-            Err(_) => proc.project_root.clone(),
-        };
-
-        if discovered_root != current_dir {
-            continue;
-        }
-
-        validate_server_name(&proc.server_name)?;
-        let info = ServerInfo {
-            name: proc.server_name.clone(),
-            pid: proc.pid,
-            version: proc
-                .version
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string()),
-            http_port: proc.http_port.unwrap_or(0),
-            tcp_port: proc.tcp_port.unwrap_or(0),
-            started_at: "recovered".to_string(),
-            cwd: current_dir.clone(),
-            engine: Engine::Clickhouse,
-            container_id: None,
-        };
-        recover_clickhouse_info_locked(&info, lock)?;
-    }
-
-    // Also recover orphaned Postgres and FalkorDB containers belonging to
-    // this project.
-    docker::recover_project_postgres_blocking(&current_dir, lock)?;
-    docker::recover_project_falkor_blocking(&current_dir, lock)
-}
-
-fn recover_clickhouse_info_locked(info: &ServerInfo, lock: &MetadataLock) -> Result<()> {
-    // A corrupt existing file is an error, not an absent entry that recovery
-    // is allowed to overwrite.
-    if load_running_info_locked(&info.name, lock)?.is_none() {
-        save_server_info_locked(info, lock)?;
-    }
+    let project_cwd = std::env::current_dir()
+        .and_then(|p| p.canonicalize())
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    docker::recover_project_postgres_blocking(&project_cwd, lock)?;
+    docker::recover_project_falkor_blocking(&project_cwd, lock)?;
+    docker::recover_project_clickhouse_blocking(&project_cwd, lock)?;
     Ok(())
-}
-
-/// A server entry for global listing — always running (discovered via process inspection).
-pub struct GlobalServerEntry {
-    pub name: String,
-    pub pid: u32,
-    pub project: String,
-    pub http_port: Option<u16>,
-    pub tcp_port: Option<u16>,
-    pub version: Option<String>,
-    pub engine: Engine,
-    pub container_id: Option<String>,
-}
-
-/// List all running ClickHouse servers across all projects via process discovery.
-/// (Postgres containers are not currently merged in — a future change will add
-/// `docker ps` based discovery here as well.)
-pub fn list_all_servers_global() -> Vec<GlobalServerEntry> {
-    global_entries(&discovery::discover_clickhouse_processes())
-}
-
-fn global_entries(processes: &[discovery::DiscoveredProcess]) -> Vec<GlobalServerEntry> {
-    processes
-        .iter()
-        .map(|p| GlobalServerEntry {
-            name: p.server_name.clone(),
-            pid: p.pid,
-            project: p.project_root.clone(),
-            http_port: p.http_port,
-            tcp_port: p.tcp_port,
-            version: p.version.clone(),
-            engine: Engine::Clickhouse,
-            container_id: None,
-        })
-        .collect()
-}
-
-/// A running server that occupies an installed ClickHouse version, wherever it
-/// was started from. Produced by [`servers_using_version`] for `local remove`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionUser {
-    pub name: String,
-    /// Project root the server was started from.
-    pub project: String,
-    pub pid: u32,
-    /// True when the server belongs to the current project, so its metadata is
-    /// reachable and [`kill_server`] can keep it consistent. Servers in other
-    /// projects can only be stopped by PID, like `server stop --global`.
-    pub current_project: bool,
-}
-
-/// Every running server — in this project and in every other project — that is
-/// running `version`.
-///
-/// `local remove` deletes a binary that running servers hold open, so the guard
-/// has to see past the current project's metadata (issue #600).
-pub fn servers_using_version(version: &str) -> Result<Vec<VersionUser>> {
-    // One process scan feeds both sources: discovery shells out to
-    // `pgrep`/`lsof`/`ps`, so scanning twice would double the cost of the guard.
-    let processes = discovery::discover_clickhouse_processes();
-    let project_servers = {
-        let lock = lock_metadata()?;
-        // Recover orphans first so a server whose metadata file is missing is
-        // still counted.
-        recover_from_discovered_locked(&processes, &lock)?;
-        list_running_servers_locked(&lock)?
-    };
-    Ok(select_version_users(
-        &project_servers,
-        &global_entries(&processes),
-        version,
-    ))
-}
-
-/// Merge project-scoped metadata with global process discovery and select the
-/// servers running `version`.
-///
-/// Both sources are consulted because each covers a gap in the other: metadata
-/// is project-scoped but survives a failed process scan, while discovery spans
-/// projects but depends on `pgrep`/`lsof`/`/proc`. The same server appears in
-/// both, so entries are de-duplicated by PID: when the watchdog is resolved,
-/// metadata for a running server carries the live PID of the discovered
-/// process, because discovery reports the supervising watchdog that
-/// `server start` recorded (issue #664). Identity is the fallback, so a server
-/// whose watchdog only one of the two sources resolved is still listed once.
-pub(crate) fn select_version_users(
-    project_servers: &[ServerInfo],
-    global: &[GlobalServerEntry],
-    version: &str,
-) -> Vec<VersionUser> {
-    let mut users: Vec<VersionUser> = project_servers
-        .iter()
-        .filter(|info| info.version == version)
-        .map(|info| VersionUser {
-            name: info.name.clone(),
-            project: info.cwd.clone(),
-            pid: info.pid,
-            current_project: true,
-        })
-        .collect();
-
-    for entry in global {
-        // A process whose version could not be read is treated as non-matching:
-        // blocking every removal on an unreadable command line would be
-        // unfixable by the user.
-        if entry.version.as_deref() != Some(version) {
-            continue;
-        }
-        // `(name, project)` names a server uniquely, so it settles the case
-        // the PID cannot: a heuristic that resolved the watchdog on one side
-        // only would otherwise list the same server twice.
-        if users.iter().any(|user| {
-            user.pid == entry.pid || (user.name == entry.name && user.project == entry.project)
-        }) {
-            continue;
-        }
-        users.push(VersionUser {
-            name: entry.name.clone(),
-            project: entry.project.clone(),
-            pid: entry.pid,
-            current_project: false,
-        });
-    }
-
-    users
-}
-
-/// Name the blocking servers for the `VersionInUse` error, so a server in
-/// another project is identifiable from the message alone.
-pub(crate) fn describe_version_users(users: &[VersionUser]) -> String {
-    users
-        .iter()
-        .map(|user| format!("'{}' in {} (PID {})", user.name, user.project, user.pid))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-/// Kill a server found via global process discovery.
-/// Takes a PID directly and kills it, without requiring local metadata.
-pub fn kill_server_by_pid(pid: u32) -> Result<()> {
-    if !is_process_alive(pid) {
-        return Err(Error::ServerNotRunning(format!("PID {}", pid)));
-    }
-
-    kill_process(pid)
-}
-
-/// Make sure the server discovered at `pid` is no longer running, for
-/// `local remove --force` stopping a blocker in another project.
-///
-/// Unlike [`kill_server_by_pid`], a process that has already exited is not an
-/// error: the discovery scan and this call are separated by other blockers
-/// being stopped, and a server that went away on its own is exactly the state
-/// the removal is after. `server stop --global` keeps the strict variant, where
-/// a PID that vanished since the listing is worth telling the user about.
-pub fn ensure_stopped_by_pid(pid: u32) -> Result<()> {
-    match kill_server_by_pid(pid) {
-        Err(Error::ServerNotRunning(_)) => Ok(()),
-        other => other,
-    }
 }
 
 #[cfg(test)]
@@ -1682,22 +994,6 @@ mod tests {
     }
 
     #[test]
-    fn advisory_count_ignores_corrupt_unrelated_metadata() {
-        let directory = tempfile::tempdir().unwrap();
-        let lock = MetadataLock::acquire_at(directory.path()).unwrap();
-        let mut healthy = test_info(std::process::id(), "25.12.1.1");
-        healthy.name = "healthy".into();
-        save_server_info_locked(&healthy, &lock).unwrap();
-        std::fs::write(directory.path().join("corrupt.json"), b"not json").unwrap();
-
-        assert_eq!(advisory_running_server_count_locked(&lock), 1);
-        assert!(matches!(
-            list_all_servers_locked(&lock),
-            Err(Error::ServerMetadataParse { .. })
-        ));
-    }
-
-    #[test]
     fn concurrent_unlocked_readers_never_observe_partial_json() {
         let directory = tempfile::tempdir().unwrap();
         let lock = MetadataLock::acquire_at(directory.path()).unwrap();
@@ -1758,22 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn recovery_does_not_overwrite_corrupt_live_metadata() {
-        let directory = tempfile::tempdir().unwrap();
-        let lock = MetadataLock::acquire_at(directory.path()).unwrap();
-        let path = directory.path().join("default.json");
-        let partial = br#"{"name":"default""#;
-        std::fs::write(&path, partial).unwrap();
-
-        let error =
-            recover_clickhouse_info_locked(&test_info(std::process::id(), "recovered"), &lock)
-                .unwrap_err();
-
-        assert!(matches!(error, Error::ServerMetadataParse { .. }));
-        assert_eq!(std::fs::read(path).unwrap(), partial);
-    }
-
-    #[test]
     fn restart_waiting_during_normalization_commits_last() {
         let directory = tempfile::tempdir().unwrap();
         let lock = MetadataLock::acquire_at(directory.path()).unwrap();
@@ -1798,347 +1078,5 @@ mod tests {
         let final_info = load_info_locked("default", &lock).unwrap().unwrap();
         assert_eq!(final_info.pid, std::process::id());
         assert_eq!(final_info.version, "restarted");
-    }
-
-    #[test]
-    fn stopped_and_out_of_range_pids_are_never_alive() {
-        assert!(!is_process_alive(0));
-        assert!(!is_process_alive(u32::MAX));
-    }
-
-    #[tokio::test]
-    async fn readiness_timeout_stops_child() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exec sleep 10"])
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-
-        let error = wait_for_server_ready(
-            &mut child,
-            "readiness-timeout-test",
-            0,
-            0,
-            Path::new("server.log"),
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("did not become ready"));
-        assert!(error.contains("server.log"));
-        assert!(!is_process_alive(pid));
-    }
-
-    #[test]
-    fn explicit_ports_must_be_available() {
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let http_error = resolve_ports(Some(port), None).unwrap_err();
-        assert!(http_error.to_string().contains("HTTP port"));
-
-        let tcp_error = resolve_ports(None, Some(port)).unwrap_err();
-        assert!(tcp_error.to_string().contains("TCP port"));
-    }
-
-    #[test]
-    fn explicit_ports_reject_zero() {
-        let http_error = resolve_ports(Some(0), None).unwrap_err();
-        assert!(
-            matches!(http_error, Error::UnsupportedArgument(msg) if msg.contains("--http-port 0"))
-        );
-
-        let tcp_error = resolve_ports(None, Some(0)).unwrap_err();
-        assert!(
-            matches!(tcp_error, Error::UnsupportedArgument(msg) if msg.contains("--tcp-port 0"))
-        );
-    }
-
-    // ── ensure_stopped_by_pid (issue #600) ─────────────────────────────
-
-    /// A PID that certainly belonged to a process and certainly has exited:
-    /// the fake server `local remove` discovered but which quit before
-    /// `--force` reached it.
-    fn exited_pid() -> u32 {
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .expect("spawn short-lived process");
-        child.wait().expect("reap short-lived process");
-        child.id()
-    }
-
-    #[test]
-    fn a_blocker_that_exited_since_discovery_counts_as_stopped() {
-        let pid = exited_pid();
-
-        assert!(
-            matches!(kill_server_by_pid(pid), Err(Error::ServerNotRunning(_))),
-            "`server stop --global` keeps reporting a vanished PID"
-        );
-        ensure_stopped_by_pid(pid).expect("an already-exited blocker must not abort the removal");
-    }
-
-    // ── kill_process escalation (issue #664) ───────────────────────────
-
-    /// SIGKILLs whatever the escalation test still owns, so a failed
-    /// assertion cannot leak a sleeping process.
-    struct KillOnDrop(Vec<u32>);
-
-    impl Drop for KillOnDrop {
-        fn drop(&mut self) {
-            for &pid in &self.0 {
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGKILL);
-                }
-            }
-        }
-    }
-
-    /// A stand-in for a watchdog started with `CLICKHOUSE_WATCHDOG_NO_FORWARD=1`:
-    /// it ignores SIGTERM and supervises a child that a SIGKILL to the parent
-    /// would leave running. Double-forked so both processes belong to init and
-    /// are reaped, instead of lingering as zombies of the test process, which
-    /// `kill(pid, 0)` cannot tell from a running server.
-    ///
-    /// Returns `(watchdog, supervised server)`.
-    fn spawn_sigterm_ignoring_pair() -> (u32, u32) {
-        use std::io::BufRead;
-
-        let mut spawner = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sh -c \"$FAKE_WATCHDOG\" &")
-            .env(
-                "FAKE_WATCHDOG",
-                r#"trap '' TERM; sleep 30 & printf '%s %s\n' "$$" "$!"; wait"#,
-            )
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .expect("spawn the fake watchdog pair");
-        let stdout = spawner.stdout.take().expect("piped stdout");
-        spawner.wait().expect("reap the intermediate shell");
-
-        let mut line = String::new();
-        std::io::BufReader::new(stdout)
-            .read_line(&mut line)
-            .expect("read the pair's PIDs");
-        let mut pids = line
-            .split_whitespace()
-            .map(|pid| pid.parse::<u32>().expect("a PID per field"));
-        let watchdog = pids.next().expect("the watchdog PID");
-        let server = pids.next().expect("the supervised PID");
-        (watchdog, server)
-    }
-
-    #[test]
-    fn the_escalation_path_kills_the_server_the_watchdog_supervised() {
-        let (watchdog, server) = spawn_sigterm_ignoring_pair();
-        let _cleanup = KillOnDrop(vec![watchdog, server]);
-
-        assert_ne!(watchdog, server, "the fixture must fork a real child");
-        assert!(
-            child_pids(watchdog).contains(&server),
-            "the child lookup must see the supervised process"
-        );
-
-        kill_process(watchdog).expect("stopping a server that ignores SIGTERM must succeed");
-
-        assert!(!is_process_alive(watchdog));
-        assert!(
-            !is_process_alive(server),
-            "a SIGKILLed watchdog cannot forward the signal, so the server it \
-             supervised has to be killed with it"
-        );
-    }
-
-    #[test]
-    fn a_process_with_no_children_has_no_supervised_pids() {
-        assert!(child_pids(exited_pid()).is_empty());
-    }
-
-    // ── select_version_users / describe_version_users (issue #600) ──────
-
-    fn named_info(name: &str, pid: u32, version: &str, project: &str) -> ServerInfo {
-        ServerInfo {
-            name: name.into(),
-            cwd: project.into(),
-            ..test_info(pid, version)
-        }
-    }
-
-    fn global_entry(
-        name: &str,
-        pid: u32,
-        version: Option<&str>,
-        project: &str,
-    ) -> GlobalServerEntry {
-        GlobalServerEntry {
-            name: name.into(),
-            pid,
-            project: project.into(),
-            http_port: Some(8123),
-            tcp_port: Some(9000),
-            version: version.map(str::to_string),
-            engine: Engine::Clickhouse,
-            container_id: None,
-        }
-    }
-
-    #[test]
-    fn no_running_server_on_the_version_leaves_it_free_to_remove() {
-        let users = select_version_users(
-            &[named_info("default", 10, "25.12.9.61", "/a")],
-            &[global_entry("dev", 20, Some("25.12.9.61"), "/b")],
-            "26.9.1.217",
-        );
-
-        assert!(users.is_empty());
-    }
-
-    #[test]
-    fn a_server_in_another_project_blocks_the_version() {
-        let users = select_version_users(
-            &[],
-            &[global_entry("dev", 4242, Some("26.9.1.217"), "/other")],
-            "26.9.1.217",
-        );
-
-        assert_eq!(
-            users,
-            vec![VersionUser {
-                name: "dev".into(),
-                project: "/other".into(),
-                pid: 4242,
-                current_project: false,
-            }]
-        );
-    }
-
-    #[test]
-    fn the_same_server_seen_in_metadata_and_discovery_is_reported_once() {
-        let users = select_version_users(
-            &[named_info("default", 777, "26.9.1.217", "/here")],
-            &[global_entry("default", 777, Some("26.9.1.217"), "/here")],
-            "26.9.1.217",
-        );
-
-        assert_eq!(
-            users,
-            vec![VersionUser {
-                name: "default".into(),
-                project: "/here".into(),
-                pid: 777,
-                current_project: true,
-            }],
-            "the current project's metadata entry wins, so --force can stop it by name"
-        );
-    }
-
-    #[test]
-    fn one_server_reported_under_two_pids_is_still_listed_once() {
-        // Discovery resolved the watchdog and the metadata file still carries
-        // the supervised child (written before this CLI version, or by a
-        // recovery that could not read the parent), so the PIDs differ while
-        // the server is one and the same.
-        let users = select_version_users(
-            &[named_info("default", 4211, "26.9.1.217", "/here")],
-            &[global_entry("default", 4210, Some("26.9.1.217"), "/here")],
-            "26.9.1.217",
-        );
-
-        assert_eq!(
-            users,
-            vec![VersionUser {
-                name: "default".into(),
-                project: "/here".into(),
-                pid: 4211,
-                current_project: true,
-            }],
-            "the VersionInUse message must not name the same server twice"
-        );
-    }
-
-    #[test]
-    fn servers_of_the_same_name_in_different_projects_are_both_listed() {
-        let users = select_version_users(
-            &[named_info("default", 1, "26.9.1.217", "/here")],
-            &[global_entry("default", 2, Some("26.9.1.217"), "/there")],
-            "26.9.1.217",
-        );
-
-        assert_eq!(
-            users
-                .iter()
-                .map(|user| (user.name.as_str(), user.project.as_str()))
-                .collect::<Vec<_>>(),
-            vec![("default", "/here"), ("default", "/there")]
-        );
-    }
-
-    #[test]
-    fn servers_from_both_sources_are_merged() {
-        let users = select_version_users(
-            &[named_info("default", 1, "26.9.1.217", "/here")],
-            &[
-                global_entry("default", 1, Some("26.9.1.217"), "/here"),
-                global_entry("dev", 2, Some("26.9.1.217"), "/there"),
-                global_entry("old", 3, Some("25.12.9.61"), "/there"),
-            ],
-            "26.9.1.217",
-        );
-
-        assert_eq!(
-            users
-                .iter()
-                .map(|user| (user.name.as_str(), user.pid, user.current_project))
-                .collect::<Vec<_>>(),
-            vec![("default", 1, true), ("dev", 2, false)]
-        );
-    }
-
-    #[test]
-    fn a_discovered_process_with_an_unreadable_version_does_not_block() {
-        let users =
-            select_version_users(&[], &[global_entry("dev", 9, None, "/other")], "26.9.1.217");
-
-        assert!(
-            users.is_empty(),
-            "an unknown version must not make removal impossible"
-        );
-    }
-
-    #[test]
-    fn a_postgres_container_never_matches_a_clickhouse_version() {
-        let mut postgres = named_info("pg", 0, "postgres:17", "/here");
-        postgres.engine = Engine::Postgres;
-        postgres.container_id = Some("abc123".into());
-
-        assert!(select_version_users(&[postgres], &[], "26.9.1.217").is_empty());
-    }
-
-    #[test]
-    fn described_users_name_the_server_the_project_and_the_pid() {
-        let described = describe_version_users(&[
-            VersionUser {
-                name: "default".into(),
-                project: "/here".into(),
-                pid: 1,
-                current_project: true,
-            },
-            VersionUser {
-                name: "dev".into(),
-                project: "/there".into(),
-                pid: 2,
-                current_project: false,
-            },
-        ]);
-
-        assert_eq!(
-            described,
-            "'default' in /here (PID 1), 'dev' in /there (PID 2)"
-        );
     }
 }

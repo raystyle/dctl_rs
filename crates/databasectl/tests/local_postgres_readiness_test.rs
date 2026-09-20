@@ -900,7 +900,7 @@ fn immediate_exit_redacts_bounded_logs_without_setup_success_or_telemetry_noise(
 
 #[test]
 fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_selection() {
-    let (output, requests, project, home, _docker) = run_start(
+    let (output, requests, project, _home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -945,38 +945,6 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
             .count(),
         1
     );
-
-    let clickhouse_data = project.path().join(".dctl/servers/dev/data");
-    std::fs::create_dir_all(&clickhouse_data).expect("create ClickHouse data directory");
-    let selection_home = tempfile::tempdir().expect("create selection home");
-    // G-A: point the second subprocess at the still-live fake daemon —
-    // Docker-engine liveness checks need a reachable socket, and a
-    // Docker-absent machine's real socket state must not leak into this
-    // test (run_start keeps home + daemon alive for exactly this).
-    let stop = Command::new(dctl_binary())
-        .env_clear()
-        .env("DO_NOT_TRACK", "1")
-        .env("HOME", selection_home.path())
-        .env("PATH", "/usr/bin:/bin")
-        .env(
-            "DOCKER_HOST",
-            format!("unix://{}/docker.sock", home.path().display()),
-        )
-        .current_dir(project.path())
-        .args(["local", "--json", "server", "stop"])
-        .output()
-        .expect("run omitted ClickHouse stop");
-
-    assert!(
-        stop.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&stop.stderr)
-    );
-    let result: serde_json::Value = serde_json::from_slice(&stop.stdout).expect("stop JSON");
-    assert_eq!(result["name"], "dev");
-    assert_eq!(result["already_stopped"], true);
-    assert_eq!(result["selection"], "implicit");
-    assert!(clickhouse_data.is_dir());
 }
 
 #[test]

@@ -12,7 +12,6 @@ mod skills;
 mod telemetry;
 mod update;
 mod user_agent;
-mod version_manager;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, FromArgMatches};
@@ -381,12 +380,12 @@ mod tests {
     fn command_json_flag_tracks_each_command() {
         // Human-readable commands report an explicit `false` flag.
         assert_eq!(
-            command_json_flag(&parse(&["dctl", "local", "list"])),
+            command_json_flag(&parse(&["dctl", "local", "server", "list"])),
             Some(false)
         );
         // --json is picked up as a global flag.
         assert_eq!(
-            command_json_flag(&parse(&["dctl", "local", "--json", "list"])),
+            command_json_flag(&parse(&["dctl", "local", "--json", "server", "list"])),
             Some(true)
         );
         // Management commands expose their explicit JSON flag.
@@ -415,7 +414,7 @@ mod tests {
         // --json suppresses the notice so machine output stays clean,
         // regardless of agent detection.
         assert!(!should_show_update_notice(&parse(&[
-            "dctl", "local", "--json", "list"
+            "dctl", "local", "--json", "server", "list"
         ])));
         // The update command never nags about itself.
         assert!(!should_show_update_notice(&parse(&["dctl", "update"])));

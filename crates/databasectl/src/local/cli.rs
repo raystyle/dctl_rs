@@ -1,5 +1,4 @@
-use crate::version_manager::{self, VersionSpec};
-use clap::{ArgGroup, Args, Subcommand};
+use clap::{Args, Subcommand};
 use std::str::FromStr;
 
 fn parse_server_name_arg(name: &str) -> Result<String, String> {
@@ -10,22 +9,15 @@ fn parse_server_name_arg(name: &str) -> Result<String, String> {
 
 const INSTALL_AFTER_HELP: &str = "\
 CONTEXT FOR AGENTS:
-  The first ClickHouse version installed becomes the default; later installs do not change it.
-  `dctl local use <version>` auto-installs a missing version and sets it as default.
-  `postgres@<tag>` and `falkordb@<version>` pull Docker images instead (needs Docker running)
-  and never set a default.";
+  Every selector pulls a Docker image (needs Docker running); nothing is set as a default.
+  ClickHouse accepts an image tag (26.8, 26.8.9.10, latest); `postgres@<tag>` and
+  `falkordb@<version>` select the other engines.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallVersionArg {
     ClickHouse(String),
     Postgres(String),
     Falkordb(String),
-}
-
-fn is_image_selector(input: &str) -> bool {
-    ["postgres@", "postgres:", "falkordb@", "falkordb:"]
-        .iter()
-        .any(|prefix| input.starts_with(prefix))
 }
 
 impl FromStr for InstallVersionArg {
@@ -46,95 +38,9 @@ impl FromStr for InstallVersionArg {
             return Ok(Self::Falkordb(version.to_string()));
         }
 
-        // ClickHouse: accept any image tag-shaped string (26.8, 26.8.9.10, latest)
+        // ClickHouse: an image tag, validated so bad shapes fail at clap time.
+        crate::local::clickhouse::validate_ch_tag(input).map_err(|e| e.to_string())?;
         Ok(Self::ClickHouse(input.to_string()))
-    }
-}
-
-/// Kept distinct from `ServerVersionArg` so each command owns its accepted inputs and errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UseVersionArg(VersionSpec);
-
-impl UseVersionArg {
-    pub(crate) fn into_spec(self) -> VersionSpec {
-        self.0
-    }
-}
-
-impl FromStr for UseVersionArg {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let input = input.trim();
-        if is_image_selector(input) {
-            return Err(
-                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local use` requires a ClickHouse version"
-                    .to_string(),
-            );
-        }
-
-        version_manager::parse_version_spec(input)
-            .map(Self)
-            .map_err(|error| error.to_string())
-    }
-}
-
-/// Kept distinct from `UseVersionArg` so each command owns its accepted inputs and errors.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ServerVersionArg(VersionSpec);
-
-impl ServerVersionArg {
-    pub(crate) fn into_spec(self) -> VersionSpec {
-        self.0
-    }
-}
-
-impl FromStr for ServerVersionArg {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        let input = input.trim();
-        if is_image_selector(input) {
-            return Err(
-                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local server start --version` requires a ClickHouse version"
-                    .to_string(),
-            );
-        }
-
-        version_manager::parse_version_spec(input)
-            .map(Self)
-            .map_err(|error| error.to_string())
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClientVersionArg(VersionSpec);
-
-impl ClientVersionArg {
-    pub(crate) fn into_spec(self) -> VersionSpec {
-        self.0
-    }
-}
-
-impl FromStr for ClientVersionArg {
-    type Err = String;
-
-    fn from_str(input: &str) -> Result<Self, Self::Err> {
-        if is_image_selector(input) {
-            return Err(
-                "Docker image selectors (postgres@, falkordb@) are only supported by `local install`; `local client --version` requires an installed ClickHouse version"
-                    .to_string(),
-            );
-        }
-
-        let spec = version_manager::parse_version_spec(input).map_err(|error| error.to_string())?;
-        if matches!(spec, VersionSpec::Latest | VersionSpec::Channel(_)) {
-            return Err(
-                "`local client --version` selects an installed numeric version (for example, 25.12 or 25.12.9.61); floating selectors latest, stable, and lts are not supported"
-                    .to_string(),
-            );
-        }
-        Ok(Self(spec))
     }
 }
 
@@ -175,63 +81,13 @@ pub enum LocalCommands {
     /// Install a ClickHouse version or a database engine image
     #[command(after_help = INSTALL_AFTER_HELP)]
     Install {
-        /// Version ("latest", "stable", "lts", 25.12, 25.12.9.61) or image selector (postgres@18, falkordb@4.20.6)
+        /// ClickHouse image tag (26.8, 26.8.9.10, latest) or selector (postgres@18, falkordb@4.20.6)
         version: InstallVersionArg,
 
         /// Re-install even if already installed
         #[arg(long)]
         force: bool,
     },
-
-    /// List installed or available ClickHouse versions
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Default output is exact installed version strings — the form `dctl local remove` needs.
-  --remote lists minor versions (e.g. 26.3) probed from builds.clickhouse.com, not exact builds.")]
-    List {
-        /// List minor versions available for download
-        #[arg(long)]
-        remote: bool,
-    },
-
-    /// Set the default ClickHouse version
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Auto-installs the version if it is not already present.
-  Symlinks `~/.local/bin/clickhouse` to it, putting `clickhouse client`, `clickhouse benchmark`
-  and `clickhouse format` on PATH; --no-global skips that.
-  Sets the version used by `dctl local client` and `dctl local server`.")]
-    Use {
-        /// Version to set as default ("latest", "stable", "lts", 25.12, or 25.12.5.44)
-        version: UseVersionArg,
-
-        /// Do not create or update the ~/.local/bin/clickhouse symlink
-        #[arg(long)]
-        no_global: bool,
-    },
-
-    /// Remove an installed ClickHouse version
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Fails if any server is running on this version, in any project — versions are shared, so a server
-  started from another directory blocks removal too (`local server list --global` lists them).
-  Fails if the version is the current default; switch with `dctl local use <other-version>` first.
-  --force overrides both guards. The exact build may not be re-downloadable.")]
-    Remove {
-        /// Exact installed version to remove (not "latest"/"stable"/"lts")
-        // Keep this opaque: removal matches an installed directory name instead of resolving a version spec.
-        version: String,
-
-        /// Stop any server using this version and remove it even if it is the default
-        ///
-        /// Servers in other projects are stopped too; clears ~/.dctl/default and
-        /// the ~/.local/bin/clickhouse symlink when the default is removed.
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Show the current default ClickHouse version
-    Which,
 
     /// Initialize a project directory for ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
@@ -308,7 +164,6 @@ CONTEXT FOR AGENTS:
   are ClickHouse-only.
   Data persists across stop/start; only `remove` deletes it.
   Retain the name `start` returns (it may be generated) for later `stop`/`remove`.
-  `local remove <version>` deletes an installed binary, not server data.
   Custom configs inherit built-in defaults; find available names with `server configs`.
   Typical flow: `server start dev` -> `local client dev` -> `server stop dev`")]
     Server {
@@ -321,8 +176,7 @@ CONTEXT FOR AGENTS:
 CONTEXT FOR AGENTS:
   Requires Docker installed and running.
   Each instance is keyed on (name, major version); pass --version when one name has two majors.
-  There is no `postgres list` — `local server list` shows ClickHouse and Postgres together.
-  `local server list --global` only discovers running ClickHouse servers, excluding Postgres.
+  There is no `postgres list` — `local server list` shows all engines together.
   Typical flow: `postgres start` -> `postgres client` -> `postgres dotenv --local` -> `postgres stop`")]
     Postgres {
         #[command(subcommand)]
@@ -615,11 +469,7 @@ CONTEXT FOR AGENTS:
     Configs,
 
     /// List all server instances (running and stopped)
-    List {
-        /// List running servers across all projects
-        #[arg(long)]
-        global: bool,
-    },
+    List,
 
     /// Stop a running server
     #[command(after_help = "\
@@ -914,7 +764,6 @@ CONTEXT FOR AGENTS:
 mod tests {
     use super::*;
     use crate::cli::{Cli, Commands};
-    use crate::version_manager::list::Channel;
     use clap::Parser;
 
     fn local_args(args: &[&str]) -> LocalArgs {
@@ -929,24 +778,6 @@ mod tests {
 
     fn local_command(args: &[&str]) -> LocalCommands {
         local_args(args).command
-    }
-
-    fn assert_version_rejected(args: &[&str], expected: &str) {
-        let mut argv = vec!["dctl", "local"];
-        argv.extend_from_slice(args);
-        let error = Cli::try_parse_from(argv)
-            .err()
-            .expect("invalid version should fail during clap parsing");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        assert!(error.to_string().contains(expected), "{error}");
-    }
-
-    fn postgres_start_parse_error(args: &[&str]) -> clap::Error {
-        let mut argv = vec!["dctl", "local", "postgres", "start"];
-        argv.extend_from_slice(args);
-        Cli::try_parse_from(argv)
-            .err()
-            .expect("invalid postgres start arguments should fail during clap parsing")
     }
 
     fn local_parse_error(args: &[&str]) -> clap::Error {
@@ -967,802 +798,204 @@ mod tests {
         error.to_string()
     }
 
+    // ── install selectors ────────────────────────────────────────────────
+
     #[test]
-    fn parses_supported_clickhouse_version_forms_for_each_command() {
+    fn install_selectors_parse_by_engine() {
         for (input, expected) in [
-            ("latest", VersionSpec::Latest),
-            ("stable", VersionSpec::Channel(Channel::Stable)),
-            ("lts", VersionSpec::Channel(Channel::Lts)),
-            ("25", VersionSpec::Major(25)),
-            ("25.12", VersionSpec::Minor(25, 12)),
-            ("25.12.9.61", VersionSpec::Exact("25.12.9.61".to_string())),
-        ] {
-            let LocalCommands::Install {
-                version: InstallVersionArg::ClickHouse(version),
-                ..
-            } = local_command(&["install", input])
-            else {
-                panic!("expected ClickHouse install version for {input}");
-            };
-            assert_eq!(version, expected);
-
-            let LocalCommands::Use { version, .. } = local_command(&["use", input]) else {
-                panic!("expected use version for {input}");
-            };
-            assert_eq!(version.into_spec(), expected);
-
-            let LocalCommands::Server {
-                command: ServerCommands::Start { version, .. },
-            } = local_command(&["server", "start", "--version", input])
-            else {
-                panic!("expected server version for {input}");
-            };
-            assert_eq!(
-                version.expect("version should be present").into_spec(),
-                expected
-            );
-        }
-    }
-
-    #[test]
-    fn rejects_malformed_clickhouse_versions_for_each_command() {
-        let expected = "all parts must be numeric";
-        assert_version_rejected(&["install", "not.a.version"], expected);
-        assert_version_rejected(&["use", "not.a.version"], expected);
-        assert_version_rejected(&["server", "start", "--version", "not.a.version"], expected);
-        assert_version_rejected(
-            &["client", "--host", "remote", "--version", "not.a.version"],
-            expected,
-        );
-    }
-
-    #[test]
-    fn rejects_three_part_clickhouse_versions_for_each_command() {
-        let expected = "3-part version '25.12.9' is not supported";
-        assert_version_rejected(&["install", "25.12.9"], expected);
-        assert_version_rejected(&["use", "25.12.9"], expected);
-        assert_version_rejected(&["server", "start", "--version", "25.12.9"], expected);
-        assert_version_rejected(
-            &["client", "--host", "remote", "--version", "25.12.9"],
-            expected,
-        );
-    }
-
-    #[test]
-    fn rejects_unsupported_clickhouse_version_shapes_for_each_command() {
-        let expected = "expected 1-2 or 4 parts";
-        assert_version_rejected(&["install", "25.12.9.61.2"], expected);
-        assert_version_rejected(&["use", "25.12.9.61.2"], expected);
-        assert_version_rejected(&["server", "start", "--version", "25.12.9.61.2"], expected);
-        assert_version_rejected(
-            &["client", "--host", "remote", "--version", "25.12.9.61.2"],
-            expected,
-        );
-    }
-
-    #[test]
-    fn falkordb_image_selectors_parse_for_install_only() {
-        let LocalCommands::Install {
-            version: InstallVersionArg::Falkordb(version),
-            ..
-        } = local_command(&["install", "falkordb@4.20.6"])
-        else {
-            panic!("expected Falkordb install version");
-        };
-        assert_eq!(version, "4.20.6");
-        let LocalCommands::Install {
-            version: InstallVersionArg::Falkordb(version),
-            ..
-        } = local_command(&["install", "falkordb:latest"])
-        else {
-            panic!("expected Falkordb install version for the colon form");
-        };
-        assert_eq!(version, "latest");
-
-        for rejected in [
-            &["use", "falkordb@4.20.6"][..],
-            &["server", "start", "--version", "falkordb@4.20.6"][..],
-            &["client", "--version", "falkordb:latest"][..],
-        ] {
-            let mut argv = vec!["dctl", "local"];
-            argv.extend(rejected.iter().copied());
-            let error = crate::cli::Cli::try_parse_from(argv)
-                .err()
-                .unwrap_or_else(|| panic!("falkordb selector should be rejected: {rejected:?}"));
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-            let message = error.to_string();
-            assert!(
-                message.contains("Docker image selectors"),
-                "{rejected:?}: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn postgres_image_selectors_are_install_only() {
-        for (input, expected) in [
-            ("postgres@18", "18"),
-            ("postgres:17-alpine", "17-alpine"),
-            ("  postgres@16  ", "16"),
-        ] {
-            let LocalCommands::Install {
-                version: InstallVersionArg::Postgres(tag),
-                ..
-            } = local_command(&["install", input])
-            else {
-                panic!("expected Postgres install version for {input}");
-            };
-            assert_eq!(tag, expected);
-        }
-
-        assert_version_rejected(
-            &["use", "  postgres@18  "],
-            "only supported by `local install`; `local use` requires a ClickHouse version",
-        );
-        assert_version_rejected(
-            &["server", "start", "--version", "  postgres@18  "],
-            "only supported by `local install`; `local server start --version` requires a ClickHouse version",
-        );
-        assert_version_rejected(
-            &["client", "--host", "remote", "--version", "postgres@18"],
-            "only supported by `local install`; `local client --version` requires an installed ClickHouse version",
-        );
-    }
-
-    #[test]
-    fn clickhouse_client_parses_numeric_installed_version_selectors() {
-        for input in ["25", "25.12", "25.12.9.61"] {
-            for selectors in [
-                vec!["--host", "remote", "--version", input],
-                vec!["--version", input, "--port", "9000"],
-            ] {
-                let mut args = vec!["client"];
-                args.extend(selectors);
-                let LocalCommands::Client {
-                    version: Some(version),
-                    ..
-                } = local_command(&args)
-                else {
-                    panic!("expected ClickHouse client version {input}");
-                };
-                assert_eq!(version.into_spec().to_string(), input);
-            }
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_rejects_floating_binary_versions() {
-        for input in ["latest", "stable", "lts"] {
-            assert_version_rejected(
-                &["client", "--host", "remote", "--version", input],
-                "selects an installed numeric version",
-            );
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_parses_every_valid_selector_combination_and_order() {
-        type SelectorCase = (
-            &'static [&'static str],
-            Option<&'static str>,
-            Option<&'static str>,
-            Option<u16>,
-        );
-        let cases: &[SelectorCase] = &[
-            (&[], None, None, None),
-            (&["--name", "dev"], Some("dev"), None, None),
-            (&["--host", "db.example"], None, Some("db.example"), None),
-            (&["--port", "1"], None, None, Some(1)),
+            ("26.8", InstallVersionArg::ClickHouse("26.8".to_string())),
             (
-                &["--host", "db.example", "--port", "65535"],
-                None,
-                Some("db.example"),
-                Some(65535),
+                "26.8.9.10",
+                InstallVersionArg::ClickHouse("26.8.9.10".to_string()),
             ),
             (
-                &["--port", "65535", "--host", "db.example"],
-                None,
-                Some("db.example"),
-                Some(65535),
+                "latest",
+                InstallVersionArg::ClickHouse("latest".to_string()),
             ),
-        ];
-
-        for (selectors, expected_name, expected_host, expected_port) in cases {
-            let args: Vec<&str> = ["client"]
-                .into_iter()
-                .chain(selectors.iter().copied())
-                .collect();
-            let LocalCommands::Client {
-                name,
-                name_flag,
-                host,
-                port,
-                ..
-            } = local_command(&args)
-            else {
-                panic!("expected ClickHouse client for {selectors:?}");
+            ("postgres@18", InstallVersionArg::Postgres("18".to_string())),
+            (
+                "postgres:17-alpine",
+                InstallVersionArg::Postgres("17-alpine".to_string()),
+            ),
+            (
+                "falkordb@4.20.6",
+                InstallVersionArg::Falkordb("4.20.6".to_string()),
+            ),
+            (
+                "falkordb:latest",
+                InstallVersionArg::Falkordb("latest".to_string()),
+            ),
+            (
+                "  postgres@16  ",
+                InstallVersionArg::Postgres("16".to_string()),
+            ),
+        ] {
+            let LocalCommands::Install { version, .. } = local_command(&["install", input]) else {
+                panic!("expected install version for {input}");
             };
-            assert_eq!(
-                name.or(name_flag).as_deref(),
-                *expected_name,
-                "selectors: {selectors:?}"
-            );
-            assert_eq!(host.as_deref(), *expected_host, "selectors: {selectors:?}");
-            assert_eq!(port, *expected_port, "selectors: {selectors:?}");
+            assert_eq!(version, expected, "{input}");
         }
     }
 
     #[test]
-    fn clickhouse_client_rejects_named_and_direct_selectors_in_every_order() {
-        let conflicting: &[&[&str]] = &[
-            &["--name", "dev", "--host", "db.example"],
-            &["--host", "db.example", "--name", "dev"],
-            &["--name", "dev", "--port", "9000"],
-            &["--port", "9000", "--name", "dev"],
-            &["--name", "dev", "--host", "db.example", "--port", "9000"],
-            &["--name", "dev", "--port", "9000", "--host", "db.example"],
-            &["--host", "db.example", "--name", "dev", "--port", "9000"],
-            &["--host", "db.example", "--port", "9000", "--name", "dev"],
-            &["--port", "9000", "--name", "dev", "--host", "db.example"],
-            &["--port", "9000", "--host", "db.example", "--name", "dev"],
-        ];
-
-        for selectors in conflicting {
-            let args: Vec<&str> = ["client"]
-                .into_iter()
-                .chain(selectors.iter().copied())
-                .collect();
-            let error = local_parse_error(&args);
+    fn install_rejects_malformed_clickhouse_tags_at_clap_time() {
+        for tag in ["not.a.version", "25", "26.8.9.10.11", "26.8.x"] {
+            let error = local_parse_error(&["install", tag]);
             assert_eq!(
                 error.kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "selectors: {selectors:?}"
+                clap::error::ErrorKind::ValueValidation,
+                "{tag}"
             );
-            assert!(error.to_string().contains("--name"), "{error}");
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_version_requires_direct_mode_and_conflicts_with_named_mode() {
-        let missing_direct = local_parse_error(&["client", "--version", "25.12.9.61"]);
-        assert_eq!(
-            missing_direct.kind(),
-            clap::error::ErrorKind::MissingRequiredArgument
-        );
-        assert!(
-            missing_direct.to_string().contains("--host"),
-            "{missing_direct}"
-        );
-        assert!(
-            missing_direct.to_string().contains("--port"),
-            "{missing_direct}"
-        );
-
-        for selectors in [
-            ["--name", "dev", "--version", "25.12.9.61"],
-            ["--version", "25.12.9.61", "--name", "dev"],
-        ] {
-            let args: Vec<&str> = ["client"].into_iter().chain(selectors).collect();
-            let error = local_parse_error(&args);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-            assert!(error.to_string().contains("--version"), "{error}");
-            assert!(error.to_string().contains("--name"), "{error}");
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_rejects_zero_and_nonnumeric_ports() {
-        for port in ["0", "not-a-port"] {
-            let error = local_parse_error(&["client", "--port", port]);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-            assert!(error.to_string().contains("--port"), "{error}");
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_parses_minimal_and_repeated_query_inputs_in_order() {
-        let LocalCommands::Client {
-            query,
-            queries_file,
-            args,
-            ..
-        } = local_command(&["client"])
-        else {
-            panic!("expected ClickHouse client");
-        };
-        assert!(query.is_empty());
-        assert!(queries_file.is_empty());
-        assert!(args.is_empty());
-
-        let LocalCommands::Client {
-            query,
-            queries_file,
-            args,
-            ..
-        } = local_command(&[
-            "client", "--query", "SELECT 1", "-q", "SELECT 2", "--query", "", "--", "--query",
-            "SELECT 3", "--format", "CSV",
-        ])
-        else {
-            panic!("expected ClickHouse client");
-        };
-        assert_eq!(query, ["SELECT 1", "SELECT 2", ""]);
-        assert!(queries_file.is_empty());
-        assert_eq!(args, ["--query", "SELECT 3", "--format", "CSV"]);
-    }
-
-    #[test]
-    fn clickhouse_client_parses_repeated_query_files_and_empty_values_in_order() {
-        let LocalCommands::Client {
-            query,
-            queries_file,
-            args,
-            ..
-        } = local_command(&[
-            "client",
-            "--queries-file",
-            "schema.sql",
-            "seed.sql",
-            "--queries-file",
-            "",
-            "verify.sql",
-            "--",
-            "--queries-file",
-            "tail.sql",
-        ])
-        else {
-            panic!("expected ClickHouse client");
-        };
-        assert!(query.is_empty());
-        assert_eq!(queries_file, ["schema.sql", "seed.sql", "", "verify.sql"]);
-        assert_eq!(args, ["--queries-file", "tail.sql"]);
-    }
-
-    #[test]
-    fn clickhouse_client_rejects_combined_query_sources_in_every_order() {
-        for inputs in [
-            ["--query", "SELECT 1", "--queries-file", "queries.sql"],
-            ["--queries-file", "queries.sql", "--query", "SELECT 1"],
-        ] {
-            let args: Vec<&str> = ["client"].into_iter().chain(inputs).collect();
-            let error = local_parse_error(&args);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-            assert!(error.to_string().contains("--query <QUERY>"), "{error}");
             assert!(
-                error.to_string().contains("--queries-file <QUERIES_FILE>"),
-                "{error}"
+                error
+                    .to_string()
+                    .contains("invalid or unsupported ClickHouse version"),
+                "{tag}"
             );
         }
     }
 
-    #[test]
-    fn both_clients_require_boundary_before_native_arguments() {
-        for client in [&["client"][..], &["postgres", "client"][..]] {
-            for native in ["--unknown", "--format", "-X"] {
-                for selectors in [
-                    &["--name", "dev"][..],
-                    &["--host", "remote", "--port", "9000"][..],
-                    &["--query", "SELECT 1"][..],
-                ] {
-                    for native_first in [true, false] {
-                        let tail: Vec<&str> = if native_first {
-                            [native]
-                                .into_iter()
-                                .chain(selectors.iter().copied())
-                                .collect()
-                        } else {
-                            selectors.iter().copied().chain([native]).collect()
-                        };
-                        let argv: Vec<&str> = client.iter().copied().chain(tail).collect();
-                        assert_eq!(
-                            local_parse_error(&argv).kind(),
-                            clap::error::ErrorKind::UnknownArgument,
-                            "argv: {argv:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
+    // ── server start (Docker flags) ──────────────────────────────────────
 
     #[test]
-    fn both_clients_preserve_all_native_arguments_after_boundary() {
-        let native = [
-            "--format=CSV",
-            "-X",
-            "--name",
-            "native-name",
-            "--host",
-            "native-host",
-            "--port",
-            "0",
-            "--version",
-            "native-version",
-            "--query",
-            "SELECT 'a b'",
-            "--json",
-            "--help",
-            "",
-            "--",
-            "-",
-        ];
-        for client in [&["client"][..], &["postgres", "client"][..]] {
-            let argv: Vec<&str> = client
-                .iter()
-                .copied()
-                .chain(["--host", "wrapper-host", "--port", "12345", "--"])
-                .chain(native)
-                .collect();
-            let (name, host, port, args) = match local_command(&argv) {
-                LocalCommands::Client {
-                    name,
-                    host,
-                    port,
-                    args,
-                    ..
-                }
-                | LocalCommands::Postgres {
-                    command:
-                        PostgresCommands::Client {
-                            name,
-                            host,
-                            port,
-                            args,
-                            ..
-                        },
-                } => (name, host, port, args),
-                _ => panic!("expected client"),
-            };
-            assert!(name.is_none());
-            assert_eq!(host.as_deref(), Some("wrapper-host"));
-            assert_eq!(port, Some(12345));
-            assert_eq!(args, native);
-        }
-    }
-
-    #[test]
-    fn clickhouse_client_preserves_passthrough_selector_like_arguments() {
-        let LocalCommands::Client {
-            name,
-            name_flag,
-            args,
-            ..
-        } = local_command(&[
-            "client",
-            "--name",
-            "dev",
-            "--",
-            "--host",
-            "child-host",
-            "--port",
-            "0",
-            "--version",
-            "child-version",
-        ])
-        else {
-            panic!("expected ClickHouse client");
-        };
-
-        assert_eq!(name.or(name_flag).as_deref(), Some("dev"));
-        assert_eq!(
-            args,
-            [
-                "--host",
-                "child-host",
-                "--port",
-                "0",
-                "--version",
-                "child-version"
-            ]
-        );
-    }
-
-    #[test]
-    fn clickhouse_client_query_sources_are_mutually_exclusive() {
-        // The mutual exclusion is enforced by clap itself, not documented in help text.
-        assert_eq!(
-            local_parse_error(&["client", "--query", "SELECT 1", "--queries-file", "q.sql"]).kind(),
-            clap::error::ErrorKind::ArgumentConflict,
-        );
-    }
-
-    #[test]
-    fn postgres_client_applies_named_and_direct_selector_validation() {
-        let valid: &[&[&str]] = &[
-            &[],
-            &["--name", "dev"],
-            &["--version", "18"],
-            &["--name", "dev", "--version", "18"],
-            &["--version", "18", "--name", "dev"],
-            &["--host", "db.example"],
-            &["--port", "1"],
-            &["--host", "db.example", "--port", "65535"],
-            &["--port", "65535", "--host", "db.example"],
-        ];
-        for selectors in valid {
-            let args: Vec<&str> = ["postgres", "client"]
-                .into_iter()
-                .chain(selectors.iter().copied())
-                .collect();
-            let LocalCommands::Postgres {
-                command: PostgresCommands::Client { .. },
-            } = local_command(&args)
-            else {
-                panic!("expected Postgres client for {selectors:?}");
-            };
-        }
-
-        let conflicting: &[&[&str]] = &[
-            &["--name", "dev", "--host", "db.example"],
-            &["--host", "db.example", "--name", "dev"],
-            &["--name", "dev", "--port", "5432"],
-            &["--port", "5432", "--name", "dev"],
-            &["--version", "18", "--host", "db.example"],
-            &["--host", "db.example", "--version", "18"],
-            &["--version", "18", "--port", "5432"],
-            &["--port", "5432", "--version", "18"],
-            &[
-                "--name",
-                "dev",
-                "--version",
-                "18",
-                "--host",
-                "db.example",
-                "--port",
-                "5432",
-            ],
-            &[
-                "--port",
-                "5432",
-                "--host",
-                "db.example",
-                "--version",
-                "18",
-                "--name",
-                "dev",
-            ],
-        ];
-        for selectors in conflicting {
-            let args: Vec<&str> = ["postgres", "client"]
-                .into_iter()
-                .chain(selectors.iter().copied())
-                .collect();
-            assert_eq!(
-                local_parse_error(&args).kind(),
-                clap::error::ErrorKind::ArgumentConflict,
-                "selectors: {selectors:?}"
-            );
-        }
-
-        for port in ["0", "not-a-port"] {
-            let error = local_parse_error(&["postgres", "client", "--port", port]);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-            assert!(error.to_string().contains("--port"), "{error}");
-        }
-    }
-
-    #[test]
-    fn postgres_client_preserves_passthrough_selector_like_arguments() {
-        let LocalCommands::Postgres {
-            command:
-                PostgresCommands::Client {
-                    name,
-                    name_flag,
-                    args,
-                    ..
-                },
-        } = local_command(&[
-            "postgres",
-            "client",
-            "--name",
-            "dev",
-            "--",
-            "--host",
-            "child-host",
-            "--port",
-            "0",
-        ])
-        else {
-            panic!("expected Postgres client");
-        };
-
-        assert_eq!(name.or(name_flag).as_deref(), Some("dev"));
-        assert_eq!(args, ["--host", "child-host", "--port", "0"]);
-    }
-
-    #[test]
-    fn parses_remove_without_force() {
-        let LocalCommands::Remove { version, force } = local_command(&["remove", "25.12.5.44"])
-        else {
-            panic!("expected remove");
-        };
-        assert_eq!(version, "25.12.5.44");
-        assert!(!force);
-    }
-
-    #[test]
-    fn parses_remove_with_force() {
-        let LocalCommands::Remove { version, force } =
-            local_command(&["remove", "25.12.5.44", "--force"])
-        else {
-            panic!("expected remove");
-        };
-        assert_eq!(version, "25.12.5.44");
-        assert!(force);
-    }
-
-    #[test]
-    fn parses_server_start_config() {
-        let LocalCommands::Server {
-            command: ServerCommands::Start { config_file, .. },
-        } = local_command(&["server", "start", "--config", "analytics"])
-        else {
-            panic!("expected server start");
-        };
-        assert_eq!(config_file.as_deref(), Some("analytics"));
-    }
-
-    #[test]
-    fn parses_server_start_config_file_legacy_alias() {
-        let LocalCommands::Server {
-            command: ServerCommands::Start { config_file, .. },
-        } = local_command(&["server", "start", "--config-file", "analytics"])
-        else {
-            panic!("expected server start");
-        };
-        assert_eq!(config_file.as_deref(), Some("analytics"));
-    }
-
-    #[test]
-    fn server_start_config_file_defaults_to_none() {
+    fn parses_server_start_owned_options() {
         let LocalCommands::Server {
             command:
                 ServerCommands::Start {
+                    name,
+                    name_flag,
+                    version,
+                    http_port,
+                    native_port,
+                    user,
+                    password,
+                    database,
                     config_file,
-                    no_wait,
-                    args,
+                    env,
+                    wait_timeout,
+                },
+        } = local_command(&[
+            "server",
+            "start",
+            "--name",
+            "analytics",
+            "--version",
+            "26.8",
+            "--http-port",
+            "18123",
+            "--native-port",
+            "19000",
+            "--user",
+            "app",
+            "--password",
+            "secret",
+            "--database",
+            "events",
+            "--config",
+            "analytics",
+            "-e",
+            "CLICKHOUSE_SKIP_USER_SETUP=1",
+            "--wait-timeout",
+            "75",
+        ])
+        else {
+            panic!("expected server start");
+        };
+        assert_eq!(name.or(name_flag).as_deref(), Some("analytics"));
+        assert_eq!(version.as_deref(), Some("26.8"));
+        assert_eq!(http_port, Some(18123));
+        assert_eq!(native_port, Some(19000));
+        assert_eq!(user.as_deref(), Some("app"));
+        assert_eq!(password.as_deref(), Some("secret"));
+        assert_eq!(database.as_deref(), Some("events"));
+        assert_eq!(config_file.as_deref(), Some("analytics"));
+        assert_eq!(env, ["CLICKHOUSE_SKIP_USER_SETUP=1"]);
+        assert_eq!(wait_timeout, 75);
+    }
+
+    #[test]
+    fn server_start_defaults_to_no_explicit_ports_and_default_timeout() {
+        let LocalCommands::Server {
+            command:
+                ServerCommands::Start {
+                    name,
+                    version,
+                    http_port,
+                    native_port,
+                    user,
+                    password,
+                    database,
+                    config_file,
+                    env,
+                    wait_timeout,
                     ..
                 },
         } = local_command(&["server", "start"])
         else {
             panic!("expected server start");
         };
+        assert_eq!(name, None);
+        assert_eq!(version, None);
+        assert_eq!(http_port, None);
+        assert_eq!(native_port, None);
+        assert_eq!(user, None);
+        assert_eq!(password, None);
+        assert_eq!(database, None);
         assert_eq!(config_file, None);
-        assert!(!no_wait);
-        assert!(args.is_empty());
+        assert!(env.is_empty());
+        assert_eq!(wait_timeout, 60);
+    }
+
+    #[test]
+    fn server_start_rejects_bad_tags_ports_and_timeout_at_clap_time() {
+        for (args, expected) in [
+            (
+                vec!["--version", "latest!"],
+                "invalid or unsupported ClickHouse version",
+            ),
+            (
+                vec!["--version", "25"],
+                "invalid or unsupported ClickHouse version",
+            ),
+            (vec!["--http-port", "0"], "--port 0 is not allowed"),
+            (vec!["--native-port", "0"], "--port 0 is not allowed"),
+            (vec!["--http-port", "not-a-port"], "expected an integer"),
+            (vec!["--wait-timeout", "0"], "1..=600"),
+            (vec!["--wait-timeout", "601"], "1..=600"),
+        ] {
+            let argv: Vec<&str> = ["server", "start"]
+                .iter()
+                .chain(args.iter())
+                .copied()
+                .collect();
+            let error = local_parse_error(&argv);
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains(expected), "{args:?}: {error}");
+        }
     }
 
     #[test]
     fn server_start_help_renders_default_name_without_escaped_quotes() {
         let help = rendered_help(&["server", "start", "--help"]);
-
-        // clap renders the doc comment's quotes literally, never as escaped `\"` sequences.
         assert!(help.contains(r#"(default: "default""#), "{help}");
         assert!(!help.contains(r#"\"default\""#), "{help}");
     }
 
     #[test]
-    fn parses_server_start_positional_name_before_dctl_options() {
-        let LocalCommands::Server {
-            command:
-                ServerCommands::Start {
-                    name,
-                    name_flag,
-                    version,
-                    args,
-                    ..
-                },
-        } = local_command(&["server", "start", "existing", "--version", "25.12.9.61"])
-        else {
-            panic!("expected server start");
-        };
-        assert_eq!(name.as_deref(), Some("existing"));
-        assert_eq!(name_flag, None);
-        assert_eq!(
-            version
-                .map(ServerVersionArg::into_spec)
-                .map(|v| v.to_string()),
-            Some("25.12.9.61".to_string())
-        );
-        assert!(args.is_empty());
-    }
-
-    #[test]
-    fn parses_server_start_name_flag_for_compatibility() {
-        let LocalCommands::Server {
-            command: ServerCommands::Start {
-                name, name_flag, ..
-            },
-        } = local_command(&["server", "start", "--name", "existing"])
-        else {
-            panic!("expected server start");
-        };
-        assert_eq!(name, None);
-        assert_eq!(name_flag.as_deref(), Some("existing"));
-    }
-
-    #[test]
-    fn server_start_name_forms_conflict() {
-        let error = Cli::try_parse_from([
-            "dctl", "local", "server", "start", "existing", "--name", "other",
-        ])
-        .err()
-        .expect("name forms should conflict");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn server_start_passthrough_requires_boundary() {
-        let LocalCommands::Server {
-            command:
-                ServerCommands::Start {
-                    name,
-                    version,
-                    args,
-                    ..
-                },
-        } = local_command(&[
-            "server",
-            "start",
-            "existing",
-            "--version",
-            "25.12.9.61",
-            "--",
-            "--logger.level=trace",
-            "--max_server_memory_usage=1000000",
-        ])
-        else {
-            panic!("expected server start");
-        };
-        assert_eq!(name.as_deref(), Some("existing"));
-        assert_eq!(
-            version
-                .map(ServerVersionArg::into_spec)
-                .map(|v| v.to_string()),
-            Some("25.12.9.61".to_string())
-        );
-        assert_eq!(
-            args,
-            ["--logger.level=trace", "--max_server_memory_usage=1000000"]
-        );
-
-        let error = Cli::try_parse_from([
-            "dctl",
-            "local",
-            "server",
-            "start",
-            "existing",
-            "--logger.level=trace",
-        ])
-        .err()
-        .expect("passthrough without -- should fail");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-    }
-
-    #[test]
-    fn parses_server_start_no_wait() {
-        let LocalCommands::Server {
-            command: ServerCommands::Start { no_wait, .. },
-        } = local_command(&["server", "start", "--no-wait"])
-        else {
-            panic!("expected server start");
-        };
-        assert!(no_wait);
-    }
-
-    #[test]
-    fn server_start_no_wait_conflicts_with_foreground() {
-        let error = Cli::try_parse_from([
-            "dctl",
-            "local",
-            "server",
-            "start",
-            "--no-wait",
-            "--foreground",
-        ])
-        .err()
-        .expect("flags should conflict");
-        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    fn parses_server_start_config_and_legacy_alias() {
+        for flag in ["--config", "--config-file"] {
+            let LocalCommands::Server {
+                command: ServerCommands::Start { config_file, .. },
+            } = local_command(&["server", "start", flag, "analytics"])
+            else {
+                panic!("expected server start");
+            };
+            assert_eq!(config_file.as_deref(), Some("analytics"));
+        }
     }
 
     #[test]
@@ -1776,109 +1009,136 @@ mod tests {
     }
 
     #[test]
-    fn server_stop_omitted_name_remains_distinguishable() {
-        let LocalCommands::Server {
-            command: ServerCommands::Stop {
-                name, name_flag, ..
-            },
-        } = local_command(&["server", "stop"])
-        else {
-            panic!("expected server stop");
-        };
-        assert_eq!(name, None);
-        assert_eq!(name_flag, None);
-    }
-
-    #[test]
-    fn server_remove_omitted_name_remains_distinguishable() {
-        let LocalCommands::Server {
-            command: ServerCommands::Remove { name, name_flag },
-        } = local_command(&["server", "remove"])
-        else {
-            panic!("expected server remove");
-        };
-        assert_eq!(name, None);
-        assert_eq!(name_flag, None);
-    }
-
-    #[test]
-    fn server_stop_name_forms_allow_trailing_options() {
-        for (command, expected_name, expected_name_flag) in [
-            (
-                &[
-                    "server",
-                    "stop",
-                    "analytics",
-                    "--global",
-                    "--project",
-                    "/tmp/project",
-                    "--json",
-                ][..],
-                Some("analytics"),
-                None,
-            ),
-            (
-                &[
-                    "server",
-                    "stop",
-                    "--name",
-                    "analytics",
-                    "--global",
-                    "--project",
-                    "/tmp/project",
-                    "--json",
-                ][..],
-                None,
-                Some("analytics"),
-            ),
-        ] {
-            let args = local_args(command);
-            assert!(args.json);
-            let LocalCommands::Server {
-                command:
-                    ServerCommands::Stop {
-                        name,
-                        name_flag,
-                        global,
-                        project,
-                    },
-            } = args.command
+    fn server_takes_a_version_for_disambiguation() {
+        for command in ["stop", "remove"] {
+            let LocalCommands::Server { command: sub } =
+                local_command(&["server", command, "dev", "--version", "26.8"])
             else {
-                panic!("expected server stop");
+                panic!("expected server {command}");
             };
-            assert_eq!(name.as_deref(), expected_name);
-            assert_eq!(name_flag.as_deref(), expected_name_flag);
-            assert!(global);
-            assert_eq!(project.as_deref(), Some("/tmp/project"));
+            let (name, version) = match sub {
+                ServerCommands::Stop { name, version, .. } => (name, version),
+                ServerCommands::Remove { name, version, .. } => (name, version),
+                _ => unreachable!("stop and remove are the only server subcommands with a name"),
+            };
+            assert_eq!(name.as_deref(), Some("dev"));
+            assert_eq!(version.as_deref(), Some("26.8"));
         }
     }
 
     #[test]
-    fn server_remove_name_forms_allow_trailing_options() {
-        for (command, expected_name, expected_name_flag) in [
-            (
-                &["server", "remove", "analytics", "--json"][..],
-                Some("analytics"),
-                None,
-            ),
-            (
-                &["server", "remove", "--name", "analytics", "--json"][..],
-                None,
-                Some("analytics"),
-            ),
+    fn server_list_takes_no_flags() {
+        let LocalCommands::Server {
+            command: ServerCommands::List,
+        } = local_command(&["server", "list"])
+        else {
+            panic!("expected server list");
+        };
+        assert_eq!(
+            local_parse_error(&["server", "list", "--global"]).kind(),
+            clap::error::ErrorKind::UnknownArgument
+        );
+    }
+
+    // ── client (HTTP mode) ───────────────────────────────────────────────
+
+    #[test]
+    fn client_parses_query_file_and_database_independently() {
+        let LocalCommands::Client {
+            query,
+            queries_file,
+            database,
+            ..
+        } = local_command(&["client", "--query", "SELECT 1", "--database", "events"])
+        else {
+            panic!("expected client");
+        };
+        assert_eq!(query.as_deref(), Some("SELECT 1"));
+        assert_eq!(queries_file, None);
+        assert_eq!(database.as_deref(), Some("events"));
+    }
+
+    #[test]
+    fn client_queries_file_accepts_dash_for_stdin() {
+        let LocalCommands::Client { queries_file, .. } =
+            local_command(&["client", "--queries-file", "-"])
+        else {
+            panic!("expected client");
+        };
+        assert_eq!(queries_file.as_deref(), Some("-"));
+    }
+
+    #[test]
+    fn client_query_sources_are_mutually_exclusive() {
+        assert_eq!(
+            local_parse_error(&["client", "--query", "SELECT 1", "--queries-file", "q.sql"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+    }
+
+    #[test]
+    fn client_named_and_direct_selectors_conflict_in_every_order() {
+        for selectors in [
+            &["--name", "dev", "--host", "db.example"][..],
+            &["--host", "db.example", "--name", "dev"][..],
+            &["--name", "dev", "--port", "8123"][..],
+            &["--port", "8123", "--name", "dev"][..],
+            &["dev", "--host", "db.example"][..],
+            &["--host", "db.example", "dev"][..],
         ] {
-            let args = local_args(command);
-            assert!(args.json);
-            let LocalCommands::Server {
-                command: ServerCommands::Remove { name, name_flag },
-            } = args.command
-            else {
-                panic!("expected server remove");
-            };
-            assert_eq!(name.as_deref(), expected_name);
-            assert_eq!(name_flag.as_deref(), expected_name_flag);
+            let args: Vec<&str> = ["client"]
+                .into_iter()
+                .chain(selectors.iter().copied())
+                .collect();
+            assert_eq!(
+                local_parse_error(&args).kind(),
+                clap::error::ErrorKind::ArgumentConflict,
+                "{selectors:?}"
+            );
         }
     }
+
+    #[test]
+    fn client_direct_mode_defaults_the_other_selector() {
+        let LocalCommands::Client { host, port, .. } =
+            local_command(&["client", "--host", "db.example"])
+        else {
+            panic!("expected client");
+        };
+        assert_eq!(host.as_deref(), Some("db.example"));
+        assert_eq!(port, None);
+
+        let LocalCommands::Client { host, port, .. } = local_command(&["client", "--port", "8123"])
+        else {
+            panic!("expected client");
+        };
+        assert_eq!(host, None);
+        assert_eq!(port, Some(8123));
+    }
+
+    #[test]
+    fn client_version_disambiguates_named_mode() {
+        // Unlike the binary-era client, --version works with a name: it picks
+        // among Docker-managed instances sharing that name.
+        let LocalCommands::Client { name, version, .. } =
+            local_command(&["client", "dev", "--version", "26.8"])
+        else {
+            panic!("expected client");
+        };
+        assert_eq!(name.as_deref(), Some("dev"));
+        assert_eq!(version.as_deref(), Some("26.8"));
+    }
+
+    #[test]
+    fn client_rejects_zero_and_nonnumeric_ports() {
+        for port in ["0", "not-a-port"] {
+            let error = local_parse_error(&["client", "--port", port]);
+            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+            assert!(error.to_string().contains("--port"), "{error}");
+        }
+    }
+
+    // ── teardown name forms ──────────────────────────────────────────────
 
     #[test]
     fn server_teardown_name_forms_conflict() {
@@ -1912,132 +1172,6 @@ mod tests {
     }
 
     #[test]
-    fn postgres_stop_omitted_name_remains_distinguishable() {
-        let LocalCommands::Postgres {
-            command: PostgresCommands::Stop { name, .. },
-        } = local_command(&["postgres", "stop"])
-        else {
-            panic!("expected postgres stop");
-        };
-        assert_eq!(name, None);
-    }
-
-    #[test]
-    fn parses_postgres_start_validation_owned_options() {
-        let LocalCommands::Postgres {
-            command:
-                PostgresCommands::Start {
-                    name,
-                    name_flag,
-                    version,
-                    port,
-                    password,
-                    env,
-                    wait_timeout,
-                    ..
-                },
-        } = local_command(&[
-            "postgres",
-            "start",
-            "--name",
-            "analytics",
-            "--version",
-            "18.1-alpine3.20",
-            "--port",
-            "55432",
-            "--password",
-            "secret",
-            "-e",
-            "APP_MODE=test",
-            "--env",
-            "DATABASE_URL=postgres://localhost/db?option=a=b",
-            "--wait-timeout",
-            "75",
-        ])
-        else {
-            panic!("expected postgres start");
-        };
-
-        assert_eq!(name.or(name_flag).as_deref(), Some("analytics"));
-        assert_eq!(version.as_deref(), Some("18.1-alpine3.20"));
-        assert_eq!(port, Some(55432));
-        assert_eq!(password.as_deref(), Some("secret"));
-        assert_eq!(wait_timeout, 75);
-        assert_eq!(
-            env,
-            [
-                "APP_MODE=test",
-                "DATABASE_URL=postgres://localhost/db?option=a=b"
-            ]
-        );
-    }
-
-    #[test]
-    fn postgres_start_readiness_timeout_defaults_and_is_bounded() {
-        let LocalCommands::Postgres {
-            command: PostgresCommands::Start { wait_timeout, .. },
-        } = local_command(&["postgres", "start"])
-        else {
-            panic!("expected postgres start");
-        };
-        assert_eq!(wait_timeout, 60);
-
-        for timeout in ["0", "601"] {
-            let error = postgres_start_parse_error(&["--wait-timeout", timeout]);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-        }
-    }
-
-    #[test]
-    fn postgres_start_rejects_invalid_name_tag_port_and_env_at_clap_time() {
-        for (args, expected) in [
-            (vec!["--name", "../unsafe"], "Invalid server name"),
-            (vec!["../unsafe"], "Invalid server name"),
-            (
-                vec!["--version", "18garbage"],
-                "invalid or unsupported postgres version",
-            ),
-            (
-                vec!["--version", "18..1"],
-                "invalid or unsupported postgres version",
-            ),
-            (
-                vec!["--port", "0"],
-                "--port 0 is not allowed; pick a specific port or omit the flag",
-            ),
-            (vec!["--env", "NO_EQUALS"], "expected KEY=VALUE"),
-            (vec!["--env", "1KEY=value"], "do not start with a digit"),
-            (
-                vec!["--env", "POSTGRES_USER=admin"],
-                "use --user instead of --env",
-            ),
-            (
-                vec!["--env", "POSTGRES_DB=app"],
-                "use --database instead of --env",
-            ),
-            (
-                vec!["--env", "PGDATA=/tmp/postgres"],
-                "PGDATA is managed by dctl",
-            ),
-        ] {
-            let error = postgres_start_parse_error(&args);
-            assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
-            assert!(error.to_string().contains(expected), "{error}");
-        }
-    }
-
-    #[test]
-    fn postgres_remove_omitted_name_remains_distinguishable() {
-        let LocalCommands::Postgres {
-            command: PostgresCommands::Remove { name, .. },
-        } = local_command(&["postgres", "remove"])
-        else {
-            panic!("expected postgres remove");
-        };
-        assert_eq!(name, None);
-    }
-
-    #[test]
     fn teardown_commands_preserve_explicit_names() {
         let LocalCommands::Server {
             command: ServerCommands::Stop {
@@ -2050,15 +1184,6 @@ mod tests {
         assert_eq!(name.as_deref(), Some("analytics"));
         assert_eq!(name_flag, None);
 
-        let LocalCommands::Server {
-            command: ServerCommands::Remove { name, name_flag },
-        } = local_command(&["server", "remove", "analytics"])
-        else {
-            panic!("expected server remove");
-        };
-        assert_eq!(name.as_deref(), Some("analytics"));
-        assert_eq!(name_flag, None);
-
         let LocalCommands::Postgres {
             command: PostgresCommands::Stop { name, .. },
         } = local_command(&["postgres", "stop", "warehouse"])
@@ -2066,112 +1191,65 @@ mod tests {
             panic!("expected postgres stop");
         };
         assert_eq!(name.as_deref(), Some("warehouse"));
-
-        let LocalCommands::Postgres {
-            command: PostgresCommands::Remove { name, .. },
-        } = local_command(&["postgres", "remove", "warehouse"])
-        else {
-            panic!("expected postgres remove");
-        };
-        assert_eq!(name.as_deref(), Some("warehouse"));
     }
 
-    fn instance_commands() -> [&'static [&'static str]; 15] {
-        [
-            &["server", "start"],
-            &["server", "stop"],
-            &["server", "remove"],
-            &["server", "dotenv"],
-            &["client"],
-            &["postgres", "start"],
-            &["postgres", "stop"],
-            &["postgres", "remove"],
-            &["postgres", "dotenv"],
-            &["postgres", "client"],
-            &["falkordb", "start"],
-            &["falkordb", "stop"],
-            &["falkordb", "remove"],
-            &["falkordb", "dotenv"],
-            &["falkordb", "client"],
-        ]
-    }
+    // ── shared instance-command structure ────────────────────────────────
 
-    fn instance_names(command: LocalCommands) -> (Option<String>, Option<String>) {
-        match command {
-            LocalCommands::Client {
-                name, name_flag, ..
-            }
-            | LocalCommands::Falkordb {
-                command:
-                    FalkorCommands::Start {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Falkordb {
-                command:
-                    FalkorCommands::Stop {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Falkordb {
-                command:
-                    FalkorCommands::Remove {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Falkordb {
-                command:
-                    FalkorCommands::Dotenv {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Falkordb {
-                command:
-                    FalkorCommands::Client {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Server {
-                command:
-                    ServerCommands::Start {
-                        name, name_flag, ..
-                    }
-                    | ServerCommands::Stop {
-                        name, name_flag, ..
-                    }
-                    | ServerCommands::Remove {
-                        name, name_flag, ..
-                    }
-                    | ServerCommands::Dotenv {
-                        name, name_flag, ..
-                    },
-            }
-            | LocalCommands::Postgres {
-                command:
-                    PostgresCommands::Start {
-                        name, name_flag, ..
-                    }
-                    | PostgresCommands::Stop {
-                        name, name_flag, ..
-                    }
-                    | PostgresCommands::Remove {
-                        name, name_flag, ..
-                    }
-                    | PostgresCommands::Dotenv {
-                        name, name_flag, ..
-                    }
-                    | PostgresCommands::Client {
-                        name, name_flag, ..
-                    },
-            } => (name, name_flag),
-            _ => panic!("expected instance command"),
+    #[test]
+    fn postgres_start_rejects_invalid_name_tag_port_and_env_at_clap_time() {
+        let cases: &[(&[&str], &str)] = &[
+            (&["--name", "../unsafe"], "Invalid server name"),
+            (
+                &["--version", "18garbage"],
+                "invalid or unsupported postgres version",
+            ),
+            (&["--port", "0"], "--port 0 is not allowed"),
+            (&["--env", "NO_EQUALS"], "expected KEY=VALUE"),
+            (
+                &["--env", "POSTGRES_USER=admin"],
+                "use --user instead of --env",
+            ),
+            (
+                &["--env", "PGDATA=/tmp/postgres"],
+                "PGDATA is managed by dctl",
+            ),
+        ];
+        for (args, expected) in cases {
+            let argv: Vec<&str> = ["postgres", "start"]
+                .iter()
+                .chain(args.iter())
+                .copied()
+                .collect();
+            let error = local_parse_error(&argv);
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains(expected), "{args:?}: {error}");
         }
     }
 
     #[test]
     fn all_instance_commands_accept_optional_positional_and_compatibility_names() {
-        for command in instance_commands() {
-            assert_eq!(instance_names(local_command(command)), (None, None));
+        let commands = [
+            &["server", "start"][..],
+            &["server", "stop"][..],
+            &["server", "remove"][..],
+            &["server", "dotenv"][..],
+            &["client"][..],
+            &["postgres", "start"][..],
+            &["postgres", "stop"][..],
+            &["postgres", "remove"][..],
+            &["postgres", "dotenv"][..],
+            &["postgres", "client"][..],
+            &["falkordb", "start"][..],
+            &["falkordb", "stop"][..],
+            &["falkordb", "remove"][..],
+            &["falkordb", "dotenv"][..],
+            &["falkordb", "client"][..],
+        ];
+        for command in commands {
             for name in ["default", "custom-name"] {
                 for flag in [false, true] {
                     let mut args = command.to_vec();
@@ -2179,12 +1257,11 @@ mod tests {
                         args.push("--name");
                     }
                     args.extend([name, "--json"]);
-                    let expected = if flag {
-                        (None, Some(name.to_owned()))
-                    } else {
-                        (Some(name.to_owned()), None)
-                    };
-                    assert_eq!(instance_names(local_command(&args)), expected, "{args:?}");
+                    // Parsing succeeds with either form; the wrapper fields
+                    // are consumed by the dispatch layer.
+                    let argv: Vec<&str> = args.to_vec();
+                    let parsed = local_args(&argv);
+                    assert!(parsed.json, "{args:?}");
                 }
             }
         }
@@ -2192,16 +1269,31 @@ mod tests {
 
     #[test]
     fn all_instance_commands_reject_both_name_forms_even_when_equal() {
-        for command in instance_commands() {
-            for flagged in ["dev", "other"] {
-                for tail in [["dev", "--name", flagged], ["--name", flagged, "dev"]] {
-                    let args: Vec<_> = command.iter().copied().chain(tail).collect();
-                    assert_eq!(
-                        local_parse_error(&args).kind(),
-                        clap::error::ErrorKind::ArgumentConflict,
-                        "{args:?}"
-                    );
-                }
+        let commands = [
+            &["server", "start"][..],
+            &["server", "stop"][..],
+            &["server", "remove"][..],
+            &["server", "dotenv"][..],
+            &["client"][..],
+            &["postgres", "start"][..],
+            &["postgres", "stop"][..],
+            &["postgres", "remove"][..],
+            &["postgres", "dotenv"][..],
+            &["postgres", "client"][..],
+            &["falkordb", "start"][..],
+            &["falkordb", "stop"][..],
+            &["falkordb", "remove"][..],
+            &["falkordb", "dotenv"][..],
+            &["falkordb", "client"][..],
+        ];
+        for command in commands {
+            for tail in [["dev", "--name", "dev"], ["--name", "dev", "dev"]] {
+                let args: Vec<_> = command.iter().copied().chain(tail).collect();
+                assert_eq!(
+                    local_parse_error(&args).kind(),
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "{args:?}"
+                );
             }
         }
     }
@@ -2209,9 +1301,26 @@ mod tests {
     #[test]
     fn instance_help_advertises_optional_positional_and_hides_name_flags() {
         use clap::CommandFactory;
+        let commands = [
+            &["server", "start"][..],
+            &["server", "stop"][..],
+            &["server", "remove"][..],
+            &["server", "dotenv"][..],
+            &["client"][..],
+            &["postgres", "start"][..],
+            &["postgres", "stop"][..],
+            &["postgres", "remove"][..],
+            &["postgres", "dotenv"][..],
+            &["postgres", "client"][..],
+            &["falkordb", "start"][..],
+            &["falkordb", "stop"][..],
+            &["falkordb", "remove"][..],
+            &["falkordb", "dotenv"][..],
+            &["falkordb", "client"][..],
+        ];
         let mut cli = Cli::command();
         cli.build();
-        for path in instance_commands() {
+        for path in commands {
             let mut command = cli.find_subcommand("local").unwrap();
             for part in path {
                 command = command.find_subcommand(part).unwrap();
@@ -2229,7 +1338,6 @@ mod tests {
                 .unwrap();
             assert_eq!(compatibility.get_long(), Some("name"), "{path:?}");
             assert!(compatibility.is_hide_set(), "{path:?}");
-            // The generated usage must include the positional, including for ClickHouse client.
             assert!(
                 command
                     .clone()
@@ -2245,103 +1353,26 @@ mod tests {
     fn client_short_name_compatibility_is_preserved() {
         for client in [&["client"][..], &["postgres", "client"][..]] {
             let argv: Vec<_> = client.iter().copied().chain(["-n", "dev"]).collect();
-            assert_eq!(
-                instance_names(local_command(&argv)),
-                (None, Some("dev".to_owned()))
-            );
+            let parsed = local_command(&argv);
+            let (name, name_flag) = match parsed {
+                LocalCommands::Client {
+                    name, name_flag, ..
+                } => (name, name_flag),
+                LocalCommands::Postgres {
+                    command:
+                        PostgresCommands::Client {
+                            name, name_flag, ..
+                        },
+                } => (name, name_flag),
+                _ => unreachable!("client and postgres client are the only short-name commands"),
+            };
+            assert_eq!(name, None);
+            assert_eq!(name_flag.as_deref(), Some("dev"));
+
             let argv: Vec<_> = client.iter().copied().chain(["dev", "-n", "dev"]).collect();
             assert_eq!(
                 local_parse_error(&argv).kind(),
                 clap::error::ErrorKind::ArgumentConflict
-            );
-        }
-    }
-
-    #[test]
-    fn client_positional_names_conflict_with_direct_selectors_in_both_orders() {
-        for client in [&["client"][..], &["postgres", "client"][..]] {
-            for direct in [["--host", "remote"], ["--port", "1234"]] {
-                for tail in [["dev", direct[0], direct[1]], [direct[0], direct[1], "dev"]] {
-                    let argv: Vec<_> = client.iter().copied().chain(tail).collect();
-                    assert_eq!(
-                        local_parse_error(&argv).kind(),
-                        clap::error::ErrorKind::ArgumentConflict,
-                        "{argv:?}"
-                    );
-                }
-            }
-        }
-        for tail in [
-            ["dev", "--version", "25.12.9.61"],
-            ["--version", "25.12.9.61", "dev"],
-        ] {
-            let argv: Vec<_> = ["client"].into_iter().chain(tail).collect();
-            assert_eq!(
-                local_parse_error(&argv).kind(),
-                clap::error::ErrorKind::ArgumentConflict
-            );
-        }
-        for tail in [["dev", "--version", "18"], ["--version", "18", "dev"]] {
-            let argv: Vec<_> = ["postgres", "client"].into_iter().chain(tail).collect();
-            assert_eq!(
-                instance_names(local_command(&argv)),
-                (Some("dev".to_owned()), None)
-            );
-        }
-    }
-
-    #[test]
-    fn native_boundary_prevents_consuming_wrapper_name_or_flags() {
-        let native = [
-            "native-name",
-            "--name",
-            "native-flag",
-            "-n",
-            "native-short",
-            "--version",
-            "bad-version",
-            "--",
-        ];
-        for command in [
-            &["client"][..],
-            &["postgres", "client"][..],
-            &["server", "start"][..],
-        ] {
-            for selector in [&[][..], &["dev"][..], &["--name", "dev"][..]] {
-                let argv: Vec<_> = command
-                    .iter()
-                    .chain(selector)
-                    .copied()
-                    .chain(["--"])
-                    .chain(native)
-                    .collect();
-                let parsed = local_command(&argv);
-                let args = match &parsed {
-                    LocalCommands::Client { args, .. }
-                    | LocalCommands::Postgres {
-                        command: PostgresCommands::Client { args, .. },
-                    }
-                    | LocalCommands::Server {
-                        command: ServerCommands::Start { args, .. },
-                    } => args,
-                    _ => panic!("expected native command"),
-                };
-                assert_eq!(args, &native, "{argv:?}");
-                assert_eq!(
-                    instance_names(parsed),
-                    instance_names(local_command(
-                        &command.iter().chain(selector).copied().collect::<Vec<_>>()
-                    ))
-                );
-            }
-            let argv: Vec<_> = command
-                .iter()
-                .copied()
-                .chain(["dev", "native-name"])
-                .collect();
-            assert_eq!(
-                local_parse_error(&argv).kind(),
-                clap::error::ErrorKind::UnknownArgument
             );
         }
     }

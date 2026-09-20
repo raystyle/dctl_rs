@@ -12,11 +12,7 @@ use crate::error::{Error, Result};
 use crate::paths;
 use std::path::{Path, PathBuf};
 
-/// Recognized config file extensions, in resolution priority order.
 const CONFIG_EXTS: [&str; 3] = ["xml", "yaml", "yml"];
-
-/// Filename stem for the dctl-managed `config.d` overlay file.
-const OVERLAY_STEM: &str = "dctl-config";
 
 /// Returns true if `name` already ends in a recognized config extension.
 fn has_config_ext(name: &str) -> bool {
@@ -140,35 +136,6 @@ pub fn list_configs() -> Result<Vec<String>> {
 /// ClickHouse merges files in the `config.d/` directory next to its working
 /// directory with its built-in defaults, so a partial override file takes
 /// effect without replacing the whole config. We own a single file there named
-/// `dctl-config.<ext>`; any previously staged overlay (in any recognized
-/// extension) is removed first, so restarting a server without `--config`
-/// reverts cleanly to plain defaults.
-pub fn apply_config_overlay(data_dir: &Path, source: Option<&Path>) -> Result<()> {
-    let config_d = data_dir.join("config.d");
-
-    // Drop any overlay we previously staged before applying the new state.
-    for ext in CONFIG_EXTS {
-        let stale = config_d.join(format!("{OVERLAY_STEM}.{ext}"));
-        if stale.exists() {
-            std::fs::remove_file(&stale)?;
-        }
-    }
-
-    let Some(source) = source else {
-        return Ok(());
-    };
-
-    // Preserve the source extension so ClickHouse parses XML vs YAML correctly.
-    let ext = source
-        .extension()
-        .and_then(|e| e.to_str())
-        .filter(|e| CONFIG_EXTS.contains(e))
-        .unwrap_or("xml");
-    std::fs::create_dir_all(&config_d)?;
-    std::fs::copy(source, config_d.join(format!("{OVERLAY_STEM}.{ext}")))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,74 +265,5 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist");
         assert!(list_configs_in(&missing).is_empty());
-    }
-
-    #[test]
-    fn overlay_stages_file_with_extension() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src.xml");
-        std::fs::write(&src, "<clickhouse><a>1</a></clickhouse>").unwrap();
-        let data_dir = tmp.path().join("data");
-        std::fs::create_dir(&data_dir).unwrap();
-
-        apply_config_overlay(&data_dir, Some(&src)).unwrap();
-
-        let staged = data_dir.join("config.d").join("dctl-config.xml");
-        assert!(staged.is_file());
-        assert_eq!(
-            std::fs::read_to_string(&staged).unwrap(),
-            "<clickhouse><a>1</a></clickhouse>"
-        );
-    }
-
-    #[test]
-    fn overlay_preserves_yaml_extension() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src.yaml");
-        std::fs::write(&src, "a: 1").unwrap();
-        let data_dir = tmp.path().join("data");
-
-        apply_config_overlay(&data_dir, Some(&src)).unwrap();
-
-        assert!(data_dir.join("config.d").join("dctl-config.yaml").is_file());
-    }
-
-    #[test]
-    fn overlay_none_clears_previous() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("src.xml");
-        std::fs::write(&src, "<clickhouse/>").unwrap();
-        let data_dir = tmp.path().join("data");
-
-        apply_config_overlay(&data_dir, Some(&src)).unwrap();
-        assert!(data_dir.join("config.d").join("dctl-config.xml").is_file());
-
-        apply_config_overlay(&data_dir, None).unwrap();
-        assert!(!data_dir.join("config.d").join("dctl-config.xml").exists());
-    }
-
-    #[test]
-    fn overlay_switching_extension_removes_old() {
-        let tmp = tempfile::tempdir().unwrap();
-        let xml = tmp.path().join("a.xml");
-        std::fs::write(&xml, "<clickhouse/>").unwrap();
-        let yaml = tmp.path().join("b.yaml");
-        std::fs::write(&yaml, "a: 1").unwrap();
-        let data_dir = tmp.path().join("data");
-
-        apply_config_overlay(&data_dir, Some(&xml)).unwrap();
-        apply_config_overlay(&data_dir, Some(&yaml)).unwrap();
-
-        let config_d = data_dir.join("config.d");
-        assert!(!config_d.join("dctl-config.xml").exists());
-        assert!(config_d.join("dctl-config.yaml").is_file());
-    }
-
-    #[test]
-    fn overlay_none_on_empty_is_noop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data_dir = tmp.path().join("data");
-        // Should not error even though config.d does not exist.
-        apply_config_overlay(&data_dir, None).unwrap();
     }
 }

@@ -94,12 +94,12 @@ fn validate_start_options(
     if let Some(version) = version {
         validate_ch_tag(version)?;
     }
-    if let Some(password) = password {
-        if password.is_empty() || password.chars().any(char::is_whitespace) {
-            return Err(Error::ClickhouseUsage(
-                "invalid --password: must be non-empty and contain no whitespace".into(),
-            ));
-        }
+    if let Some(password) = password
+        && (password.is_empty() || password.chars().any(char::is_whitespace))
+    {
+        return Err(Error::ClickhouseUsage(
+            "invalid --password: must be non-empty and contain no whitespace".into(),
+        ));
     }
     for assignment in &extra_env {
         if let Some(key) = assignment.split('=').next()
@@ -142,19 +142,35 @@ fn validate_start_options(
     })
 }
 
-pub(crate) async fn start(
-    name: Option<String>,
-    version: Option<String>,
-    http_port: Option<u16>,
-    native_port: Option<u16>,
-    user: Option<String>,
-    password: Option<String>,
-    database: Option<String>,
-    config: Option<String>,
-    extra_env: Vec<String>,
-    wait_timeout: Duration,
-    json: bool,
-) -> Result<()> {
+/// `dctl local server start` flags, verbatim from clap.
+pub(crate) struct StartCmd {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub http_port: Option<u16>,
+    pub native_port: Option<u16>,
+    pub user: Option<String>,
+    pub password: Option<String>,
+    pub database: Option<String>,
+    pub config: Option<String>,
+    pub extra_env: Vec<String>,
+    pub wait_timeout: Duration,
+    pub json: bool,
+}
+
+pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
+    let StartCmd {
+        name,
+        version,
+        http_port,
+        native_port,
+        user,
+        password,
+        database,
+        config,
+        extra_env,
+        wait_timeout,
+        json,
+    } = cmd;
     let preflight = validate_start_options(
         name.as_deref(),
         version.as_deref(),
@@ -982,28 +998,6 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
         selection: None,
     };
     output::print_output(&out, json);
-    Ok(())
-}
-
-pub(crate) async fn stop_all(json: bool) -> Result<()> {
-    let metadata_lock = server::lock_metadata()?;
-    server::recover_current_project_servers_locked(&metadata_lock)?;
-    let servers: Vec<_> = server::list_running_servers_locked(&metadata_lock)?
-        .into_iter()
-        .filter(|s| s.engine == Engine::Clickhouse && s.container_id.is_some())
-        .collect();
-    if !json && servers.is_empty() {
-        println!("No running ClickHouse servers");
-        return Ok(());
-    }
-    let out = crate::local::stop_servers(&servers, json, |name| {
-        server::kill_server_locked(name, &metadata_lock)
-    });
-    if json {
-        output::print_output(&out, json);
-    } else {
-        println!("Done");
-    }
     Ok(())
 }
 
