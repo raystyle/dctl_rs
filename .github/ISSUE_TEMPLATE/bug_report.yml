@@ -1,25 +1,25 @@
-name: Bug report
-description: Report a problem with dctl (dctl)
+name: Bug 报告
+description: 报告 dctl 的问题
 title: "[bug]: "
 labels: ["bug"]
 body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to file a bug report! Please fill out the sections below so we can reproduce and fix the issue.
+        感谢花时间提交 bug 报告。请填写以下各节,便于复现与修复。
   - type: textarea
     id: what-happened
     attributes:
-      label: What happened?
-      description: A clear description of the bug, including what you expected to happen instead.
-      placeholder: When I run `dctl ...`, I expected ... but instead ...
+      label: 发生了什么
+      description: 清晰描述 bug,以及你期望发生什么。
+      placeholder: 我运行 `dctl ...` 时期望 ...,但实际 ...
     validations:
       required: true
   - type: textarea
     id: repro
     attributes:
-      label: Steps to reproduce
-      description: The exact commands you ran, in order. Include relevant flags and config.
+      label: 复现步骤
+      description: 按顺序列出执行的确切命令,含相关旗标与配置。
       placeholder: |
         1. `dctl local server start ...`
         2. `dctl ...`
@@ -30,49 +30,49 @@ body:
   - type: input
     id: version
     attributes:
-      label: dctl version
-      description: Output of `dctl --version`.
-      placeholder: dctl 0.2.4
+      label: dctl 版本
+      description: `dctl --version` 的输出。
+      placeholder: dctl 0.5.0
     validations:
       required: true
   - type: dropdown
     id: install-method
     attributes:
-      label: Installation method
-      description: How did you install dctl?
+      label: 安装方式
+      description: 你是怎么安装 dctl 的?
       options:
-        - Quick install script (curl ... | sh)
+        - 快速安装脚本(curl ... | sh)
         - cargo binstall
-        - Built from source
-        - Other (describe in "What happened?")
+        - 从源码构建
+        - 其它(在「发生了什么」里描述)
     validations:
       required: false
   - type: dropdown
     id: os
     attributes:
-      label: Operating system
+      label: 操作系统
       options:
-        - macOS (Apple Silicon)
-        - macOS (Intel)
-        - Linux (x86_64)
-        - Linux (aarch64)
+        - macOS Apple Silicon
+        - macOS Intel
+        - Linux x86_64
+        - Linux aarch64
         - Windows
-        - Other (describe in "What happened?")
+        - 其它(在「发生了什么」里描述)
     validations:
       required: true
   - type: input
     id: os-version
     attributes:
-      label: OS version
-      description: e.g. macOS 15.5, Ubuntu 24.04, Debian 12.
+      label: 系统版本
+      description: 如 macOS 15.5、Ubuntu 24.04、Debian 12。
       placeholder: macOS 15.5
     validations:
       required: false
   - type: textarea
     id: logs
     attributes:
-      label: Relevant logs or output
-      description: Paste any error messages or command output. This will be rendered as code, so no need for backticks.
+      label: 相关日志或输出
+      description: 粘贴报错信息或命令输出。将按代码渲染,无需手加反引号。
       render: shell
     validations:
       required: false
