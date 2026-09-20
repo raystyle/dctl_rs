@@ -1,16 +1,16 @@
 # dctl
 
-**dctl**(DataBase Control)是本地数据库服务器管理 CLI:以官方二进制管理 ClickHouse,以 Docker 容器管理 Postgres 与 FalkorDB 图数据库。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 部分,保留本地与 Docker 引擎生命周期作为核心。
+**dctl**(DataBase Control)是本地数据库服务器管理 CLI:ClickHouse、Postgres、FalkorDB 图数据库三引擎统一走 Docker 容器生命周期,client 由 dctl 自身集成(ClickHouse 查询走 HTTP 接口,宿主无需装任何数据库 CLI)。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 与二进制下载部分,保留本地引擎生命周期作为核心。
 
 一条命令在项目目录里跑起数据库,无需手写配置:
 
 ```console
-$ dctl local server start          # 首次运行自动安装 latest,拉起进程并等待就绪
-$ dctl local client -q 'SELECT 1'  # exec 进入匹配的 clickhouse-client
+$ dctl local server start          # 需要时拉取 clickhouse-server 镜像,打印生成的密码
+$ dctl local client -q 'SELECT 1'  # dctl 内置 HTTP 客户端直查
 $ dctl local server stop
 ```
 
-Postgres 走 Docker 引擎,同一套生命周期:
+Postgres 与 FalkorDB 同一套容器生命周期:
 
 ```console
 $ dctl local postgres start        # 需要时拉取 postgres:18,打印生成的密码
@@ -45,7 +45,7 @@ $ cargo build --release -p databasectl
 
 `dctl update` 自更新到最新 GitHub release,`dctl update --check` 仅检查不安装。没有 crates.io、npm、PyPI 渠道;GitHub Releases 是唯一分发点。
 
-环境要求:Linux 或 macOS;Postgres 与 FalkorDB 引擎需要 Docker;下载 ClickHouse 二进制需要能访问 builds.clickhouse.com 与 packages.clickhouse.com(产品下载源,与上游一致)。
+环境要求:Linux 或 macOS;三个引擎都需要 Docker。
 
 ## 配置
 
@@ -54,8 +54,7 @@ dctl 的状态分两处存放:
 | 路径 | 范围 | 内容 |
 | --- | --- | --- |
 | `<project>/.dctl/` | 每项目 | 服务器元数据 `servers/*.json`、服务器数据目录;由 `dctl local init` 写入 gitignore |
-| `~/.dctl/` | 全局 | 已装版本 `versions/<v>/clickhouse`、默认版本标记、命名部分配置 `configs/` |
-| `~/.local/bin/clickhouse` | 全局 | 指向默认 ClickHouse 二进制的符号链接,由 `dctl local use` 维护 |
+| `~/.dctl/` | 全局 | 命名部分配置 `configs/`、ledger 私钥 `ledger/` |
 
 项目级命令只认当前目录下的 `.dctl/`,不向上搜索父目录;请在项目根目录运行。
 
@@ -68,30 +67,31 @@ dctl 的状态分两处存放:
 
 顶层命令面:`dctl local`、`dctl skills`、`dctl update`。处处接受 `--json`,agent 自动获得;退出码:0 成功、1 错误、2 usage 错误、3 取消。
 
-### ClickHouse 版本管理
+### 镜像预拉取
 
 ```console
-$ dctl local install 25.12      # 精确构建、次版本系列,或 latest/stable/lts
-$ dctl local list               # 已安装的精确版本
-$ dctl local list --remote      # 可下载的次版本系列
-$ dctl local use 25.12          # 设默认并符号链接 ~/.local/bin/clickhouse
-$ dctl local which              # 查看默认版本
-$ dctl local remove 25.12       # 带守卫:拒绝删除使用中或默认版本
+$ dctl local install 26.8             # 或 26.8.9.10 / latest,预拉 ClickHouse 镜像
+$ dctl local install postgres@18      # 或 postgres:17-alpine
+$ dctl local install falkordb@4.20.6  # 或 falkordb:latest
 ```
 
 ### ClickHouse 服务器
 
 ```console
 $ dctl local init                       # 脚手架 .dctl/、clickhouse/、postgres/、falkordb/ 目录
-$ dctl local server start               # default 服务器,端口被占自动选空闲口
-$ dctl local server start dev --http-port 8333
-$ dctl local server status              # --global 可跨项目列出
-$ dctl local server stop [NAME]         # 幂等;stop-all 停所有范围
-$ dctl local server remove NAME         # 须先停止;删除数据
-$ dctl local client [-q 'SELECT 1']     # exec 匹配的 clickhouse-client
+$ dctl local server start               # default 实例,clickhouse:26.8,双口被占自动选空闲口
+$ dctl local server start dev --http-port 8333 --native-port 9333
+$ dctl local server start --version 26.8.9   # 指定镜像 tag;latest 亦可
+$ dctl local server list                # 三引擎并列(运行中 + 已停止)
+$ dctl local server stop [NAME]         # 幂等;stop-all 停本项目所有引擎
+$ dctl local server remove NAME         # 须先停止;删除容器与数据
+$ dctl local client [-q 'SELECT 1']     # 内置 HTTP 客户端;-q/--queries-file 走 HTTP
+$ dctl local client                     # 交互式,docker exec 进容器内 clickhouse-client
+$ dctl local client --host H --port P -q 'SELECT 1'   # 直连任意 ClickHouse
+$ dctl local server dotenv              # 写 CLICKHOUSE_* 连接变量
 ```
 
-start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置叠加到托管服务器配置上。孤儿服务器(在项目里启动过但元数据被移动)通过进程 cwd 扫描被发现。
+start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以只读卷挂载进容器 `config.d/`。随机密码由 start 打印一次,`client`/`dotenv` 从容器环境重读。孤儿容器(元数据被移动)通过 Docker label 被重新发现。
 
 ### init 后的项目目录结构
 
@@ -102,9 +102,9 @@ start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置叠�
 ├── .dctl/                  # 运行时状态(gitignore 自动写入,不入库)
 │   ├── .gitignore          # 内容恒为 *,忽略整个 .dctl/
 │   └── servers/            # 各服务器实例元数据与数据
-│       ├── default.json    # ClickHouse 服务器元数据(名称/PID/端口/版本)
-│       ├── default/        # ClickHouse 服务器数据目录
-│       │   └── data/
+│       ├── default-ch26.8.json   # ClickHouse 实例元数据(名称/容器/端口/版本)
+│       ├── default-ch26.8/
+│       │   └── data/       # ClickHouse 数据(bind mount 到容器)
 │       ├── default-pg18.json   # Postgres 实例元数据
 │       ├── default-pg18/
 │       │   └── data/       # Postgres 数据(bind mount 到容器)
@@ -129,7 +129,7 @@ start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置叠�
 
 **入库规则**:`clickhouse/`、`postgres/`、`falkordb/` 是你项目的 SQL/Cypher 脚手架(各含 `.gitkeep` 保证空目录入库),随代码提交;`.dctl/` 是运行时状态(服务器数据与元数据),`init` 自动写入 `.dctl/.gitignore`(内容为 `*`)确保整目录不入库。ledger 私钥在全局 `~/.dctl/ledger/dctl_rs.pem`(0600),不在项目目录内。
 
-**多实例命名**:同一名字可有多版本实例(如 `default-pg18` 与 `default-pg17` 并存),元数据文件名 = `<name>-<engine><version>`;`stop`/`remove` 不带 `--version` 时,单实例直接选中,多实例报错要求指定。
+**多实例命名**:同一名字可有多版本实例(如 `default-ch26.8` 与 `default-ch26.9`、`default-pg18` 与 `default-pg17` 并存),元数据文件名 = `<name>-<engine><version>`;`stop`/`remove` 不带 `--version` 时,单实例直接选中,多实例报错要求指定。
 
 ### Postgres 与 Docker
 

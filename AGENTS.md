@@ -1,6 +1,6 @@
 # dctl_rs
 
-dctl(DataBase Control):本地 ClickHouse 官方二进制与 Postgres(Docker)生命周期管理 CLI,是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
+dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容器生命周期管理 CLI(client 内置集成),是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
 
 `CLAUDE.md` 是一行 `@AGENTS.md` 桥接;只编辑 `AGENTS.md`,不另写第二份。
 
@@ -37,6 +37,6 @@ dctl(DataBase Control):本地 ClickHouse 官方二进制与 Postgres(Docker)生�
 ## 环境
 
 - 开发机 WSL(/mnt/wsl/repos/dctl_rs,无 Docker);Docker 依赖测试用 `ssh ray@lan-linux`(Docker 29.8.1,无 Rust,以 rust:1-slim 容器跑,完整配方与权限坑见 `docs/diary/2026-09-20-fork-bootstrap.md`)
-- 状态目录:项目级 `.dctl/`,全局 `~/.dctl/`;`~/.local/bin/clickhouse` 为产品符号链接,名字不改
+- 状态目录:项目级 `.dctl/`,全局 `~/.dctl/`;三引擎实例键 `<name>-<engine><version>`,容器名 `dctl-<engine>-<name>-<version>`
 - 上游:`upstream` remote 指 ClickHouse/clickhousectl,选择性 backport,纪律见 ADR-0001
 - 文档路径统一正斜杠写法 `docs/adr/`
