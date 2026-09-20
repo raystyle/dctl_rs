@@ -91,3 +91,8 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 版本线从上游 0.5.0 续至 0.6.0;tag 驱动 release workflow 一次通过:4 target 构建(musl 静态双验)、8 发行版 smoke、GitHub Release 四资产
 - 下载冒烟:gh 认证下载 musl 包,dctl --version 与 ledger key 输出正确(kid 与内置 JWK 一致)
 - 注意:仓库 private 期间匿名直链 404 属预期;转 public 后 install.sh / binstall 直链即通
+
+## 总台追注回执
+
+- ledger-client 依赖 tag 收到 v0.1.1 追注(v0.1.0 舰队级缺陷:URL 拼接缺斜杠致 GET 假空与 POST 路径分叉;v0.1.1 已修 + decode 硬化,hst 实弹报);REQ-006 登记时已采 v0.1.1,一句留痕
+- REQ-006(ledger-rs 迁移 + 权限收口)已按两道总台令合并立案:切共享 crate、移除自研签名道与 HTTP 客户端、命令面只增不关不删、关闭删除唯一道走 omc 工位

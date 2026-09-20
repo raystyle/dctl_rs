@@ -9,3 +9,4 @@
 | REQ-003 | implemented | must | FalkorDB 图数据库引擎接入 | cargo test -p databasectl --test local_falkor_readiness_test |
 | REQ-004 | implemented | should | 集成 ledger 标准的 issue 与 artifact 命令族 | cargo test -p databasectl --test ledger_request_test |
 | REQ-005 | draft | could | registry.ohmygh.com 私仓直连与离线回落 | null |
+| REQ-006 | draft | must | 迁移到共享 ledger-rs crate 并统一权限收口 | null |
