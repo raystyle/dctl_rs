@@ -6,4 +6,4 @@
 | --- | --- | --- | --- | --- |
 | REQ-001 | draft | should | Engine 抽象泛化,接入第三引擎 | null |
 | REQ-002 | draft | should | 物理删除 telemetry.rs 与 failure.rs | null |
-| REQ-003 | draft | must | FalkorDB 图数据库引擎接入 | null |
+| REQ-003 | implemented | must | FalkorDB 图数据库引擎接入 | cargo test -p databasectl --test local_falkor_readiness_test |
