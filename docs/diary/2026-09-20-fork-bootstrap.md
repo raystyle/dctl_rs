@@ -72,3 +72,9 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 修复:事件体/字段映射/翻页/桩形状全按 worker 真实形状重钉;人类面表格带 Result/Dev/Prod/Cur 列;401 文案覆盖钥不配对;写面路径带 query 本地拒绝;base_url 去尾斜杠;私钥 0600 警告;README attest 旗标改 --kind;ADR-0006 补签名 pathname 语义与 DCTL_LEDGER_KEY 载体语义
 - G3(b 案:从私钥推导 kid 并警告不匹配)与 G9(/events?since= 读面)记 backlog
 - 教训:对有真源的服务做集成,桩形状必须从服务端源码抄,不能从契约摘要想象:三高一全因虚构形状而全绿
+
+## 家族标准对齐轮(herdr-flywheel 纯讨论轮)
+
+- 用户令「看其他项目如何实现的,形成标准对齐」;抽查 hst_rs/reader_rs/ark_rs 一手源码,成文 S002
+- 核心发现:hst 的 close 链确定性幂等键(sha256 锚 issue 号+类型+digest)是家族对 G4 半链问题的既证解法,dctl 应对齐
+- 保持项裁定:命令挂载(dctl 组式)、私钥形态(PEM)、表格渲染;三项 dctl 独有防御(query 拒绝、尾斜杠 trim、0600 警告)列为家族可反向吸收项
