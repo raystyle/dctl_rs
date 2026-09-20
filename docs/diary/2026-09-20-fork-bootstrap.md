@@ -55,3 +55,13 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 实弹发现并修复两缺陷:docker exec 回退 client 未带认证;孤儿恢复把镜像全引用存成 version 致 resume 解析错位 [实证: 2026-09-20 lan-linux 真容器全生命周期 SMOKE OK]
 - 测试写法教训:StartupExit 在 JSON 信封是 redacted 摘要,断言日志尾要用人类模式;串行锁要防毒化(lock 失败转 into_inner);假 Docker 的锁不变量只对慢操作(镜像 inspect/pull)生效,create/start 按设计持锁
 - 环境特性记录:容器内跑 dctl(挂宿主 socket)时,TcpListener 端口探测在容器网络命名空间,看不到宿主端口占用;自动挑口在此环境可能撞宿主已绑端口,冒烟须显式指定端口
+
+## ledger 命令族单
+
+同日追加于 ledger-commands 分支(总台令 REQ-063 标准,REQ-004 落地):
+
+- 交付:顶层 `dctl ledger` 命令域(issue 四命令 + artifact 四命令 + key 分发面),Ed25519 五头签名道,ADR-0006 立案
+- 密钥:keypair 现场生成,私钥 0600 落 ~/.dctl/ledger/dctl_rs.pem 永不入仓不进 argv;公钥 JWK 常量内置 CLI
+- 验证:单测与 wiremock 子进程套件全绿(签名基逐字节、五头验签、close 链顺序、家族翻页、digest 拒绝、409 语义);读面实弹 ledger.ohmygh.com GET 200 [实证: 2026-09-20 issue/artifact list 投影返回]
+- 踩坑:reqwest query 传单元组会触发 serde_urlencoded unsupported pair,须传键值对数组;ed25519-dalek v3 的 PEM 特性名是 pem(含 pkcs8),keypair 生成走 openssl 与生产密档同路径
+- 待办:总台注册公钥 kid 后补写面实弹(issue new 201 + artifact publish 201)
