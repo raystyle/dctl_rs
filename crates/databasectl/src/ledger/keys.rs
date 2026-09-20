@@ -74,6 +74,7 @@ pub(crate) fn load_signing_key() -> Result<SigningKey> {
                 path.display()
             ))
         })?;
+        warn_if_world_accessible(&path);
         return parse_pem(&bytes);
     }
 
@@ -87,7 +88,34 @@ pub(crate) fn load_signing_key() -> Result<SigningKey> {
             key_guidance()
         ))
     })?;
+    warn_if_world_accessible(&path);
     parse_pem(&bytes)
+}
+
+/// The key archive is protected by convention (0600); flag group/world bits
+/// loudly but do not block — the warning is the same discipline tier as
+/// "never in argv, never in the repo". Returns the warning text so tests can
+/// capture it without stderr plumbing.
+fn warn_if_world_accessible(path: &std::path::Path) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(metadata) = std::fs::metadata(path)
+            && metadata.permissions().mode() & 0o077 != 0
+        {
+            let warning = format!(
+                "Warning: ledger private key {} is readable by group or others; chmod 600 it.",
+                path.display()
+            );
+            eprintln!("{warning}");
+            return Some(warning);
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    None
 }
 
 fn parse_pem(text: &str) -> Result<SigningKey> {
@@ -124,6 +152,21 @@ mod tests {
             .decode(value["x"].as_str().unwrap())
             .unwrap();
         assert_eq!(raw.len(), 32);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn world_readable_key_archive_warns_and_private_one_does_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("k.pem");
+        std::fs::write(&key, "x").unwrap();
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(warn_if_world_accessible(&key).is_some());
+
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(warn_if_world_accessible(&key).is_none());
     }
 
     #[test]
