@@ -1,16 +1,16 @@
-//! Docker integration for `local postgres`.
+//! Docker integration for `local postgres` and `local falkordb`.
 //!
 //! All Docker work goes through the async Docker API — there is no shell-out
 //! to the `docker` CLI anywhere in this crate, including for interactive
-//! `psql` exec (which uses an attached exec stream + crossterm raw mode and
-//! forwards SIGWINCH as `resize_exec`).
+//! `psql`/`redis-cli` exec (which uses an attached exec stream + crossterm
+//! raw mode and forwards SIGWINCH as `resize_exec`).
 //!
 //! Containers we create are tagged with these labels so we can later discover
 //! them even if the local metadata file is missing:
 //!
-//!  * `dctl.engine=postgres`
+//!  * `dctl.engine=postgres|falkordb`
 //!  * `dctl.name=<server-name>`
-//!  * `dctl.major=<major-version>`
+//!  * `dctl.major=<major-or-full-version>`
 //!  * `dctl.project=<canonical project cwd>`
 //!  * `created_by=dctl_<crate-version>`
 
@@ -37,6 +37,12 @@ pub fn created_by_value() -> String {
 /// Distinct (name, major) pairs always get distinct container names.
 pub fn pg_container_name(user_name: &str, major: &str) -> String {
     format!("dctl-pg-{}-{}", user_name, major)
+}
+
+/// Container name for a FalkorDB instance: `dctl-fk-<name>-<version>`.
+/// Distinct (name, version) pairs always get distinct container names.
+pub fn fk_container_name(user_name: &str, version: &str) -> String {
+    format!("dctl-fk-{}-{}", user_name, version)
 }
 
 /// Connect to the local Docker daemon and verify it's reachable.
@@ -296,11 +302,12 @@ impl PullReporter {
     }
 }
 
-/// Pull `postgres:<tag>`, keeping full progress for interactive terminals and
-/// collapsing it to one bounded summary line for redirected or structured output.
-pub async fn pull_image(docker: &Docker, tag: &str, structured_output: bool) -> Result<()> {
+/// Pull an image by full reference (`postgres:18`, `falkordb/falkordb:v4.20.6`),
+/// keeping full progress for interactive terminals and collapsing it to one
+/// bounded summary line for redirected or structured output.
+pub async fn pull_image(docker: &Docker, image_ref: &str, structured_output: bool) -> Result<()> {
     use bollard::query_parameters::CreateImageOptionsBuilder;
-    let from = format!("postgres:{}", tag);
+    let from = image_ref.to_string();
     let mode = pull_progress_mode(
         io::stdout().is_terminal(),
         io::stderr().is_terminal(),
@@ -328,11 +335,10 @@ pub async fn pull_image(docker: &Docker, tag: &str, structured_output: bool) -> 
     Ok(())
 }
 
-/// Check whether `postgres:<tag>` is already present locally (no pull).
-pub async fn image_exists(docker: &Docker, tag: &str) -> Result<bool> {
+/// Check whether an image reference is already present locally (no pull).
+pub async fn image_exists(docker: &Docker, image_ref: &str) -> Result<bool> {
     use bollard::errors::Error as BErr;
-    let name = format!("postgres:{}", tag);
-    match docker.inspect_image(&name).await {
+    match docker.inspect_image(image_ref).await {
         Ok(_) => Ok(true),
         Err(BErr::DockerResponseServerError {
             status_code: 404, ..
@@ -425,18 +431,19 @@ pub async fn create_postgres(docker: &Docker, opts: PostgresRunOpts<'_>) -> Resu
     Ok(created.id)
 }
 
-/// If a container with our managed name (`dctl-pg-<name>-<major>`)
-/// exists in any state, remove it — but only when it carries our labels for
-/// the current project. Returns Ok(()) if the name is free or was cleaned
-/// up, or an actionable error if the name is held by an unrelated container.
+/// If a container with one of our managed names (`dctl-pg-<name>-<major>` or
+/// `dctl-fk-<name>-<version>`) exists in any state, remove it — but only when
+/// it carries our labels for the current project. Returns Ok(()) if the name
+/// is free or was cleaned up, or an actionable error if the name is held by an
+/// unrelated container.
 pub async fn ensure_name_free(
     docker: &Docker,
-    user_name: &str,
-    major: &str,
+    container_name: &str,
+    engine: &str,
     project_cwd: &str,
 ) -> Result<()> {
     use bollard::errors::Error as BErr;
-    let cname = pg_container_name(user_name, major);
+    let cname = container_name.to_string();
     match docker.inspect_container(&cname, None).await {
         Ok(info) => {
             let labels_match = info
@@ -444,7 +451,7 @@ pub async fn ensure_name_free(
                 .as_ref()
                 .and_then(|c| c.labels.as_ref())
                 .map(|l| {
-                    l.get(LABEL_ENGINE).map(String::as_str) == Some("postgres")
+                    l.get(LABEL_ENGINE).map(String::as_str) == Some(engine)
                         && l.get(LABEL_PROJECT).map(String::as_str) == Some(project_cwd)
                 })
                 .unwrap_or(false);
@@ -460,6 +467,143 @@ pub async fn ensure_name_free(
         }) => Ok(()),
         Err(e) => Err(Error::DockerError(e.to_string())),
     }
+}
+
+pub struct FalkorRunOpts<'a> {
+    /// User-facing instance name (e.g. `dev`).
+    pub user_name: &'a str,
+    /// Full version digits (e.g. `4.20.6`).
+    pub version: &'a str,
+    /// Image reference (e.g. `falkordb/falkordb:v4.20.6`).
+    pub image_ref: &'a str,
+    pub host_port: u16,
+    pub browser_port: u16,
+    pub data_dir: &'a std::path::Path,
+    pub project_cwd: &'a str,
+    pub password: &'a str,
+    pub extra_env: Vec<String>,
+}
+
+/// Create a FalkorDB container without starting it; return its ID. Same
+/// create-then-start split as `create_postgres`, for identical rollback
+/// guarantees.
+pub async fn create_falkordb(docker: &Docker, opts: FalkorRunOpts<'_>) -> Result<String> {
+    use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+    use bollard::query_parameters::CreateContainerOptionsBuilder;
+
+    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    for (container_port, host_port) in [
+        ("6379/tcp", opts.host_port),
+        ("3000/tcp", opts.browser_port),
+    ] {
+        port_bindings.insert(
+            container_port.to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(host_port.to_string()),
+            }]),
+        );
+    }
+
+    let canonical_data = opts
+        .data_dir
+        .canonicalize()
+        .map_err(|e| Error::DockerError(format!("data dir canonicalize: {e}")))?;
+    let bind = format!("{}:/var/lib/falkordb/data", canonical_data.display());
+
+    let host_config = HostConfig {
+        port_bindings: Some(port_bindings),
+        binds: Some(vec![bind]),
+        ..Default::default()
+    };
+
+    // Authentication is Redis-layer: REDIS_ARGS reaches the server's argv.
+    // FALKORDB_ARGS (module tuning) may arrive through extra_env.
+    let mut env: Vec<String> = vec![format!("REDIS_ARGS=--requirepass {}", opts.password)];
+    env.extend(opts.extra_env);
+
+    let mut labels: HashMap<String, String> = HashMap::new();
+    labels.insert(LABEL_ENGINE.into(), "falkordb".into());
+    labels.insert(LABEL_NAME.into(), opts.user_name.into());
+    labels.insert(LABEL_MAJOR.into(), opts.version.into());
+    labels.insert(LABEL_PROJECT.into(), opts.project_cwd.into());
+    labels.insert(LABEL_CREATED_BY.into(), created_by_value());
+
+    let container_config = ContainerCreateBody {
+        image: Some(opts.image_ref.to_string()),
+        env: Some(env),
+        host_config: Some(host_config),
+        labels: Some(labels),
+        ..Default::default()
+    };
+
+    let create_opts = CreateContainerOptionsBuilder::default()
+        .name(&fk_container_name(opts.user_name, opts.version))
+        .build();
+
+    let created = docker
+        .create_container(Some(create_opts), container_config)
+        .await
+        .map_err(|e| Error::DockerError(e.to_string()))?;
+    Ok(created.id)
+}
+
+/// Run FalkorDB's readiness probe inside the container: an authenticated
+/// `redis-cli ping` succeeds (exit 0, PONG) only once the server answers with
+/// the password we provisioned. Connection failures exit non-zero.
+pub async fn falkor_is_ready(docker: &Docker, id: &str, password: &str) -> Result<bool> {
+    use bollard::exec::{StartExecOptions, StartExecResults};
+    use bollard::models::ExecConfig;
+
+    let exec = docker
+        .create_exec(
+            id,
+            ExecConfig {
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                attach_stdin: Some(false),
+                tty: Some(false),
+                cmd: Some(vec![
+                    "redis-cli".to_string(),
+                    "--no-auth-warning".to_string(),
+                    "-a".to_string(),
+                    password.to_string(),
+                    "ping".to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    let started = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    if !matches!(started, StartExecResults::Detached) {
+        return Err(Error::DockerError(
+            "FalkorDB readiness probe unexpectedly attached".to_string(),
+        ));
+    }
+
+    for _ in 0..75 {
+        let inspect = docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|error| Error::DockerError(error.to_string()))?;
+        if inspect.running != Some(true) {
+            return Ok(inspect.exit_code == Some(0));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Err(Error::DockerError(
+        "FalkorDB readiness probe did not exit within 1.5 seconds".to_string(),
+    ))
 }
 
 /// A missing container is distinct from an inspection failure. Only Docker's
@@ -699,13 +843,31 @@ pub async fn list_project_postgres(
     docker: &Docker,
     project_cwd: &str,
 ) -> Result<Vec<DiscoveredContainer>> {
+    list_project_engine(docker, project_cwd, "postgres", 5432).await
+}
+
+/// Find FalkorDB containers we created in `project_cwd`; same label contract
+/// as `list_project_postgres`, with the protocol port 6379.
+pub async fn list_project_falkor(
+    docker: &Docker,
+    project_cwd: &str,
+) -> Result<Vec<DiscoveredContainer>> {
+    list_project_engine(docker, project_cwd, "falkordb", 6379).await
+}
+
+async fn list_project_engine(
+    docker: &Docker,
+    project_cwd: &str,
+    engine: &str,
+    protocol_port: u16,
+) -> Result<Vec<DiscoveredContainer>> {
     use bollard::query_parameters::ListContainersOptionsBuilder;
 
     let mut filters: HashMap<String, Vec<String>> = HashMap::new();
     filters.insert(
         "label".to_string(),
         vec![
-            format!("{}=postgres", LABEL_ENGINE),
+            format!("{}={}", LABEL_ENGINE, engine),
             format!("{}={}", LABEL_PROJECT, project_cwd),
         ],
     );
@@ -741,7 +903,7 @@ pub async fn list_project_postgres(
         let host_port = c.ports.as_ref().and_then(|ports| {
             ports
                 .iter()
-                .find(|p| p.private_port == 5432)
+                .find(|p| p.private_port == protocol_port)
                 .and_then(|p| p.public_port)
         });
         out.push(DiscoveredContainer {
@@ -763,12 +925,34 @@ pub async fn exec_psql_one_shot(
     psql_args: &[String],
     reader: Option<Box<dyn io::Read + Send>>,
 ) -> Result<()> {
+    let mut cmd = vec!["psql".to_string()];
+    cmd.extend(psql_args.iter().cloned());
+    exec_command_one_shot(docker, container_id, cmd, reader).await
+}
+
+/// Run `redis-cli` without a TTY, same streaming contract as the psql variant.
+pub async fn exec_redis_cli_one_shot(
+    docker: &Docker,
+    container_id: &str,
+    cli_args: &[String],
+    reader: Option<Box<dyn io::Read + Send>>,
+) -> Result<()> {
+    let mut cmd = vec!["redis-cli".to_string()];
+    cmd.extend(cli_args.iter().cloned());
+    exec_command_one_shot(docker, container_id, cmd, reader).await
+}
+
+/// Run a command without a TTY, streaming an optional host input source into
+/// the exec stream while forwarding stdout and stderr independently.
+async fn exec_command_one_shot(
+    docker: &Docker,
+    container_id: &str,
+    cmd: Vec<String>,
+    reader: Option<Box<dyn io::Read + Send>>,
+) -> Result<()> {
     use bollard::exec::StartExecResults;
     use bollard::models::ExecConfig;
     use tokio::io::AsyncWriteExt;
-
-    let mut cmd = vec!["psql".to_string()];
-    cmd.extend(psql_args.iter().cloned());
 
     let exec = docker
         .create_exec(
@@ -793,7 +977,9 @@ pub async fn exec_psql_one_shot(
     let (mut output, mut input) = match started {
         StartExecResults::Attached { output, input } => (output, input),
         StartExecResults::Detached => {
-            return Err(Error::DockerError("psql exec unexpectedly detached".into()));
+            return Err(Error::DockerError(
+                "container exec unexpectedly detached".into(),
+            ));
         }
     };
 
@@ -842,7 +1028,7 @@ pub async fn exec_psql_one_shot(
             input_result
         }
         _ => Err(Error::DockerError(
-            "psql exec has no final exit status".into(),
+            "container exec has no final exit status".into(),
         )),
     }
 }
@@ -895,14 +1081,32 @@ pub async fn exec_psql_in_container(
     container_id: &str,
     psql_args: &[String],
 ) -> Result<()> {
+    let mut cmd = vec!["psql".to_string()];
+    cmd.extend(psql_args.iter().cloned());
+    exec_command_tty(docker, container_id, cmd).await
+}
+
+/// Run `redis-cli` inside a container with a full interactive TTY; same
+/// contract as the psql variant.
+pub async fn exec_redis_cli_in_container(
+    docker: &Docker,
+    container_id: &str,
+    cli_args: &[String],
+) -> Result<()> {
+    let mut cmd = vec!["redis-cli".to_string()];
+    cmd.extend(cli_args.iter().cloned());
+    exec_command_tty(docker, container_id, cmd).await
+}
+
+/// Run a command inside a container with a full interactive TTY:
+/// host stdin/stdout are wired to the docker exec stream, the host terminal
+/// goes into raw mode, and SIGWINCH is forwarded as `resize_exec`.
+async fn exec_command_tty(docker: &Docker, container_id: &str, cmd: Vec<String>) -> Result<()> {
     use bollard::exec::StartExecResults;
     use bollard::models::ExecConfig;
     use bollard::query_parameters::ResizeExecOptionsBuilder;
     use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let mut cmd = vec!["psql".to_string()];
-    cmd.extend(psql_args.iter().cloned());
 
     let exec = docker
         .create_exec(
@@ -1215,6 +1419,50 @@ pub fn recover_project_postgres_blocking(
                 started_at: "recovered".to_string(),
                 cwd: cwd_owned.clone(),
                 engine: Engine::Postgres,
+                container_id: Some(c.container_id.clone()),
+            };
+            save_server_info_locked(&info, lock)?;
+        }
+        Ok(())
+    })
+}
+
+/// FalkorDB sibling of `recover_project_postgres_blocking`: same contract,
+/// keyed `<name>-fk<version>`; the browser port is not recoverable from the
+/// label filter alone and stays 0 until the next start refreshes it.
+pub fn recover_project_falkor_blocking(
+    project_cwd: &str,
+    lock: &crate::local::server::MetadataLock,
+) -> Result<()> {
+    use crate::local::server::{
+        Engine, ServerInfo, ensure_fk_data_dir, fk_instance_key, load_info_locked,
+        save_server_info_locked,
+    };
+    let cwd_owned = project_cwd.to_string();
+    block_on(async move {
+        let docker = match connect().await {
+            Ok(d) => d,
+            Err(_) => return Ok::<(), Error>(()),
+        };
+        let containers = match list_project_falkor(&docker, &cwd_owned).await {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        for c in containers {
+            let key = fk_instance_key(&c.user_name, &c.major);
+            if load_info_locked(&key, lock)?.is_some() {
+                continue;
+            }
+            ensure_fk_data_dir(&c.user_name, &c.major)?;
+            let info = ServerInfo {
+                name: key,
+                pid: 0,
+                version: c.image.clone(),
+                http_port: 0,
+                tcp_port: c.host_port.unwrap_or(0),
+                started_at: "recovered".to_string(),
+                cwd: cwd_owned.clone(),
+                engine: Engine::Falkordb,
                 container_id: Some(c.container_id.clone()),
             };
             save_server_info_locked(&info, lock)?;

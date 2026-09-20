@@ -2,6 +2,7 @@ pub mod cli;
 pub mod config;
 pub mod discovery;
 pub mod docker;
+pub mod falkordb;
 pub mod output;
 pub mod postgres;
 pub mod server;
@@ -49,6 +50,9 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
             if result.postgres_scaffold_created {
                 paths.push("postgres/".to_string());
             }
+            if result.falkordb_scaffold_created {
+                paths.push("falkordb/".to_string());
+            }
             let out = output::InitOutput {
                 paths,
                 already_initialized: !result.clickhouse_dir_created,
@@ -76,13 +80,15 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
         ),
         LocalCommands::Server { command } => run_server_commands(command, json).await,
         LocalCommands::Postgres { command } => postgres::run(command, json).await,
+        LocalCommands::Falkordb { command } => falkordb::run(command, json).await,
     }
 }
 
 async fn install_postgres(tag: &str, force: bool, json: bool) -> Result<()> {
     postgres::validate_pg_tag(tag)?;
     let docker = docker::connect().await?;
-    if !force && docker::image_exists(&docker, tag).await? {
+    let image_ref = format!("postgres:{tag}");
+    if !force && docker::image_exists(&docker, &image_ref).await? {
         let out = output::InstallOutput {
             version: format!("postgres@{tag}"),
             set_as_default: false,
@@ -94,10 +100,36 @@ async fn install_postgres(tag: &str, force: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    docker::pull_image(&docker, tag, json).await?;
+    docker::pull_image(&docker, &image_ref, json).await?;
 
     let out = output::InstallOutput {
         version: format!("postgres@{tag}"),
+        set_as_default: false,
+    };
+    output::print_output(&out, json);
+    Ok(())
+}
+
+async fn install_falkordb(tag: &str, force: bool, json: bool) -> Result<()> {
+    falkordb::validate_fk_tag(tag)?;
+    let docker = docker::connect().await?;
+    let image_ref = falkordb::fk_image_ref(tag);
+    if !force && docker::image_exists(&docker, &image_ref).await? {
+        let out = output::InstallOutput {
+            version: format!("falkordb@{tag}"),
+            set_as_default: false,
+        };
+        if !json {
+            eprintln!("{image_ref} is already pulled");
+        }
+        output::print_output(&out, json);
+        return Ok(());
+    }
+
+    docker::pull_image(&docker, &image_ref, json).await?;
+
+    let out = output::InstallOutput {
+        version: format!("falkordb@{tag}"),
         set_as_default: false,
     };
     output::print_output(&out, json);
@@ -108,6 +140,9 @@ async fn install(version: InstallVersionArg, force: bool, json: bool) -> Result<
     let spec = match version {
         InstallVersionArg::ClickHouse(spec) => spec,
         InstallVersionArg::Postgres(tag) => return install_postgres(&tag, force, json).await,
+        InstallVersionArg::Falkordb(version) => {
+            return install_falkordb(&version, force, json).await;
+        }
     };
     let platform = version_manager::platform::Platform::detect()?;
 
@@ -1233,12 +1268,16 @@ fn list_servers_local(json: bool) -> Result<()> {
                             } else {
                                 None
                             };
-                            // For Postgres the disk key is `<name>-pg<major>`;
-                            // show users the friendly name without the suffix.
-                            let display = if is_ch {
-                                e.name.clone()
-                            } else {
-                                postgres::user_name_from_key(&e.name).to_string()
+                            // For the Docker engines the disk key carries a
+                            // version suffix; show users the friendly name.
+                            let display = match info.engine {
+                                server::Engine::Clickhouse => e.name.clone(),
+                                server::Engine::Postgres => {
+                                    postgres::user_name_from_key(&e.name).to_string()
+                                }
+                                server::Engine::Falkordb => {
+                                    falkordb::user_name_from_key(&e.name).to_string()
+                                }
                             };
                             (
                                 display,
@@ -1395,6 +1434,10 @@ where
                 server::Engine::Clickhouse => (server.name.clone(), None),
                 server::Engine::Postgres => (
                     postgres::user_name_from_key(&server.name).to_string(),
+                    Some(server.version.clone()),
+                ),
+                server::Engine::Falkordb => (
+                    falkordb::user_name_from_key(&server.name).to_string(),
                     Some(server.version.clone()),
                 ),
             };

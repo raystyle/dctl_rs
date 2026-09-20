@@ -26,6 +26,12 @@ pub fn postgres_project_dir() -> PathBuf {
         .join("postgres")
 }
 
+pub fn falkordb_project_dir() -> PathBuf {
+    std::env::current_dir()
+        .expect("failed to get current directory")
+        .join("falkordb")
+}
+
 /// Which project-local paths `init()` created during this invocation. The
 /// caller renders this in both the human-readable and `--json` output, so
 /// `init()` itself prints nothing.
@@ -35,6 +41,7 @@ pub struct InitResult {
     pub runtime_gitignore_created: bool,
     pub clickhouse_scaffold_created: bool,
     pub postgres_scaffold_created: bool,
+    pub falkordb_scaffold_created: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -84,12 +91,15 @@ pub fn init() -> Result<InitResult> {
         postgres_project_dir(),
         &["tables", "views", "functions", "queries", "seed"],
     )?;
+    let falkordb_scaffold_created =
+        create_project_scaffold(falkordb_project_dir(), &["queries", "seed"])?;
 
     Ok(InitResult {
         clickhouse_dir_created: runtime_ignore.directory_created,
         runtime_gitignore_created: runtime_ignore.gitignore_created,
         clickhouse_scaffold_created,
         postgres_scaffold_created,
+        falkordb_scaffold_created,
     })
 }
 

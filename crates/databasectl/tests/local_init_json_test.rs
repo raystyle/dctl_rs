@@ -40,12 +40,13 @@ fn init_json_reports_clickhouse_dir_and_both_scaffolds_on_first_run() {
 
     assert_eq!(
         json["paths"],
-        serde_json::json!([".dctl/", "clickhouse/", "postgres/"])
+        serde_json::json!([".dctl/", "clickhouse/", "postgres/", "falkordb/"])
     );
 
     assert!(project.path().join(".dctl").is_dir());
     assert!(project.path().join("clickhouse/tables").is_dir());
     assert!(project.path().join("postgres/tables").is_dir());
+    assert!(project.path().join("falkordb/queries").is_dir());
 }
 
 #[test]
@@ -91,7 +92,7 @@ fn init_human_output_reports_each_created_path_exactly_once() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    for path in [".dctl/", "clickhouse/", "postgres/"] {
+    for path in [".dctl/", "clickhouse/", "postgres/", "falkordb/"] {
         // `.dctl/` is a substring match of itself only; `clickhouse/`
         // also matches inside `.dctl/`, so count line-anchored mentions.
         let mentions = combined
@@ -107,7 +108,8 @@ fn init_human_output_reports_each_created_path_exactly_once() {
         String::from_utf8_lossy(&output.stdout),
         "Initialized ClickHouse project in .dctl/\n\
          Created project scaffold in clickhouse/\n\
-         Created project scaffold in postgres/\n"
+         Created project scaffold in postgres/\n\
+         Created project scaffold in falkordb/\n"
     );
 }
 

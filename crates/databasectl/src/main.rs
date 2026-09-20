@@ -146,6 +146,14 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
 
     if let Commands::Local(args) = &cli.command {
         let Some(message) = args.postgres_start_validation_error() else {
+            if let Some(message) = args.falkor_start_validation_error() {
+                let start = cmd
+                    .find_subcommand_mut("local")
+                    .and_then(|local| local.find_subcommand_mut("falkordb"))
+                    .and_then(|falkordb| falkordb.find_subcommand_mut("start"))
+                    .expect("local falkordb start command must exist");
+                return Err(start.error(ErrorKind::ArgumentConflict, message));
+            }
             return Ok(());
         };
         let start = cmd

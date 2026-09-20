@@ -309,10 +309,17 @@ async fn start(
         drop(metadata_lock);
 
         if prior.is_none() {
-            if !docker::image_exists(&docker, &tag).await? {
-                docker::pull_image(&docker, &tag, json).await?;
+            let image_ref = format!("postgres:{tag}");
+            if !docker::image_exists(&docker, &image_ref).await? {
+                docker::pull_image(&docker, &image_ref, json).await?;
             }
-            docker::ensure_name_free(&docker, &user_name, &major, &project_cwd).await?;
+            docker::ensure_name_free(
+                &docker,
+                &docker::pg_container_name(&user_name, &major),
+                "postgres",
+                &project_cwd,
+            )
+            .await?;
         }
 
         // The optimistic target may have changed while Docker work was in
