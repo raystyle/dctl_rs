@@ -91,7 +91,9 @@ CONTEXT FOR AGENTS:
   Posts a result event referencing the digest, then a status=done event — done
   is what closes the issue. Both events carry deterministic idempotency keys:
   rerunning after a partial failure replays both events instead of appending
-  duplicates. Publish the artifact first (`ledger artifact publish`).")]
+  duplicates. Retrying with the same digest must reuse the same --note (or
+  none) — a different note is different content under the same key (409).
+  Publish the artifact first (`ledger artifact publish`).")]
     Close {
         /// Issue number
         number: String,

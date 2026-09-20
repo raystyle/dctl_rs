@@ -187,7 +187,9 @@ fn api_error(status: u16, body: &str) -> Error {
         401 => {
             " (X-Timestamp drift, or the private key is not the pair of the built-in kid — the server verifies X-Key-Id against the registered public key; see `dctl ledger key`)"
         }
-        409 => " (idempotency key collision with different content; rerun to mint a fresh key)",
+        409 => {
+            " (same idempotency key with different content: fresh-key writes can be rerun as-is; deterministic-key writes like issue close must reuse the original content, e.g. the same --note or none)"
+        }
         429 => " (per-key daily quota reached; writes resume next UTC day)",
         _ => "",
     };
