@@ -237,7 +237,9 @@ async fn issue_close_posts_result_then_status_done_in_order() {
     // parsePayload requires an object (or absent) — neither may be null.
     assert!(first["payload"].is_object());
     assert!(second["payload"].is_object());
-    // Each write mints its own idempotency key.
+    // Deterministic chain keys: distinct per event type, and a rerun of the
+    // same close would send the same pair (server replays instead of
+    // appending duplicates).
     let key = |request: &wiremock::Request| {
         request
             .headers
@@ -246,6 +248,9 @@ async fn issue_close_posts_result_then_status_done_in_order() {
             .unwrap_or_default()
     };
     assert_ne!(key(&requests[0]), key(&requests[1]));
+    for request in &requests {
+        assert_eq!(key(request).len(), 64, "sha256 hex key: {}", key(request));
+    }
 }
 
 #[tokio::test]

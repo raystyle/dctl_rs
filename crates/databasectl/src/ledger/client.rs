@@ -129,13 +129,27 @@ pub(crate) async fn list_artifacts(
     })
 }
 
-/// A signed POST write. Idempotency key and nonce are minted per call;
-/// the same key with different content would be a 409 (server-side rule —
-/// the CLI never reuses a key).
+/// A signed POST write with a fresh idempotency key; the same key with
+/// different content would be a 409 (server-side rule — the CLI never
+/// reuses a key).
 pub(crate) async fn signed_post(path: &str, body: serde_json::Value) -> Result<Json> {
+    signed_post_with_idem(path, body, None).await
+}
+
+/// A signed POST write. `fixed_idem` pins the idempotency key: re-running
+/// the same logical write replays the original event instead of appending
+/// a duplicate (the close chain uses this; family standard, S002).
+pub(crate) async fn signed_post_with_idem(
+    path: &str,
+    body: serde_json::Value,
+    fixed_idem: Option<&str>,
+) -> Result<Json> {
     let key = keys::load_signing_key()?;
     let kid = keys::key_id();
     let body_bytes = serde_json::to_vec(&body)?;
+    let idem = fixed_idem
+        .map(str::to_string)
+        .unwrap_or_else(sign::new_idempotency_key);
     let signed = sign::sign_post(
         &key,
         &kid,
@@ -144,7 +158,7 @@ pub(crate) async fn signed_post(path: &str, body: serde_json::Value) -> Result<J
         body_bytes,
         sign::unix_timestamp(),
         sign::new_nonce(),
-        sign::new_idempotency_key(),
+        idem,
     )?;
 
     let client = crate::http::client_builder()
