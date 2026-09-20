@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tar::Archive;
 
-const GITHUB_REPO: &str = "ClickHouse/dctl";
-const BUILDS_BASE_URL: &str = "https://builds.clickhouse.com/dctl";
+const GITHUB_REPO: &str = "raystyle/dctl_rs";
+const RELEASES_BASE_URL: &str = "https://github.com/raystyle/dctl_rs/releases/download";
 const CHECK_INTERVAL_SECS: u64 = 24 * 60 * 60; // 24 hours
 
 #[derive(Deserialize)]
@@ -204,7 +204,8 @@ pub async fn perform_update(json: bool) -> Result<UpdateResult> {
 
     let target = target_triple()?;
     let archive_name = format!("dctl-{}-{}.tar.gz", target, latest);
-    let download_url = format!("{}/{}", BUILDS_BASE_URL, archive_name);
+    // GitHub release asset URL: releases/download/<tag>/<archive>.
+    let download_url = format!("{}/{}/{}", RELEASES_BASE_URL, latest, archive_name);
 
     let display = latest.strip_prefix('v').unwrap_or(latest);
     if !json {

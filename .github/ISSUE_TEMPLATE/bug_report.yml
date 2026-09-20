@@ -43,9 +43,6 @@ body:
       options:
         - Quick install script (curl ... | sh)
         - cargo binstall
-        - npm
-        - pip / pipx / uv (PyPI)
-        - cargo install (crates.io)
         - Built from source
         - Other (describe in "What happened?")
     validations:

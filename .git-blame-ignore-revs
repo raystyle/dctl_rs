@@ -4,3 +4,7 @@
 
 # Format entire workspace with cargo fmt
 d78a6d2aa40a70d9e1093f09ae987ca1b26e3e41
+
+# dctl fork bootstrap: cloud stack removal and identity rename
+4c40ed628baa1e7754832c8eadc6182a3ac54027
+b3db09290d3f259e9a34976f4d6e8cdbce29ab66
