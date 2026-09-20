@@ -10,3 +10,4 @@
 | REQ-004 | implemented | should | 集成 ledger 标准的 issue 与 artifact 命令族 | cargo test -p databasectl --test ledger_request_test |
 | REQ-005 | draft | could | registry.ohmygh.com 私仓直连与离线回落 | null |
 | REQ-006 | draft | must | 迁移到共享 ledger-rs crate 并统一权限收口 | null |
+| REQ-007 | draft | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | null |
