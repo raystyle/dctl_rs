@@ -85,3 +85,9 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - signed_post_with_idem 增固定键通道;wiremock 套件钉 64 位 hex 键形;close 帮助文案改 replay 语义
 - 语义边界留痕(codex G3):确定性键锚 (repo, issue, type, digest),同 issue 同 digest 再关一次会回放不落新痕;当前服务端只增无改模型下合理,要留新痕须换 digest
 - G1 采纳:wiremock 补端到端回放断言(同 close 跑两次,键对逐位相等);G2 采纳:409 文案分场景 + close CONTEXT 补 --note 复用纪律
+
+## v0.6.0 首发
+
+- 版本线从上游 0.5.0 续至 0.6.0;tag 驱动 release workflow 一次通过:4 target 构建(musl 静态双验)、8 发行版 smoke、GitHub Release 四资产
+- 下载冒烟:gh 认证下载 musl 包,dctl --version 与 ledger key 输出正确(kid 与内置 JWK 一致)
+- 注意:仓库 private 期间匿名直链 404 属预期;转 public 后 install.sh / binstall 直链即通
