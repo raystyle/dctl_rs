@@ -1,7 +1,3 @@
 [workspace]
-members = [
-    "crates/clickhousectl",
-    "crates/clickhouse-cloud-api",
-    "crates/clickhouse-openapi-analyzer",
-]
+members = ["crates/clickhousectl"]
 resolver = "3"

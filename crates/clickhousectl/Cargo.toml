@@ -21,10 +21,6 @@ default = ["telemetry"]
 # send). On by default; distro packagers can compile it out entirely with
 # `--no-default-features`.
 telemetry = []
-# Forwards to the library feature of the same name: when enabled, deprecated API
-# fields are present on the response structs and surfaced in CLI output. Off by
-# default so the CLI never shows a field the API has deprecated.
-deprecated-fields = ["clickhouse-cloud-api/deprecated-fields"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -45,14 +41,12 @@ chrono = "0.4.44"
 open = "5.3.3"
 url = "2.5.8"
 tabled = "0.20.0"
-clickhouse-cloud-api = { version = "0.5.0", path = "../clickhouse-cloud-api" }
 uuid = { version = "1.23.0", features = ["v4"] }
 is-ai-agent = "0.5.0"
 base64 = "0.22.1"
 bollard = "0.21.0"
 crossterm = "0.29.0"
 rand = "0.10.1"
-dotenvy = "0.15.7"
 tempfile = "3.27.0"
 sha2 = "0.11.0"
 serde_ignored = "0.1.14"

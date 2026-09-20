@@ -1,7 +1,6 @@
 mod cli;
-mod cloud;
-mod dotenv;
 mod error;
+#[cfg(feature = "telemetry")]
 mod failure;
 mod http;
 mod init;
@@ -22,12 +21,6 @@ use error::{Error, Result};
 
 #[tokio::main]
 async fn main() {
-    // Snapshot any project-local `.env` before anything else so credential
-    // resolution can use it. Safe to call here even though tokio has worker
-    // threads — we populate an in-process `OnceLock` rather than touching
-    // libc's environ.
-    dotenv::init();
-
     // Snapshot the executable path before the command runs: a successful
     // `clickhousectl update` replaces the binary on disk, after which a lazy
     // `current_exe()` lookup fails on Linux and the update's own telemetry
@@ -163,84 +156,7 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
         return Err(start.error(ErrorKind::ArgumentConflict, message));
     }
 
-    let Commands::Cloud(args) = &cli.command else {
-        return Ok(());
-    };
-    if args.has_organization_selector_conflict() {
-        let cloud = cmd
-            .find_subcommand_mut("cloud")
-            .expect("cloud command must exist");
-        return Err(cloud.error(
-            ErrorKind::ArgumentConflict,
-            "--org-id cannot be used with --org-name",
-        ));
-    }
-
-    // Login's credentials are global arguments. Validate after propagation so
-    // a pair split across command levels remains valid.
-    if let cloud::cli::CloudCommands::Auth { command } = &args.command
-        && let Some(message) = command.login_validation_error()
-    {
-        let login = cmd
-            .find_subcommand_mut("cloud")
-            .and_then(|cloud| cloud.find_subcommand_mut("auth"))
-            .and_then(|auth| auth.find_subcommand_mut("login"))
-            .expect("cloud auth login command must exist");
-        return Err(login.error(ErrorKind::MissingRequiredArgument, message));
-    }
-
-    if args.has_explicit_json_format_conflict() {
-        // clap validates each subcommand before propagating values supplied for a
-        // global argument at a parent level, so this cross-level conflict needs a
-        // post-parse check. Format the error against the owning command.
-        let query = cmd
-            .find_subcommand_mut("cloud")
-            .and_then(|cloud| cloud.find_subcommand_mut("service"))
-            .and_then(|service| service.find_subcommand_mut("query"))
-            .expect("service query command must exist");
-        return Err(query.error(
-            ErrorKind::ArgumentConflict,
-            "the argument '--json' cannot be used with '--format <FORMAT>'",
-        ));
-    }
-
-    // Each reverse private endpoint type has its own required flags, and the
-    // flags of the other types are meaningless for it; clap has no way to
-    // forbid an argument based on another argument's value.
-    if let Some(message) = args.reverse_private_endpoint_validation_error() {
-        let endpoint = cmd
-            .find_subcommand_mut("cloud")
-            .and_then(|cloud| cloud.find_subcommand_mut("clickpipe"))
-            .and_then(|clickpipe| clickpipe.find_subcommand_mut("reverse-private-endpoint"))
-            .and_then(|endpoint| endpoint.find_subcommand_mut("create"))
-            .expect("clickpipe reverse-private-endpoint create command must exist");
-        return Err(endpoint.error(ErrorKind::ArgumentConflict, message));
-    }
-
-    // clap can require --iam-role for one auth value, but cannot express the
-    // inverse conflict, require the credential pair only for basic auth, or
-    // condition --replication-slot-name on another value.
-    let Some((source, message)) = args.clickpipe_create_validation_error() else {
-        return Ok(());
-    };
-    let create = cmd
-        .find_subcommand_mut("cloud")
-        .and_then(|cloud| cloud.find_subcommand_mut("clickpipe"))
-        .and_then(|clickpipe| clickpipe.find_subcommand_mut("create"))
-        .expect("clickpipe create command must exist");
-    // The usage error belongs to the source subcommand. If the returned literal
-    // ever drifts from a `#[command(name)]`, report it against `clickpipe
-    // create` instead of panicking on a valid invocation.
-    let owner = if create.find_subcommand(source).is_some() {
-        create
-            .find_subcommand_mut(source)
-            .expect("presence checked immediately above")
-    } else {
-        create
-    };
-    // ArgumentConflict is intentional for invalid relationships between valid
-    // values, matching existing CLI validation and preserving exit code 2.
-    Err(owner.error(ErrorKind::ArgumentConflict, message))
+    Ok(())
 }
 
 /// Run a successfully parsed invocation to completion and report the exit
@@ -279,10 +195,6 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
         Commands::Local(args) => json_output(args.json),
         _ => false,
     };
-    let cloud_json = match &cli.command {
-        Commands::Cloud(args) => json_output(args.json),
-        _ => false,
-    };
 
     let result = run(cli.command).await;
 
@@ -297,13 +209,9 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
         Ok(()) => (0, false, false),
         Err(e) => {
             let is_child_exit = matches!(&e, Error::ChildExit(_));
-            // All Cloud runtime failures share one envelope, including auth
-            // and cancellation. Keep child output and exit statuses intact.
-            let structured_cloud_error = cloud_json && !is_child_exit;
             if !is_child_exit {
                 match &e {
                     _ if local_json => local::output::print_error(&e),
-                    _ if cloud_json => cloud::output::print_error(&e),
                     _ => {
                         use std::io::Write;
                         // Not `eprintln!`, which panics on a closed stderr — see
@@ -312,11 +220,7 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
                     }
                 }
             }
-            (
-                e.exit_code(),
-                is_child_exit,
-                (local_json && !is_child_exit) || structured_cloud_error,
-            )
+            (e.exit_code(), is_child_exit, local_json && !is_child_exit)
         }
     };
 
@@ -356,7 +260,6 @@ fn command_json_flag(cmd: &Commands) -> Option<bool> {
     match cmd {
         Commands::Update(_) => None,
         Commands::Local(args) => Some(args.json),
-        Commands::Cloud(args) => Some(args.json),
         Commands::Skills(args) => Some(args.json),
         #[cfg(feature = "telemetry")]
         Commands::Telemetry(args) => Some(args.json),
@@ -385,10 +288,6 @@ async fn run(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Local(args) => local::run(args.command, json_output(args.json)).await,
         Commands::Skills(args) => run_skills(args).await,
-        Commands::Cloud(args) => {
-            let json = json_output(args.json);
-            cloud::run(*args, json).await
-        }
         Commands::Update(args) => run_update(args).await,
         #[cfg(feature = "telemetry")]
         Commands::Telemetry(args) => telemetry::run_command(args.command, json_output(args.json)),
@@ -416,70 +315,6 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn login_credential_pairs_are_validated_after_global_flag_propagation() {
-        for prefix in [
-            vec!["clickhousectl", "cloud", "auth", "login"],
-            vec!["clickhousectl", "cloud"],
-        ] {
-            for flag in ["--api-key", "--api-secret"] {
-                let mut args = prefix.clone();
-                args.extend([flag, "value"]);
-                if prefix.len() == 2 {
-                    args.extend(["auth", "login"]);
-                }
-                let error = parse_and_validate(&args).err().expect("partial pair");
-                assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-                assert_eq!(error.exit_code(), 2);
-            }
-        }
-        for args in [
-            vec!["clickhousectl", "cloud", "auth", "login"],
-            vec!["clickhousectl", "cloud", "auth", "login", "--interactive"],
-            vec![
-                "clickhousectl",
-                "cloud",
-                "--api-key",
-                "key",
-                "auth",
-                "login",
-                "--api-secret",
-                "secret",
-            ],
-            vec![
-                "clickhousectl",
-                "cloud",
-                "--api-secret",
-                "secret",
-                "auth",
-                "login",
-                "--api-key",
-                "key",
-            ],
-            vec![
-                "clickhousectl",
-                "cloud",
-                "--api-key",
-                "key",
-                "--api-secret",
-                "secret",
-                "auth",
-                "login",
-            ],
-            // A partial runtime credential override is outside login's contract.
-            vec![
-                "clickhousectl",
-                "cloud",
-                "--api-key",
-                "key",
-                "service",
-                "list",
-            ],
-        ] {
-            assert!(parse_and_validate(&args).is_ok(), "{args:?}");
-        }
-    }
-
-    #[test]
     fn json_output_true_when_flag_set() {
         assert!(json_output(true));
     }
@@ -495,110 +330,6 @@ mod tests {
             .expect("Cli::from_arg_matches must accept matches from Cli::command()");
         validate_post_parse(&cli, &mut cmd)?;
         Ok(cli)
-    }
-
-    #[test]
-    fn service_query_rejects_explicit_json_with_format_in_both_orders() {
-        for args in [
-            &[
-                "clickhousectl",
-                "cloud",
-                "--json",
-                "service",
-                "query",
-                "--id",
-                "svc-1",
-                "--query",
-                "SELECT 1",
-                "--format",
-                "CSV",
-            ][..],
-            &[
-                "clickhousectl",
-                "cloud",
-                "service",
-                "query",
-                "--id",
-                "svc-1",
-                "--query",
-                "SELECT 1",
-                "--json",
-                "--format",
-                "CSV",
-            ][..],
-        ] {
-            let error = parse_and_validate(args)
-                .err()
-                .expect("explicit --json and --format should conflict");
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-            assert_eq!(error.exit_code(), 2);
-            let message = error.to_string();
-            assert!(message.contains("--json"), "{message}");
-            assert!(message.contains("--format"), "{message}");
-            assert!(
-                message.contains("clickhousectl cloud service query"),
-                "{message}"
-            );
-        }
-    }
-
-    #[test]
-    fn postgres_clickpipe_relationship_errors_are_clap_usage_errors() {
-        let base = [
-            "clickhousectl",
-            "cloud",
-            "clickpipe",
-            "create",
-            "postgres",
-            "svc-1",
-            "--name",
-            "pipe-1",
-            "--host",
-            "postgres.example",
-            "--pg-database",
-            "source-db",
-            "--username",
-            "user",
-            "--password",
-            "password",
-            "--table-mapping",
-            "public.events:events",
-        ];
-        let cases = [
-            (
-                ["--iam-role", "arn:aws:iam::123456789012:role/clickpipe"].as_slice(),
-                "--iam-role cannot be used with --auth basic",
-            ),
-            (
-                ["--replication-slot-name", "existing_slot"].as_slice(),
-                "--replication-slot-name can only be used with --replication-mode cdc_only",
-            ),
-            (
-                [
-                    "--replication-mode",
-                    "snapshot",
-                    "--replication-slot-name",
-                    "existing_slot",
-                ]
-                .as_slice(),
-                "--replication-slot-name can only be used with --replication-mode cdc_only",
-            ),
-        ];
-
-        for (extra, diagnostic) in cases {
-            let args: Vec<&str> = base.iter().chain(extra).copied().collect();
-            let error = parse_and_validate(&args)
-                .err()
-                .expect("invalid postgres relationship should fail validation");
-            assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
-            assert_eq!(error.exit_code(), 2);
-            let message = error.to_string();
-            assert!(message.contains(diagnostic), "{message}");
-            assert!(
-                message.contains("clickhousectl cloud clickpipe create postgres"),
-                "{message}"
-            );
-        }
     }
 
     #[test]
@@ -642,24 +373,10 @@ mod tests {
     fn command_json_flag_tracks_each_command() {
         // Human-readable commands report an explicit `false` flag.
         assert_eq!(
-            command_json_flag(&parse(&["clickhousectl", "cloud", "service", "list"])),
-            Some(false)
-        );
-        assert_eq!(
             command_json_flag(&parse(&["clickhousectl", "local", "list"])),
             Some(false)
         );
-        // --json is picked up on both cloud and local (global flag).
-        assert_eq!(
-            command_json_flag(&parse(&[
-                "clickhousectl",
-                "cloud",
-                "--json",
-                "service",
-                "list"
-            ])),
-            Some(true)
-        );
+        // --json is picked up as a global flag.
         assert_eq!(
             command_json_flag(&parse(&["clickhousectl", "local", "--json", "list"])),
             Some(true)
@@ -695,13 +412,6 @@ mod tests {
     fn update_notice_suppressed_for_json_and_update() {
         // --json suppresses the notice so machine output stays clean,
         // regardless of agent detection.
-        assert!(!should_show_update_notice(&parse(&[
-            "clickhousectl",
-            "cloud",
-            "--json",
-            "service",
-            "list"
-        ])));
         assert!(!should_show_update_notice(&parse(&[
             "clickhousectl",
             "local",

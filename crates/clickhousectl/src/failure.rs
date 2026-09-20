@@ -1,5 +1,13 @@
 //! Privacy-safe runtime failure classification (#450).
 //!
+//! Fork note: the cloud-side classifiers and recorders were removed with the
+//! cloud stack; only the snapshot surface below still serves the optional
+//! `telemetry` feature. The unused vocabulary and machinery are kept (rather
+//! than pruned piecemeal) because the whole module sits on the removal list
+//! together with `telemetry` itself.
+#![allow(dead_code)]
+
+//!
 //! Anonymous telemetry used to describe every non-auth runtime failure of
 //! `cloud service query` as `outcome=error, exit_code=1`, which made 6,444
 //! exit-1 events indistinguishable: a syntax error, a stopped service, a
@@ -244,51 +252,6 @@ impl ApiFailure {
     }
 }
 
-/// Classify a library error from its **variant**, not its message.
-///
-/// This is the single place a `clickhouse_cloud_api::Error` becomes a
-/// category, so every cloud command inherits the same mapping by converting
-/// its errors through `CloudClient::convert_error`.
-pub fn classify_api_error(error: &clickhouse_cloud_api::Error) -> ApiFailure {
-    use clickhouse_cloud_api::Error as E;
-    match error {
-        E::Api { status, .. } | E::UdfAttachmentUnavailable { status, .. } => {
-            ApiFailure::with_status(status_kind(*status), *status)
-        }
-        E::Sql { status, .. } => ApiFailure::with_status(FailureKind::SqlError, *status),
-        E::Http(error) => ApiFailure::new(if error.is_timeout() {
-            FailureKind::Timeout
-        } else {
-            FailureKind::Transport
-        }),
-        E::ServiceStopped => ApiFailure::new(FailureKind::ServiceStopped),
-        // The Query API gateway stopped waiting (#644). It is a timeout even
-        // though the transport succeeded, and the status is not invented: the
-        // variant is produced from an HTTP 500 and nothing else.
-        E::QueryTimeout => ApiFailure::with_status(FailureKind::Timeout, 500),
-        // An idle service is normally handled by re-sending with the wake
-        // confirmation; if the error escapes anyway it is a state problem,
-        // not a transport or SQL one.
-        E::ServiceIdle => ApiFailure::new(FailureKind::Other),
-        E::Json(_) | E::AuthMismatch(_) => ApiFailure::new(FailureKind::Other),
-        // The library error is `#[non_exhaustive]`: a variant this build does
-        // not know is unclassified, never inspected through its message.
-        _ => ApiFailure::new(FailureKind::Other),
-    }
-}
-
-/// Kind for a plain HTTP status. `408`/`504` are timeouts and `429` is rate
-/// limiting; everything else collapses to its class.
-fn status_kind(status: u16) -> FailureKind {
-    match status {
-        429 => FailureKind::RateLimited,
-        408 | 504 => FailureKind::Timeout,
-        400..=499 => FailureKind::Http4xx,
-        500..=599 => FailureKind::Http5xx,
-        _ => FailureKind::Other,
-    }
-}
-
 /// The first classified failure of the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Record {
@@ -500,146 +463,6 @@ mod tests {
                 "duplicate wire value in {values:?}"
             );
         }
-    }
-
-    #[test]
-    fn api_errors_are_classified_from_the_variant_not_the_message() {
-        use clickhouse_cloud_api::Error as E;
-
-        let cases = [
-            (
-                E::Api {
-                    status: 429,
-                    message: "TOO_MANY_REQUESTS".into(),
-                },
-                FailureKind::RateLimited,
-                Some(429),
-            ),
-            (
-                E::Api {
-                    status: 401,
-                    message: "unauthorized".into(),
-                },
-                FailureKind::Http4xx,
-                Some(401),
-            ),
-            (
-                E::Api {
-                    status: 408,
-                    message: "Request Timeout".into(),
-                },
-                FailureKind::Timeout,
-                Some(408),
-            ),
-            (
-                E::Api {
-                    status: 504,
-                    message: "gateway timeout".into(),
-                },
-                FailureKind::Timeout,
-                Some(504),
-            ),
-            (
-                E::Api {
-                    status: 503,
-                    message: "unavailable".into(),
-                },
-                FailureKind::Http5xx,
-                Some(503),
-            ),
-            // A message that looks like a SQL error but arrives in the plain
-            // API variant is classified by the variant, not by the text.
-            (
-                E::Api {
-                    status: 404,
-                    message: "SQL error 60: Unknown table".into(),
-                },
-                FailureKind::Http4xx,
-                Some(404),
-            ),
-            (
-                E::Sql {
-                    status: 400,
-                    code: "62".into(),
-                    details: "Syntax error".into(),
-                },
-                FailureKind::SqlError,
-                Some(400),
-            ),
-            (E::ServiceStopped, FailureKind::ServiceStopped, None),
-            (
-                E::UdfAttachmentUnavailable {
-                    status: 424,
-                    message: "service unavailable".into(),
-                    response: Box::default(),
-                },
-                FailureKind::Http4xx,
-                bounded_status(424),
-            ),
-            (E::ServiceIdle, FailureKind::Other, None),
-            // The gateway timeout is a timeout, classified from the variant
-            // and not from the 500 status it arrives with (#644).
-            (E::QueryTimeout, FailureKind::Timeout, Some(500)),
-            (E::AuthMismatch("nope".into()), FailureKind::Other, None),
-            // A status outside the allowlist keeps its class and drops the
-            // exact value.
-            (
-                E::Api {
-                    status: 418,
-                    message: "teapot".into(),
-                },
-                FailureKind::Http4xx,
-                None,
-            ),
-            (
-                E::Api {
-                    status: 0,
-                    message: "no status".into(),
-                },
-                FailureKind::Other,
-                None,
-            ),
-        ];
-
-        for (error, kind, status) in cases {
-            let failure = classify_api_error(&error);
-            assert_eq!(failure.kind, kind, "wrong kind for {error:?}");
-            assert_eq!(failure.http_status, status, "wrong status for {error:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn transport_errors_are_transport_and_timeouts_are_timeouts() {
-        let transport = reqwest::Client::new()
-            .get("http://127.0.0.1:1/never")
-            .send()
-            .await
-            .unwrap_err();
-        assert_eq!(
-            classify_api_error(&clickhouse_cloud_api::Error::Http(transport)).kind,
-            FailureKind::Transport
-        );
-
-        let server = wiremock::MockServer::start().await;
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .respond_with(
-                wiremock::ResponseTemplate::new(200).set_delay(Duration::from_millis(200)),
-            )
-            .mount(&server)
-            .await;
-        let timeout = reqwest::Client::builder()
-            .timeout(Duration::from_millis(20))
-            .build()
-            .unwrap()
-            .get(server.uri())
-            .send()
-            .await
-            .unwrap_err();
-        assert!(timeout.is_timeout(), "expected a timeout error: {timeout}");
-        assert_eq!(
-            classify_api_error(&clickhouse_cloud_api::Error::Http(timeout)).kind,
-            FailureKind::Timeout
-        );
     }
 
     #[test]

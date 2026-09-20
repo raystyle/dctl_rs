@@ -1,17 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 
-use crate::cloud::cli::CloudArgs;
 pub use crate::local::cli::LocalArgs;
 
 // Keep command options below this block; clap's generated --help uses rank 999.
 pub(crate) mod help_order {
-    pub const ORG_ID: usize = 900;
-    pub const ORG_NAME: usize = 901;
-    pub const API_KEY: usize = 902;
-    pub const API_SECRET: usize = 903;
-    pub const URL: usize = 904;
     pub const JSON: usize = 905;
-    pub const DEBUG: usize = 906;
 }
 
 #[derive(Parser)]
@@ -26,10 +19,6 @@ pub(crate) mod help_order {
     .display_order(0)))]
 #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Cloud auth: OAuth (`cloud auth login`) is read-only; API keys
-  (`cloud auth login --api-key X --api-secret Y`) allow writes.
-  Create account: `cloud auth signup`
-  Typical cloud flow: `cloud auth signup` -> `cloud auth login --api-key X --api-secret Y` -> `cloud service create`
   Install the ClickHouse agent skills: `clickhousectl skills --agent claude`")]
 pub struct Cli {
     #[command(subcommand)]
@@ -46,18 +35,6 @@ CONTEXT FOR AGENTS:
   `clickhousectl local server start` bootstraps from zero — installs `latest` if nothing is set up.
   Typical flow: `local server start` -> `local client -q 'SELECT 1'`")]
     Local(LocalArgs),
-
-    /// Manage ClickHouse and Postgres in ClickHouse Cloud
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Credentials, first wins: --api-key/--api-secret, saved API keys,
-  CLICKHOUSE_CLOUD_API_KEY/CLICKHOUSE_CLOUD_API_SECRET (shell then .env), OAuth.
-  API keys are read+write; OAuth is read-only and every write command fails on it.
-  `cloud auth status` shows the active source; --org-id auto-detects only with exactly one org.
-  delete/remove act immediately — there is no confirmation prompt.
-  Exit codes: 0 success, 1 error, 2 usage error, 3 cancelled, 4 auth required.
-  Typical flow: `cloud auth login --api-key X --api-secret Y` -> `cloud org list` -> `cloud service list`")]
-    Cloud(Box<CloudArgs>),
 
     /// Install ClickHouse agent skills into supported coding agents
     #[command(after_help = "\
@@ -279,15 +256,7 @@ mod tests {
 
     #[test]
     fn shared_flags_have_identical_help_at_every_declaration() {
-        let shared = [
-            "api-key",
-            "api-secret",
-            "url",
-            "org-id",
-            "org-name",
-            "json",
-            "debug",
-        ];
+        let shared = ["json"];
         let mut declarations = BTreeMap::new();
         let mut failures = Vec::new();
         // Inspect declarations before build() propagates global flags to descendants.
@@ -344,91 +313,66 @@ mod tests {
             .collect()
     }
 
-    fn with_hidden_url(command: clap::Command) -> clap::Command {
-        command
-            .mut_args(|arg| {
-                if arg.get_long() == Some("url") {
-                    arg.hide(true)
-                } else {
-                    arg
-                }
-            })
-            .mut_subcommands(with_hidden_url)
-    }
-
     #[test]
     fn built_help_tree_keeps_shared_options_in_a_final_ordered_block() {
-        let shared = [
-            "org-id",
-            "org-name",
-            "api-key",
-            "api-secret",
-            "url",
-            "json",
-            "debug",
-            "help",
-        ];
+        let shared = ["json", "help"];
         let mut tree = Cli::command();
         tree.build();
-        // Exercise release visibility in debug tests too. A release test run also
-        // checks the actual cfg-controlled URL declaration below.
-        for tree in [tree.clone(), with_hidden_url(tree)] {
-            visit_commands(&tree, "clickhousectl", &mut |command, path| {
-                if command.is_hide_set() {
-                    return;
-                }
-                for long in [false, true] {
-                    let actual = rendered_options(command, long);
-                    let visible: Vec<_> = command
-                        .get_arguments()
-                        .filter(|arg| {
-                            !arg.is_hide_set()
-                                && !(if long {
-                                    arg.is_hide_long_help_set()
-                                } else {
-                                    arg.is_hide_short_help_set()
-                                })
-                                && arg.get_long().is_some()
-                        })
-                        .collect();
-                    assert_eq!(actual.len(), visible.len(), "{path}, long={long}");
-                    for arg in &visible {
-                        let flag = arg.get_long().unwrap();
-                        assert!(actual.iter().any(|item| item == flag), "{path}: --{flag}");
-                        if !shared.contains(&flag) {
-                            assert!(
-                                arg.get_display_order() < help_order::ORG_ID,
-                                "{path}: domain option --{flag} overlaps shared display ranks"
-                            );
-                        }
-                    }
-                    let expected: Vec<_> = shared
-                        .iter()
-                        .copied()
-                        .filter(|flag| visible.iter().any(|arg| arg.get_long() == Some(flag)))
-                        .collect();
-                    assert!(
-                        actual.ends_with(
-                            &expected
-                                .iter()
-                                .map(|flag| (*flag).to_owned())
-                                .collect::<Vec<_>>()
-                        ),
-                        "{path}, long={long}: expected final block {expected:?}, got {actual:?}"
-                    );
-                    // Hidden compatibility aliases must never become option rows.
-                    for arg in command.get_arguments().filter(|arg| arg.is_hide_set()) {
-                        if let Some(flag) = arg.get_long() {
-                            assert!(!actual.iter().any(|item| item == flag), "{path}: --{flag}");
-                        }
+        visit_commands(&tree, "clickhousectl", &mut |command, path| {
+            if command.is_hide_set() {
+                return;
+            }
+            for long in [false, true] {
+                let actual = rendered_options(command, long);
+                let visible: Vec<_> = command
+                    .get_arguments()
+                    .filter(|arg| {
+                        !arg.is_hide_set()
+                            && !(if long {
+                                arg.is_hide_long_help_set()
+                            } else {
+                                arg.is_hide_short_help_set()
+                            })
+                            && arg.get_long().is_some()
+                    })
+                    .collect();
+                assert_eq!(actual.len(), visible.len(), "{path}, long={long}");
+                for arg in &visible {
+                    let flag = arg.get_long().unwrap();
+                    assert!(actual.iter().any(|item| item == flag), "{path}: --{flag}");
+                    if !shared.contains(&flag) {
+                        assert!(
+                            arg.get_display_order() < help_order::JSON,
+                            "{path}: domain option --{flag} overlaps shared display ranks"
+                        );
                     }
                 }
-            });
-        }
+                let expected: Vec<_> = shared
+                    .iter()
+                    .copied()
+                    .filter(|flag| visible.iter().any(|arg| arg.get_long() == Some(flag)))
+                    .collect();
+                assert!(
+                    actual.ends_with(
+                        &expected
+                            .iter()
+                            .map(|flag| (*flag).to_owned())
+                            .collect::<Vec<_>>()
+                    ),
+                    "{path}, long={long}: expected final block {expected:?}, got {actual:?}"
+                );
+                // Hidden compatibility aliases must never become option rows.
+                for arg in command.get_arguments().filter(|arg| arg.is_hide_set()) {
+                    if let Some(flag) = arg.get_long() {
+                        assert!(!actual.iter().any(|item| item == flag), "{path}: --{flag}");
+                    }
+                }
+            }
+        });
     }
 
     #[test]
-    fn built_help_tree_preserves_inherited_flags_and_url_visibility() {
+    fn built_help_tree_preserves_inherited_flags() {
         let mut tree = Cli::command();
         tree.build();
         visit_commands(&tree, "clickhousectl", &mut |command, path| {
@@ -436,29 +380,16 @@ mod tests {
             if path.split_whitespace().any(|part| part == "help") {
                 return;
             }
-            let required: &[&str] = if path.starts_with("clickhousectl cloud") {
-                &[
-                    "org-id",
-                    "org-name",
-                    "api-key",
-                    "api-secret",
-                    "url",
-                    "json",
-                    "debug",
-                ]
-            } else if path.starts_with("clickhousectl local") {
+            let required: &[&str] = if path.starts_with("clickhousectl local") {
                 &["json"]
             } else {
                 &[]
             };
             for flag in required {
-                let arg = command
+                command
                     .get_arguments()
                     .find(|arg| arg.get_long() == Some(flag))
                     .unwrap_or_else(|| panic!("{path}: missing inherited --{flag}"));
-                if *flag == "url" {
-                    assert_eq!(arg.is_hide_set(), !cfg!(debug_assertions), "{path}");
-                }
             }
         });
     }

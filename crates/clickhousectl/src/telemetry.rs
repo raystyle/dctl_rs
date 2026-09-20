@@ -103,7 +103,7 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(2);
 static EXE_PATH: OnceLock<PathBuf> = OnceLock::new();
 
 /// Snapshot process-wide facts needed at finalize time. Called once at the
-/// top of `main`, same eager pattern as `dotenv::init`. If `current_exe()`
+/// top of `main`. If `current_exe()`
 /// fails the lock stays empty and the send is skipped — the same failure mode
 /// as resolving lazily.
 pub fn init() {
@@ -1654,85 +1654,60 @@ mod tests {
 
     #[test]
     fn primary_json_file_aliases_capture_only_canonical_argument_names() {
-        for (command, aliases) in [
-            (
-                vec!["backup", "bucket", "create", "SECRET-SERVICE"],
-                vec!["file", "config-file", "config"],
-            ),
-            (
-                vec!["service", "settings", "set", "SECRET-SERVICE"],
-                vec!["file", "settings-file"],
-            ),
-        ] {
-            for alias in aliases {
-                let flag = format!("--{alias}");
-                let mut args = vec!["chctl", "cloud"];
-                args.extend(command.iter().copied());
-                args.extend([flag.as_str(), "SECRET-PATH.json"]);
-                let inv = capture_from(&args);
-                assert_eq!(inv.flags, ["file"]);
-                assert_eq!(
-                    inv.positionals,
-                    if command[0] == "backup" {
-                        vec!["service_id"]
-                    } else {
-                        vec!["resource_id"]
-                    }
-                );
-                let json =
-                    serde_json::to_string(&build_payload(&inv, 0, &env_of(&[]), None)).unwrap();
-                assert!(!json.contains("SECRET"), "file value leaked: {json}");
+        for alias in ["config", "config-file"] {
+            let flag = format!("--{alias}");
+            let mut args = vec!["chctl", "local", "server", "start"];
+            args.extend([flag.as_str(), "SECRET-PATH.json"]);
+            let inv = capture_from(&args);
+            assert_eq!(inv.flags, ["config"]);
+            let json = serde_json::to_string(&build_payload(&inv, 0, &env_of(&[]), None)).unwrap();
+            assert!(!json.contains("SECRET"), "file value leaked: {json}");
 
-                args.extend(["--file", "SECRET-OTHER.json"]);
-                let lossy = capture_lossy_from(&args);
-                assert_eq!(lossy.flags, ["file"]);
-                assert_eq!(lossy.outcome, "other_parse_error");
-                let json =
-                    serde_json::to_string(&build_payload(&lossy, 2, &env_of(&[]), None)).unwrap();
-                assert!(
-                    !json.contains("SECRET"),
-                    "conflicting file value leaked: {json}"
-                );
-            }
+            args.extend(["--config", "SECRET-OTHER.json"]);
+            let lossy = capture_lossy_from(&args);
+            assert_eq!(lossy.flags, ["config"]);
+            assert_eq!(lossy.outcome, "other_parse_error");
+            let json =
+                serde_json::to_string(&build_payload(&lossy, 2, &env_of(&[]), None)).unwrap();
+            assert!(
+                !json.contains("SECRET"),
+                "conflicting file value leaked: {json}"
+            );
         }
     }
 
     #[test]
-    fn cloud_resource_selectors_capture_names_only() {
+    fn local_resource_selectors_capture_names_only() {
         for (tail, flags) in [
             (
                 vec![
-                    "--org-name",
-                    "SECRET-ORG",
-                    "service",
-                    "update",
+                    "server",
+                    "start",
                     "--name",
                     "SECRET-TARGET",
-                    "--new-name",
-                    "SECRET-REPLACEMENT",
+                    "--http-port",
+                    "8333",
                 ],
-                vec!["name", "new-name", "org-name"],
+                vec!["http-port", "name"],
             ),
             (
-                vec!["member", "get", "--email", "SECRET-EMAIL"],
-                vec!["email"],
+                vec!["client", "--host", "SECRET-HOST", "--query", "SECRET-SQL"],
+                vec!["host", "query"],
             ),
             (
                 vec![
                     "postgres",
-                    "restore",
-                    "--source-name",
-                    "SECRET-SOURCE",
+                    "start",
                     "--name",
                     "SECRET-NEW",
-                    "--restore-target",
-                    "2026-09-01T12:00:00Z",
+                    "--user",
+                    "SECRET-USER",
                 ],
-                vec!["name", "restore-target", "source-name"],
+                vec!["name", "user"],
             ),
         ] {
-            let mut args = vec!["chctl", "cloud"];
-            args.extend(tail);
+            let mut args = vec!["chctl", "local"];
+            args.extend(tail.iter().copied());
             let inv = capture_from(&args);
             assert_eq!(inv.flags, flags);
             let json = serde_json::to_string(&build_payload(&inv, 0, &env_of(&[]), None)).unwrap();
@@ -1742,21 +1717,16 @@ mod tests {
 
     #[test]
     fn capture_reports_names_only_never_values_or_positionals() {
-        for position in 3..=6 {
-            let mut args = vec![
-                "clickhousectl",
-                "cloud",
-                "--json",
-                "service",
-                "get",
-                "SECRET-SERVICE-ID",
-            ];
-            args.splice(position..position, ["--org-id", "SECRET-ORG"]);
+        // `--json` is local's global flag, accepted (and deduped) wherever it
+        // lands in the path.
+        for position in 2..=5 {
+            let mut args = vec!["clickhousectl", "local", "server", "start", "SECRET-NAME"];
+            args.splice(position..position, ["--json"]);
             let inv = capture_from(&args);
-            assert_eq!(inv.command, "cloud service get");
-            assert_eq!(inv.flags, ["json", "org-id"]);
+            assert_eq!(inv.command, "local server start");
+            assert_eq!(inv.flags, ["json"]);
             // The positional's definition id is recorded; its value is not (#480).
-            assert_eq!(inv.positionals, ["resource_id"]);
+            assert_eq!(inv.positionals, ["name"]);
             let json = serde_json::to_string(&build_payload(&inv, 0, &env_of(&[]), None)).unwrap();
             assert!(!json.contains("SECRET"), "payload leaked a value: {json}");
         }
@@ -1907,8 +1877,8 @@ mod tests {
 
     #[test]
     fn capture_dedupes_propagated_global_flags() {
-        let inv = capture_from(&["clickhousectl", "cloud", "--json", "service", "list"]);
-        assert_eq!(inv.command, "cloud service list");
+        let inv = capture_from(&["clickhousectl", "local", "--json", "list"]);
+        assert_eq!(inv.command, "local list");
         assert_eq!(inv.flags, ["json"]);
     }
 
@@ -1998,8 +1968,8 @@ mod tests {
 
     #[test]
     fn lossy_nested_help_keeps_the_command_path() {
-        let inv = capture_lossy_from(&["clickhousectl", "cloud", "service", "--help"]);
-        assert_eq!(inv.command, "cloud service");
+        let inv = capture_lossy_from(&["clickhousectl", "local", "server", "--help"]);
+        assert_eq!(inv.command, "local server");
         assert_eq!(inv.flags, ["help"]);
         assert_eq!(inv.outcome, "help");
     }
@@ -2019,15 +1989,15 @@ mod tests {
 
     #[test]
     fn lossy_typoed_subcommand_stops_and_carries_the_suggestion() {
-        let inv = capture_lossy_from(&["clickhousectl", "cloud", "servce", "list"]);
+        let inv = capture_lossy_from(&["clickhousectl", "local", "servr", "start"]);
         // The typo'd token is never recorded; the path is the valid prefix.
-        assert_eq!(inv.command, "cloud");
+        assert_eq!(inv.command, "local");
         assert!(inv.flags.is_empty());
         assert_eq!(inv.outcome, "invalid_subcommand");
         // Clap's did-you-mean names a *defined* subcommand.
-        assert_eq!(inv.suggestion.as_deref(), Some("service"));
+        assert_eq!(inv.suggestion.as_deref(), Some("server"));
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
-        assert!(!json.contains("servce"), "typo leaked into payload: {json}");
+        assert!(!json.contains("servr"), "typo leaked into payload: {json}");
     }
 
     #[test]
@@ -2057,7 +2027,7 @@ mod tests {
     fn lossy_flag_suggestion_records_the_bare_definition_name() {
         // Clap's SuggestedArg context carries `--json`; the recorded value is
         // the bare canonical name, cloned from the definition.
-        let inv = capture_lossy_from(&["clickhousectl", "cloud", "service", "list", "--jsn"]);
+        let inv = capture_lossy_from(&["clickhousectl", "local", "list", "--jsn"]);
         assert_eq!(inv.outcome, "unknown_argument");
         assert_eq!(inv.suggestion.as_deref(), Some("json"));
     }
@@ -2081,11 +2051,11 @@ mod tests {
         let mut error = clap::Error::new(ErrorKind::InvalidSubcommand);
         error.insert(
             ContextKind::SuggestedSubcommand,
-            ContextValue::Strings(vec!["service".into(), "not-a-defined-name".into()]),
+            ContextValue::Strings(vec!["server".into(), "not-a-defined-name".into()]),
         );
         assert_eq!(
             suggestion_for_error(&cmd, &error).as_deref(),
-            Some("service")
+            Some("server")
         );
     }
 
@@ -2260,36 +2230,40 @@ mod tests {
 
     #[test]
     fn lossy_flag_value_equal_to_a_subcommand_name_is_skipped() {
-        // `get` is missing its required positional, so the parse fails; the
-        // `--org-id` *value* happens to be the name of a sibling subcommand
-        // and must not be misrecorded as command path.
+        // The parse fails on the port value; the `--name` *value* happens to
+        // be the name of a sibling subcommand and must not be misrecorded as
+        // command path.
         let inv = capture_lossy_from(&[
             "clickhousectl",
-            "cloud",
-            "service",
-            "get",
-            "--org-id",
+            "local",
+            "server",
+            "start",
+            "--name",
             "list",
+            "--http-port",
+            "SECRET-NOT-A-PORT",
         ]);
-        assert_eq!(inv.command, "cloud service get");
-        assert_eq!(inv.flags, ["org-id"]);
-        assert_eq!(inv.outcome, "missing_required");
+        assert_eq!(inv.command, "local server start");
+        assert_eq!(inv.flags, ["http-port", "name"]);
+        assert_eq!(inv.outcome, "invalid_value");
+        let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
+        assert!(!json.contains("SECRET"), "port value leaked: {json}");
     }
 
     #[test]
     fn lossy_inline_flag_value_is_discarded() {
-        // `--org-id=SECRET` fails only because of the trailing junk token;
-        // the name part is matched, the inline value never recorded.
+        // `--http-port=SECRET` fails on the value; the name part is matched,
+        // the inline value never recorded.
         let inv = capture_lossy_from(&[
             "clickhousectl",
-            "cloud",
-            "service",
-            "list",
-            "--org-id=SECRET-ORG",
+            "local",
+            "server",
+            "start",
+            "--http-port=SECRET-PORT",
             "junk-token",
         ]);
-        assert_eq!(inv.command, "cloud service list");
-        assert_eq!(inv.flags, ["org-id"]);
+        assert_eq!(inv.command, "local server start");
+        assert_eq!(inv.flags, ["http-port"]);
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
         assert!(!json.contains("SECRET"), "inline value leaked: {json}");
     }
@@ -2375,14 +2349,13 @@ mod tests {
         // clap would have accepted.
         let inv = capture_lossy_from(&[
             "clickhousectl",
-            "cloud",
-            "service",
+            "local",
             "list",
             "-Z",
-            "--org-id",
-            "SECRET-ORG",
+            "--json",
+            "SECRET-TAIL",
         ]);
-        assert_eq!(inv.command, "cloud service list");
+        assert_eq!(inv.command, "local list");
         assert!(inv.flags.is_empty());
         assert_eq!(inv.outcome, "unknown_argument");
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
@@ -2434,17 +2407,17 @@ mod tests {
         // positionals, flag values, and unmatched tokens must all be absent.
         let inv = capture_lossy_from(&[
             "clickhousectl",
-            "cloud",
+            "local",
             "--json",
-            "service",
-            "get",
-            "SECRET-SERVICE-ID",
-            "--org-id",
-            "SECRET-ORG",
+            "server",
+            "start",
+            "SECRET-NAME",
+            "--version",
+            "SECRET-VER",
             "--wat",
             "SECRET-TRAILING",
         ]);
-        assert_eq!(inv.command, "cloud service get");
+        assert_eq!(inv.command, "local server start");
         assert_eq!(inv.outcome, "unknown_argument");
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
         assert!(!json.contains("SECRET"), "payload leaked a value: {json}");
