@@ -17,7 +17,7 @@ CONTEXT FOR AGENTS:
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallVersionArg {
-    ClickHouse(VersionSpec),
+    ClickHouse(String),
     Postgres(String),
     Falkordb(String),
 }
@@ -46,9 +46,8 @@ impl FromStr for InstallVersionArg {
             return Ok(Self::Falkordb(version.to_string()));
         }
 
-        version_manager::parse_version_spec(input)
-            .map(Self::ClickHouse)
-            .map_err(|error| error.to_string())
+        // ClickHouse: accept any image tag-shaped string (26.8, 26.8.9.10, latest)
+        Ok(Self::ClickHouse(input.to_string()))
     }
 }
 
@@ -243,17 +242,13 @@ CONTEXT FOR AGENTS:
   Next: `dctl local server start`")]
     Init,
 
-    /// Connect to a running ClickHouse server with clickhouse-client
-    #[command(
-        group(ArgGroup::new("direct").args(["host", "port"]).multiple(true)),
-        after_help = "\
+    /// Connect to a running ClickHouse server
+    #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Default mode looks up a server started by `dctl local server start`; the name defaults
-  to \"default\".
-  Put wrapper options before `--`; all arguments after it go to clickhouse-client.
-  Interactive, --query and --queries-file output stays native, even with --json or a coding agent.
-  Choose SQL output explicitly, e.g. `-- --format JSONEachRow`."
-    )]
+  Default mode looks up a Docker-managed server; queries run via the HTTP interface
+  (no clickhouse-client binary needed). Interactive mode uses docker exec.
+  Direct mode (--host/--port) connects via HTTP to any ClickHouse server.
+  `--query` output stays native even with --json or a coding agent.")]
     Client {
         /// Server name to connect to (default: "default")
         #[arg(value_name = "NAME", conflicts_with_all = ["name_flag", "host", "port"])]
@@ -271,12 +266,12 @@ CONTEXT FOR AGENTS:
         #[arg(display_order = 0)]
         name_flag: Option<String>,
 
-        /// Host to connect to directly, bypassing local server lookup (port 9000)
+        /// Host to connect to directly, bypassing managed lookup (HTTP port 8123)
         #[arg(long)]
         #[arg(display_order = 1)]
         host: Option<String>,
 
-        /// TCP port to connect to directly, bypassing local server lookup (host localhost)
+        /// HTTP port for direct connection (host 127.0.0.1)
         #[arg(
             long,
             short,
@@ -285,27 +280,25 @@ CONTEXT FOR AGENTS:
         #[arg(display_order = 2)]
         port: Option<u16>,
 
-        /// Installed local client version for direct host/port mode
-        ///
-        /// Requires --host or --port and conflicts with NAME. Numeric versions only
-        /// (25, 25.12, 25.12.9.61). Does not change the default.
-        #[arg(long, short = 'v', requires = "direct", conflicts_with_all = ["name", "name_flag"])]
+        /// ClickHouse version to disambiguate when multiple share a name
+        #[arg(long, short = 'v', conflicts_with_all = ["host", "port"])]
         #[arg(display_order = 3)]
-        version: Option<ClientVersionArg>,
+        version: Option<String>,
 
-        /// Execute a SQL query; repeatable (repeats need ClickHouse 23.9.1.1854+)
+        /// Execute a SQL query via the HTTP interface
         #[arg(long, short, conflicts_with = "queries_file")]
         #[arg(display_order = 4)]
-        query: Vec<String>,
+        query: Option<String>,
 
-        /// Execute queries from SQL files; accepts multiple paths or repeated flags
-        #[arg(long, num_args = 1.., conflicts_with = "query")]
+        /// Execute queries from a SQL file ("-" for stdin)
+        #[arg(long, conflicts_with = "query")]
         #[arg(display_order = 5)]
-        queries_file: Vec<String>,
+        queries_file: Option<String>,
 
-        /// Native clickhouse-client arguments (require --)
-        #[arg(last = true, allow_hyphen_values = true)]
-        args: Vec<String>,
+        /// Database to use
+        #[arg(long)]
+        #[arg(display_order = 6)]
+        database: Option<String>,
     },
 
     /// Manage local server instances
@@ -552,15 +545,13 @@ CONTEXT FOR AGENTS:
 
 #[derive(Subcommand)]
 pub enum ServerCommands {
-    /// Start a ClickHouse server instance
+    /// Start a ClickHouse server instance (Docker-backed)
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Starting a name that is already running is an error; a bare start with \"default\" already
-  running picks a new generated name instead.
-  With no --version and no default set, start installs \"latest\" first (~150 MB) without making
-  it the default.
-  After editing a custom config, stop the server and start again with the same --config.
-  Omitting --config on a later start removes the previously selected override.")]
+  Docker-managed: same container lifecycle as Postgres and FalkorDB.
+  Ports: 8123 (HTTP) and 9000 (native); auto-picked when busy, never the same.
+  The generated password is printed once by start; query later with `local client -q`.
+  A failed fresh start rolls back container and data; pre-existing data is kept.")]
     Start {
         /// Server name (default: "default", or random if default is already running)
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -575,45 +566,43 @@ CONTEXT FOR AGENTS:
         )]
         name_flag: Option<String>,
 
-        /// Version or channel to run: latest, stable, lts, 25.12 (installs if needed)
-        ///
-        /// Does not change the default version set by `local use`.
-        #[arg(long, short = 'v')]
-        version: Option<ServerVersionArg>,
+        /// ClickHouse image tag: 26.8, 26.8.9, 26.8.9.10, or latest. Default: 26.8
+        #[arg(long, short = 'v', value_parser = crate::local::clickhouse::parse_ch_tag_arg)]
+        version: Option<String>,
 
-        /// HTTP port; when omitted, 8123 if free else an auto-selected free port
-        ///
-        /// An explicitly requested port that is already in use is rejected.
-        #[arg(long)]
+        /// HTTP port; when omitted, 8123 if free else auto-selected
+        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_port_arg)]
         http_port: Option<u16>,
 
-        /// TCP port; when omitted, 9000 if free else an auto-selected free port
-        ///
-        /// An explicitly requested port that is already in use is rejected.
+        /// Native TCP port; when omitted, 9000 if free else auto-selected
+        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_port_arg)]
+        native_port: Option<u16>,
+
+        /// CLICKHOUSE_USER (default: default)
         #[arg(long)]
-        tcp_port: Option<u16>,
+        user: Option<String>,
 
-        /// Run in foreground instead of background (alias: --fg)
-        #[arg(long, alias = "fg", short = 'F')]
-        foreground: bool,
+        /// CLICKHOUSE_PASSWORD (default: random 24-char alphanumeric)
+        #[arg(long)]
+        password: Option<String>,
 
-        /// Return after spawning without waiting for HTTP and TCP readiness
-        ///
-        /// Otherwise a background start waits up to 30s for HTTP and TCP. Not with --foreground.
-        #[arg(long, conflicts_with = "foreground")]
-        no_wait: bool,
+        /// CLICKHOUSE_DB (default: default)
+        #[arg(long)]
+        database: Option<String>,
 
         /// Overlay defaults with a named partial config (see `server configs`)
-        ///
-        /// Select one file from ~/.dctl/configs/; paths are not accepted.
         #[arg(long = "config", alias = "config-file", value_name = "NAME")]
         config_file: Option<String>,
 
-        /// Arguments passed to clickhouse-server after `--`
+        /// Extra container env vars; repeatable, each key at most once
         ///
-        /// --config, --config-file and -C are rejected here; use `--config <NAME>` instead.
-        #[arg(last = true, allow_hyphen_values = true, value_name = "CLICKHOUSE_ARG")]
-        args: Vec<String>,
+        /// CLICKHOUSE_USER/PASSWORD/DB are managed; use the corresponding flags.
+        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+
+        /// Seconds to wait for readiness (maximum: 600)
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=600))]
+        wait_timeout: u16,
     },
 
     /// List custom config files available to `server start --config`
@@ -627,7 +616,7 @@ CONTEXT FOR AGENTS:
 
     /// List all server instances (running and stopped)
     List {
-        /// List running ClickHouse servers across all projects
+        /// List running servers across all projects
         #[arg(long)]
         global: bool,
     },
@@ -635,10 +624,9 @@ CONTEXT FOR AGENTS:
     /// Stop a running server
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Omitting NAME with no ClickHouse servers succeeds as a no-op; with several non-default servers
-  it errors — pass a name or use `stop-all`.")]
+  Docker-managed engines stop their container; resume preserves data and credentials.")]
     Stop {
-        /// Name of the server to stop (auto-selects default or a sole ClickHouse server when omitted)
+        /// Name of the server to stop (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
         name: Option<String>,
 
@@ -651,34 +639,20 @@ CONTEXT FOR AGENTS:
         )]
         name_flag: Option<String>,
 
-        /// Stop a ClickHouse server in any project; the default is project-scoped
-        #[arg(long)]
-        global: bool,
-
-        /// Project directory to disambiguate when using --global
-        #[arg(long, requires = "global")]
-        project: Option<String>,
+        /// ClickHouse version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
     },
 
     /// Stop all servers of every engine in this project
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  ClickHouse processes get SIGTERM, then SIGKILL if they do not exit in time.")]
-    StopAll {
-        /// Stop ClickHouse servers in all projects; the default is project-scoped
-        #[arg(long)]
-        global: bool,
-    },
+    StopAll,
 
     /// Remove a stopped server and its data
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Irreversible: deletes the server's data directory. Stop it first — removing a running server
-  errors.
-  Omitting NAME removes only an existing \"default\"; it never guesses a custom name, even when
-  exactly one exists.")]
+  Irreversible: removes the container and deletes its data directory. Stop the server first.")]
     Remove {
-        /// Name of the server to remove (defaults to "default" if it exists)
+        /// Name of the server to remove (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
         name: Option<String>,
 
@@ -690,19 +664,19 @@ CONTEXT FOR AGENTS:
             hide = true
         )]
         name_flag: Option<String>,
+
+        /// ClickHouse version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
     },
 
     /// Write ClickHouse connection env vars to a .env file
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Requires a running server; reads its actual ports.
-  Writes CLICKHOUSE_HOST, CLICKHOUSE_PORT and CLICKHOUSE_HTTP_PORT, plus CLICKHOUSE_USER,
-  CLICKHOUSE_PASSWORD and CLICKHOUSE_DATABASE only when their flags are given.
-  Writes .env in the current directory (.env.local with --local), then prints its name and a
-  value preview. Prefer your application's dotenv loader. Only source a reviewed, shell-compatible
-  file with `set -a; source .env; set +a` (use .env.local after --local); never eval the preview.
-  An existing file is edited in place: only the keys written here are replaced, other
-  CLICKHOUSE_* lines are kept.")]
+  Requires a running server; reads ports and credentials from the container env.
+  Writes CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT, CLICKHOUSE_PORT, CLICKHOUSE_USER,
+  CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE.
+  Contains the password in plaintext — prefer --local.")]
     Dotenv {
         /// Server name (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -717,21 +691,13 @@ CONTEXT FOR AGENTS:
         )]
         name_flag: Option<String>,
 
+        /// ClickHouse version to disambiguate when multiple share a name
+        #[arg(long, short = 'v')]
+        version: Option<String>,
+
         /// Write to .env.local instead of .env
         #[arg(long)]
         local: bool,
-
-        /// Include CLICKHOUSE_USER with this value
-        #[arg(long)]
-        user: Option<String>,
-
-        /// Include CLICKHOUSE_PASSWORD with this value
-        #[arg(long)]
-        password: Option<String>,
-
-        /// Include CLICKHOUSE_DATABASE with this value
-        #[arg(long)]
-        database: Option<String>,
     },
 }
 

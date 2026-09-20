@@ -229,6 +229,80 @@ pub fn fk_data_dir(name: &str, version: &str) -> PathBuf {
         .join("data")
 }
 
+/// Disk identifier for a Docker-managed ClickHouse instance:
+/// `<name>-ch<version>`.
+pub fn ch_instance_key(name: &str, version: &str) -> String {
+    format!("{}-ch{}", name, version)
+}
+
+pub(crate) fn is_ch_instance_key(name: &str) -> bool {
+    name.rsplit_once("-ch").is_some_and(|(name, version)| {
+        !name.is_empty()
+            && (version == "latest"
+                || (version.split('.').count() >= 2
+                    && version
+                        .split('.')
+                        .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))))
+    })
+}
+
+/// Data directory for a Docker-managed ClickHouse instance.
+pub fn ch_data_dir(name: &str, version: &str) -> PathBuf {
+    servers_dir()
+        .join(ch_instance_key(name, version))
+        .join("data")
+}
+
+/// Ensure the data directory for a ClickHouse instance exists.
+pub fn ensure_ch_data_dir(name: &str, version: &str) -> Result<bool> {
+    ensure_servers_dir()?;
+    let instance_dir = servers_dir().join(ch_instance_key(name, version));
+    let created = match std::fs::create_dir(&instance_dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
+        Err(error) => return Err(error.into()),
+    };
+    if let Err(error) = std::fs::create_dir_all(instance_dir.join("data")) {
+        if created {
+            let _ = std::fs::remove_dir(&instance_dir);
+        }
+        return Err(error.into());
+    }
+    Ok(created)
+}
+
+/// Find every Docker-managed ClickHouse instance named `name`.
+pub(crate) fn find_ch_instances_locked(name: &str, lock: &MetadataLock) -> Result<Vec<ServerInfo>> {
+    let prefix = format!("{}-ch", name);
+    let dir = match std::fs::read_dir(&lock.dir) {
+        Ok(d) => d,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut out = Vec::new();
+    for entry in dir {
+        let entry = entry?;
+        let fname = match entry.file_name().into_string() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let stem = match fname.strip_suffix(".json") {
+            Some(s) => s,
+            None => continue,
+        };
+        if !stem.starts_with(&prefix) || !is_ch_instance_key(stem) {
+            continue;
+        }
+        if let Some(info) = load_info_locked(stem, lock)?
+            && info.engine == Engine::Clickhouse
+            && info.container_id.is_some()
+        {
+            out.push(info);
+        }
+    }
+    Ok(out)
+}
+
 /// Ensure the data directory for a FalkorDB instance exists. Returns whether
 /// this call created the instance directory, for transactional startup cleanup.
 pub fn ensure_fk_data_dir(name: &str, version: &str) -> Result<bool> {
@@ -424,6 +498,9 @@ fn is_alive(info: &ServerInfo) -> Result<bool> {
             Some(id) => docker::is_container_running_blocking(id),
             None => Ok(false),
         },
+        Engine::Clickhouse if info.container_id.is_some() => {
+            docker::is_container_running_blocking(info.container_id.as_deref().unwrap_or(""))
+        }
     }
 }
 
@@ -804,6 +881,11 @@ pub(crate) fn kill_server_locked(name: &str, lock: &MetadataLock) -> Result<()> 
         .ok_or_else(|| Error::ServerNotRunning(name.to_string()))?;
 
     match info.engine {
+        Engine::Clickhouse if info.container_id.is_some() => {
+            // Docker-managed ClickHouse: stop the container like PG/FK.
+            let id = info.container_id.as_deref().unwrap_or("");
+            docker::stop_blocking(id)?;
+        }
         Engine::Clickhouse => {
             kill_process(info.pid)?;
             mark_server_stopped_locked(name, info.pid, lock)?;

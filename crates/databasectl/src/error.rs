@@ -123,6 +123,8 @@ pub enum PortKind {
     Tcp,
     Postgres,
     Falkordb,
+    /// The ClickHouse native TCP port (9000).
+    Clickhouse,
     /// The FalkorDB Browser UI port (3000); a distinct kind so machine
     /// envelopes point at `falkordb start --help`, not the ClickHouse hint.
     FalkordbBrowser,
@@ -131,7 +133,7 @@ pub enum PortKind {
 impl PortKind {
     fn human_guidance(self) -> &'static str {
         match self {
-            Self::Postgres | Self::Falkordb | Self::FalkordbBrowser => {
+            Self::Postgres | Self::Falkordb | Self::FalkordbBrowser | Self::Clickhouse => {
                 "; choose another --port or omit --port to auto-select a free port"
             }
             Self::Http | Self::Tcp => "",
@@ -147,6 +149,7 @@ impl fmt::Display for PortKind {
             Self::Postgres => "Postgres",
             Self::Falkordb => "FalkorDB",
             Self::FalkordbBrowser => "FalkorDB Browser",
+            Self::Clickhouse => "ClickHouse",
         })
     }
 }
@@ -585,6 +588,10 @@ pub enum Error {
     #[error("FalkorDB error: {0}")]
     FalkorUsage(String),
 
+    /// A Docker-managed ClickHouse validation or state error.
+    #[error("ClickHouse error: {0}")]
+    ClickhouseUsage(String),
+
     /// A child process whose status must be returned unchanged. This is
     /// intentionally not printed as a dctl error by `run_parsed`.
     #[error("child process exited with code {0}")]
@@ -748,6 +755,13 @@ pub enum Error {
 
     #[error("{primary}\nFalkorDB startup rollback incomplete: {cleanup}")]
     FalkorStartupRollback {
+        #[source]
+        primary: Box<Error>,
+        cleanup: String,
+    },
+
+    #[error("{primary}\nClickHouse startup rollback incomplete: {cleanup}")]
+    ClickhouseStartupRollback {
         #[source]
         primary: Box<Error>,
         cleanup: String,

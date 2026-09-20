@@ -69,6 +69,8 @@ enum LocalErrorCode {
     PostgresError,
     /// A FalkorDB validation or state error; text is dctl's own.
     FalkorError,
+    /// A Docker-managed ClickHouse validation or state error.
+    ClickhouseError,
     SqlInputOpenFailed,
     SqlInputReadFailed,
     /// A managed server metadata file contains invalid JSON. The structured
@@ -303,6 +305,9 @@ impl LocalErrorOutput {
             Error::FalkorStartupRollback { primary, .. } => {
                 return Self::from_error(primary);
             }
+            Error::ClickhouseStartupRollback { primary, .. } => {
+                return Self::from_error(primary);
+            }
 
             // ── servers ─────────────────────────────────────────────────────
             Error::ServerNotFound(_) => {
@@ -410,6 +415,7 @@ impl LocalErrorOutput {
                     PortKind::Falkordb | PortKind::FalkordbBrowser => {
                         "dctl local falkordb start --help"
                     }
+                    PortKind::Clickhouse => "dctl local server start --help",
                     PortKind::Http | PortKind::Tcp => "dctl local server start --help",
                 })
             }
@@ -488,6 +494,7 @@ impl LocalErrorOutput {
 
             // ── falkordb ────────────────────────────────────────────────────
             Error::FalkorUsage(_) => Mapping::parity(LocalErrorCode::FalkorError),
+            Error::ClickhouseUsage(_) => Mapping::parity(LocalErrorCode::ClickhouseError),
             Error::SqlInputOpen { .. } => Mapping::redacted(
                 LocalErrorCode::SqlInputOpenFailed,
                 "Could not open SQL input file; check that --queries-file exists and is readable",
@@ -506,6 +513,7 @@ impl LocalErrorOutput {
             | Error::Postgres(_)
             | Error::Skills(_)
             | Error::Ledger(_)
+            | Error::ClickhouseUsage(_)
             | Error::ChildExit(_) => {
                 Mapping::redacted(LocalErrorCode::LocalError, "Local command failed")
             }
@@ -1212,6 +1220,58 @@ impl fmt::Display for FalkorStartOutput {
             "  Connect:  dctl local falkordb client {} -q 'PING'",
             self.name
         )
+    }
+}
+
+// ── clickhouse start ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClickhouseStartOutput {
+    pub name: String,
+    pub container_id: String,
+    pub image: String,
+    pub http_port: u16,
+    pub native_port: u16,
+    pub user: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub password: String,
+    pub database: String,
+}
+
+impl fmt::Display for ClickhouseStartOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let short = self.container_id.chars().take(12).collect::<String>();
+        writeln!(
+            f,
+            "ClickHouse '{}' running (container: {})",
+            self.name, short
+        )?;
+        writeln!(f, "  Image:    {}", self.image)?;
+        writeln!(f, "  HTTP:     {}", self.http_port)?;
+        writeln!(f, "  Native:   {}", self.native_port)?;
+        if !self.password.is_empty() {
+            writeln!(f, "  Password: {}", self.password)?;
+        }
+        write!(f, "  Query:    dctl local client -q 'SELECT 1'")
+    }
+}
+
+// ── clickhouse dotenv ───────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ClickhouseDotenvOutput {
+    pub file: String,
+    pub server: String,
+    pub vars: Vec<DotenvVar>,
+}
+
+impl fmt::Display for ClickhouseDotenvOutput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "Wrote to {} (clickhouse '{}')", self.file, self.server)?;
+        for var in &self.vars {
+            writeln!(f, "  {}={}", var.key, var.value)?;
+        }
+        Ok(())
     }
 }
 

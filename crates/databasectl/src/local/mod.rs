@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod clickhouse;
 pub mod config;
 pub mod discovery;
 pub mod docker;
@@ -68,16 +69,19 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
             version,
             query,
             queries_file,
-            args,
-        } => run_client(
-            name.or(name_flag),
-            host,
-            port,
-            version,
-            query,
-            queries_file,
-            args,
-        ),
+            database,
+        } => {
+            clickhouse::client(
+                name.or(name_flag),
+                version,
+                host,
+                port,
+                query,
+                queries_file,
+                database,
+            )
+            .await
+        }
         LocalCommands::Server { command } => run_server_commands(command, json).await,
         LocalCommands::Postgres { command } => postgres::run(command, json).await,
         LocalCommands::Falkordb { command } => falkordb::run(command, json).await,
@@ -137,40 +141,34 @@ async fn install_falkordb(tag: &str, force: bool, json: bool) -> Result<()> {
 }
 
 async fn install(version: InstallVersionArg, force: bool, json: bool) -> Result<()> {
-    let spec = match version {
-        InstallVersionArg::ClickHouse(spec) => spec,
-        InstallVersionArg::Postgres(tag) => return install_postgres(&tag, force, json).await,
-        InstallVersionArg::Falkordb(version) => {
-            return install_falkordb(&version, force, json).await;
-        }
-    };
-    let platform = version_manager::platform::Platform::detect()?;
+    match version {
+        InstallVersionArg::ClickHouse(tag) => install_clickhouse(&tag, force, json).await,
+        InstallVersionArg::Postgres(tag) => install_postgres(&tag, force, json).await,
+        InstallVersionArg::Falkordb(version) => install_falkordb(&version, force, json).await,
+    }
+}
 
-    let version =
-        version_manager::install::install_local_first(&spec, &platform, force, json).await?;
-
-    // If this is the first installed version, set it as default
-    let set_as_default = version_manager::get_default_version().is_err();
-    if set_as_default {
-        version_manager::set_default_version(&version)?;
+async fn install_clickhouse(tag: &str, force: bool, json: bool) -> Result<()> {
+    clickhouse::validate_ch_tag(tag)?;
+    let docker = docker::connect().await?;
+    let image_ref = clickhouse::ch_image_ref(tag);
+    if !force && docker::image_exists(&docker, &image_ref).await? {
+        let out = output::InstallOutput {
+            version: format!("clickhouse@{tag}"),
+            set_as_default: false,
+        };
         if !json {
-            eprintln!("Set as default version");
+            eprintln!("{image_ref} is already pulled");
         }
-    }
-
-    let out = output::InstallOutput {
-        version,
-        set_as_default,
-    };
-    // The version manager already emits outcome-aware human output: a real
-    // install is confirmed there, while a no-op says that the existing build
-    // is being reused. The generic display text always says "Installed", so
-    // reserve it for structured output to avoid a duplicate or misleading
-    // human confirmation.
-    if json {
         output::print_output(&out, json);
+        return Ok(());
     }
-
+    docker::pull_image(&docker, &image_ref, json).await?;
+    let out = output::InstallOutput {
+        version: format!("clickhouse@{tag}"),
+        set_as_default: false,
+    };
+    output::print_output(&out, json);
     Ok(())
 }
 
@@ -959,21 +957,25 @@ async fn run_server_commands(command: ServerCommands, json: bool) -> Result<()> 
             name_flag,
             version,
             http_port,
-            tcp_port,
-            foreground,
-            no_wait,
+            native_port,
+            user,
+            password,
+            database,
             config_file,
-            args,
+            env,
+            wait_timeout,
         } => {
-            start_server(
+            clickhouse::start(
                 name.or(name_flag),
                 version,
                 http_port,
-                tcp_port,
-                foreground,
-                no_wait,
+                native_port,
+                user,
+                password,
+                database,
                 config_file,
-                args,
+                env,
+                std::time::Duration::from_secs(wait_timeout.into()),
                 json,
             )
             .await
@@ -989,39 +991,36 @@ async fn run_server_commands(command: ServerCommands, json: bool) -> Result<()> 
         ServerCommands::Stop {
             name,
             name_flag,
-            global,
-            project,
-        } => stop_server(
-            ServerNameInput::from_args(name, name_flag),
-            global,
-            project,
-            json,
-        ),
-        ServerCommands::StopAll { global } => {
-            if global {
-                stop_all_servers_global(json)
-            } else {
-                stop_all_servers_local(json)
-            }
+            version,
+        } => {
+            clickhouse::stop(
+                name.or(name_flag).as_deref().unwrap_or("default"),
+                version.as_deref(),
+                json,
+            )
+            .await
         }
+        ServerCommands::StopAll => stop_all_servers_local(json),
         ServerCommands::Dotenv {
             name,
             name_flag,
+            version,
             local,
-            user,
-            password,
-            database,
-        } => dotenv_server(
+        } => clickhouse::dotenv(
             name.or(name_flag).as_deref(),
+            version.as_deref(),
             local,
-            user,
-            password,
-            database,
             json,
         ),
-        ServerCommands::Remove { name, name_flag } => {
-            remove_server(ServerNameInput::from_args(name, name_flag), json)
-        }
+        ServerCommands::Remove {
+            name,
+            name_flag,
+            version,
+        } => clickhouse::remove(
+            name.or(name_flag).as_deref().unwrap_or("default"),
+            version.as_deref(),
+            json,
+        ),
     }
 }
 

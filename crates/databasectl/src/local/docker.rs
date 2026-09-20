@@ -27,6 +27,7 @@ pub const LABEL_ENGINE: &str = "dctl.engine";
 /// writes cannot drift apart).
 pub const ENGINE_POSTGRES: &str = "postgres";
 pub const ENGINE_FALKORDB: &str = "falkordb";
+pub const ENGINE_CLICKHOUSE: &str = "clickhouse";
 pub const LABEL_NAME: &str = "dctl.name";
 pub const LABEL_MAJOR: &str = "dctl.major";
 pub const LABEL_PROJECT: &str = "dctl.project";
@@ -47,6 +48,11 @@ pub fn pg_container_name(user_name: &str, major: &str) -> String {
 /// Distinct (name, version) pairs always get distinct container names.
 pub fn fk_container_name(user_name: &str, version: &str) -> String {
     format!("dctl-fk-{}-{}", user_name, version)
+}
+
+/// Container name for a ClickHouse instance: `dctl-ch-<name>-<version>`.
+pub fn ch_container_name(user_name: &str, version: &str) -> String {
+    format!("dctl-ch-{}-{}", user_name, version)
 }
 
 /// Connect to the local Docker daemon and verify it's reachable.
@@ -552,7 +558,108 @@ pub async fn create_falkordb(docker: &Docker, opts: FalkorRunOpts<'_>) -> Result
     Ok(created.id)
 }
 
-/// Run FalkorDB's readiness probe inside the container: an authenticated
+pub struct ClickhouseRunOpts<'a> {
+    pub user_name: &'a str,
+    /// Image tag (e.g. `26.8` or `26.8.9.10`).
+    pub version: &'a str,
+    pub image_ref: &'a str,
+    pub http_port: u16,
+    pub native_port: u16,
+    pub data_dir: &'a std::path::Path,
+    pub project_cwd: &'a str,
+    pub user: &'a str,
+    pub password: &'a str,
+    pub database: &'a str,
+    /// Bind-mount for a partial config overlay (source on the host), if any.
+    pub config_source: Option<&'a std::path::Path>,
+    pub extra_env: Vec<String>,
+}
+
+/// Create a ClickHouse container without starting it; return its ID.
+///
+/// Dual ports (8123 HTTP + 9000 native TCP), data at /var/lib/clickhouse,
+/// optional config overlay ro-mounted into config.d/, ulimit nofile 262144
+/// per the official recommendation.
+pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> Result<String> {
+    use bollard::models::{ContainerCreateBody, HostConfig, PortBinding, ResourcesUlimits};
+    use bollard::query_parameters::CreateContainerOptionsBuilder;
+
+    let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    for (container_port, host_port) in
+        [("8123/tcp", opts.http_port), ("9000/tcp", opts.native_port)]
+    {
+        port_bindings.insert(
+            container_port.to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("127.0.0.1".to_string()),
+                host_port: Some(host_port.to_string()),
+            }]),
+        );
+    }
+
+    let canonical_data = opts
+        .data_dir
+        .canonicalize()
+        .map_err(|e| Error::DockerError(format!("data dir canonicalize: {e}")))?;
+    let mut binds = vec![format!("{}:/var/lib/clickhouse", canonical_data.display())];
+    if let Some(config_source) = opts.config_source {
+        let canonical_config = config_source
+            .canonicalize()
+            .map_err(|e| Error::DockerError(format!("config canonicalize: {e}")))?;
+        let ext = config_source
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("xml");
+        binds.push(format!(
+            "{}:/etc/clickhouse-server/config.d/dctl-config.{}:ro",
+            canonical_config.display(),
+            ext
+        ));
+    }
+
+    let host_config = HostConfig {
+        port_bindings: Some(port_bindings),
+        binds: Some(binds),
+        ulimits: Some(vec![ResourcesUlimits {
+            name: Some("nofile".to_string()),
+            soft: Some(262144),
+            hard: Some(262144),
+        }]),
+        ..Default::default()
+    };
+
+    let mut env: Vec<String> = vec![
+        format!("CLICKHOUSE_USER={}", opts.user),
+        format!("CLICKHOUSE_PASSWORD={}", opts.password),
+        format!("CLICKHOUSE_DB={}", opts.database),
+    ];
+    env.extend(opts.extra_env);
+
+    let mut labels: HashMap<String, String> = HashMap::new();
+    labels.insert(LABEL_ENGINE.into(), ENGINE_CLICKHOUSE.into());
+    labels.insert(LABEL_NAME.into(), opts.user_name.into());
+    labels.insert(LABEL_MAJOR.into(), opts.version.into());
+    labels.insert(LABEL_PROJECT.into(), opts.project_cwd.into());
+    labels.insert(LABEL_CREATED_BY.into(), created_by_value());
+
+    let container_config = ContainerCreateBody {
+        image: Some(opts.image_ref.to_string()),
+        env: Some(env),
+        host_config: Some(host_config),
+        labels: Some(labels),
+        ..Default::default()
+    };
+
+    let create_opts = CreateContainerOptionsBuilder::default()
+        .name(&ch_container_name(opts.user_name, opts.version))
+        .build();
+
+    let created = docker
+        .create_container(Some(create_opts), container_config)
+        .await
+        .map_err(|e| Error::DockerError(e.to_string()))?;
+    Ok(created.id)
+}
 /// `redis-cli ping` succeeds (exit 0, PONG) only once the server answers with
 /// the password we provisioned. Connection failures exit non-zero.
 pub async fn falkor_is_ready(docker: &Docker, id: &str, password: &str) -> Result<bool> {
@@ -862,6 +969,14 @@ pub async fn list_project_falkor(
     list_project_engine(docker, project_cwd, ENGINE_FALKORDB, 6379).await
 }
 
+/// Find ClickHouse containers we created in `project_cwd`; protocol port 8123.
+pub async fn list_project_clickhouse(
+    docker: &Docker,
+    project_cwd: &str,
+) -> Result<Vec<DiscoveredContainer>> {
+    list_project_engine(docker, project_cwd, ENGINE_CLICKHOUSE, 8123).await
+}
+
 async fn list_project_engine(
     docker: &Docker,
     project_cwd: &str,
@@ -1111,6 +1226,16 @@ pub async fn exec_psql_in_container(
 
 /// Run `redis-cli` inside a container with a full interactive TTY; same
 /// contract as the psql variant, with REDISCLI_AUTH carried in the exec env.
+pub async fn exec_clickhouse_client_in_container(
+    docker: &Docker,
+    container_id: &str,
+    cli_args: &[String],
+) -> Result<()> {
+    let mut cmd = vec!["clickhouse-client".to_string()];
+    cmd.extend(cli_args.iter().cloned());
+    exec_command_tty(docker, container_id, cmd, Vec::new()).await
+}
+
 pub async fn exec_redis_cli_in_container(
     docker: &Docker,
     container_id: &str,
@@ -1461,6 +1586,48 @@ pub fn recover_project_postgres_blocking(
                 started_at: "recovered".to_string(),
                 cwd: cwd_owned.clone(),
                 engine: Engine::Postgres,
+                container_id: Some(c.container_id.clone()),
+            };
+            save_server_info_locked(&info, lock)?;
+        }
+        Ok(())
+    })
+}
+
+/// ClickHouse sibling of `recover_project_postgres_blocking`.
+pub fn recover_project_clickhouse_blocking(
+    project_cwd: &str,
+    lock: &crate::local::server::MetadataLock,
+) -> Result<()> {
+    use crate::local::server::{
+        Engine, ServerInfo, ch_instance_key, ensure_ch_data_dir, load_info_locked,
+        save_server_info_locked,
+    };
+    let cwd_owned = project_cwd.to_string();
+    block_on(async move {
+        let docker = match connect().await {
+            Ok(d) => d,
+            Err(_) => return Ok::<(), Error>(()),
+        };
+        let containers = match list_project_clickhouse(&docker, &cwd_owned).await {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
+        for c in containers {
+            let key = ch_instance_key(&c.user_name, &c.major);
+            if load_info_locked(&key, lock)?.is_some() {
+                continue;
+            }
+            ensure_ch_data_dir(&c.user_name, &c.major)?;
+            let info = ServerInfo {
+                name: key,
+                pid: 0,
+                version: format!("clickhouse:{}", c.major),
+                http_port: 0,
+                tcp_port: c.host_port.unwrap_or(0),
+                started_at: "recovered".to_string(),
+                cwd: cwd_owned.clone(),
+                engine: Engine::Clickhouse,
                 container_id: Some(c.container_id.clone()),
             };
             save_server_info_locked(&info, lock)?;
