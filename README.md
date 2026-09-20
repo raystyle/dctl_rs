@@ -133,7 +133,7 @@ $ dctl ledger issue list [--limit 100] [--before <id>]     # 家族翻页:has_mo
 $ dctl ledger issue show 3
 $ dctl ledger artifact publish --name <名> --kind experience \
     --digest sha256:<64hex> [--version] [--git-range a..b] [--deps d1,d2]
-$ dctl ledger artifact attest <id> --type attest_dev       # 或 attest_prod/demote/supersede
+$ dctl ledger artifact attest <id> --kind attest_dev      # 或 attest_prod/demote/supersede
 $ dctl ledger artifact promote <id>
 $ dctl ledger artifact list [--current] [--env dev|prod]
 $ dctl ledger issue close 3 --digest sha256:<64hex>        # result 引 digest 后 status=done

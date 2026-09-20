@@ -62,6 +62,13 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 
 - 交付:顶层 `dctl ledger` 命令域(issue 四命令 + artifact 四命令 + key 分发面),Ed25519 五头签名道,ADR-0006 立案
 - 密钥:keypair 现场生成,私钥 0600 落 ~/.dctl/ledger/dctl_rs.pem 永不入仓不进 argv;公钥 JWK 常量内置 CLI
-- 验证:单测与 wiremock 子进程套件全绿(签名基逐字节、五头验签、close 链顺序、家族翻页、digest 拒绝、409 语义);读面实弹 ledger.ohmygh.com GET 200 [实证: 2026-09-20 issue/artifact list 投影返回]
+- 验证更正(请二评审沉淀):初版 wiremock 桩钉的是虚构响应形状(close 扁平事件体、id/seq 字段、无 more=1),套件绿不构成写面已验的证据;经对总台 worker 源码(index.ts)重钉真实形状(嵌套 payload、issue_n/artifact_id、more=1 触发 has_more)后重新全绿;读面实弹 GET 200 仍然成立 [实证: 2026-09-20]
 - 踩坑:reqwest query 传单元组会触发 serde_urlencoded unsupported pair,须传键值对数组;ed25519-dalek v3 的 PEM 特性名是 pem(含 pkcs8),keypair 生成走 openssl 与生产密档同路径
 - 待办:总台注册公钥 kid 后补写面实弹(issue new 201 + artifact publish 201)
+
+## ledger 请二评审轮次
+
+- 一轮(不放行):F1-F5 必修 + G1-G9。codex 直接读了 ohmycloud worker 源码、按真实语义写本地桩实跑、并拿一次性钥打真服务验证 401 文案:F1(close 事件体须嵌套 payload)、F2(响应字段 issue_n/artifact_id)、F3(游标 issue_n + more=1)、F4(桩形状虚构掩盖前三条)、F5(人类面丢 issue 号)
+- 修复:事件体/字段映射/翻页/桩形状全按 worker 真实形状重钉;人类面表格带 Result/Dev/Prod/Cur 列;401 文案覆盖钥不配对;写面路径带 query 本地拒绝;base_url 去尾斜杠;私钥 0600 警告;README attest 旗标改 --kind;ADR-0006 补签名 pathname 语义与 DCTL_LEDGER_KEY 载体语义
+- G3(b 案:从私钥推导 kid 并警告不匹配)与 G9(/events?since= 读面)记 backlog
+- 教训:对有真源的服务做集成,桩形状必须从服务端源码抄,不能从契约摘要想象:三高一全因虚构形状而全绿

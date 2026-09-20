@@ -137,7 +137,8 @@ async fn issue_new_posts_signed_five_header_request() {
         .and(wiremock::matchers::path(ISSUES_PATH))
         .respond_with(
             wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
-                "id": 7, "seq": 1,
+                "ok": true, "issue": 7,
+                "event": {"event_id": "e1", "seq": 1, "type": "issue_open"},
             })),
         )
         .mount(&sandbox.mock)
@@ -161,7 +162,7 @@ async fn issue_new_posts_signed_five_header_request() {
         String::from_utf8_lossy(&output.stderr)
     );
     let json: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(json["registered"]["id"], 7);
+    assert_eq!(json["registered"]["issue"], 7);
 
     let requests = sandbox.mock.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
@@ -197,7 +198,9 @@ async fn issue_close_posts_result_then_status_done_in_order() {
     wiremock::Mock::given(wiremock::matchers::method("POST"))
         .and(wiremock::matchers::path(&events_path))
         .respond_with(
-            wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({"seq": 2})),
+            wiremock::ResponseTemplate::new(201).set_body_json(serde_json::json!({
+                "ok": true, "event": {"seq": 2},
+            })),
         )
         .mount(&sandbox.mock)
         .await;
@@ -222,13 +225,18 @@ async fn issue_close_posts_result_then_status_done_in_order() {
 
     let requests = sandbox.mock.received_requests().await.unwrap();
     assert_eq!(requests.len(), 2, "result then status chain");
+    // Server shape: events carry a nested payload (workers/ledger
+    // index.ts parsePayload); free text rides the top-level body.
     let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
     let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
     assert_eq!(first["type"], "result");
-    assert_eq!(first["digest"], digest);
-    assert_eq!(first["note"], "verified on lan-linux");
+    assert_eq!(first["payload"]["digest"], digest);
+    assert_eq!(first["body"], "verified on lan-linux");
     assert_eq!(second["type"], "status");
-    assert_eq!(second["status"], "done");
+    assert_eq!(second["payload"]["to"], "done");
+    // parsePayload requires an object (or absent) — neither may be null.
+    assert!(first["payload"].is_object());
+    assert!(second["payload"].is_object());
     // Each write mints its own idempotency key.
     let key = |request: &wiremock::Request| {
         request
@@ -268,8 +276,8 @@ async fn issue_list_reads_family_pagination_without_signing() {
         .respond_with(
             wiremock::ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "issues": [
-                    {"number": 9, "kind": "bug", "status": "open", "title": "Third"},
-                    {"number": 4, "kind": "improvement", "status": "done", "title": "Fourth"},
+                    {"issue_n": 9, "kind": "bug", "status": "open", "title": "Third", "assignee": null, "hasResult": false},
+                    {"issue_n": 4, "kind": "improvement", "status": "done", "title": "Fourth", "assignee": null, "hasResult": true},
                 ],
                 "has_more": true,
                 "count": 2,
@@ -295,12 +303,17 @@ async fn issue_list_reads_family_pagination_without_signing() {
         "cursor points at the last row: {stdout}"
     );
     assert!(stdout.contains("count 2 (this page)"), "{stdout}");
+    // F2/F3: the projection's issue_n renders as the number column and
+    // hasResult renders as the Result column (not "-").
+    assert!(stdout.contains("| 9 "), "issue_n renders: {stdout}");
+    assert!(stdout.contains(" yes "), "hasResult renders: {stdout}");
 
     let requests = sandbox.mock.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let query = requests[0].url.query().unwrap_or_default();
     assert!(query.contains("limit=10"), "{query}");
     assert!(query.contains("before=12"), "{query}");
+    assert!(query.contains("more=1"), "has_more needs more=1: {query}");
     assert!(
         requests[0].headers.get("x-signature").is_none(),
         "reads are unsigned"

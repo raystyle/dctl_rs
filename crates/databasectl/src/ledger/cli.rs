@@ -18,9 +18,12 @@ pub enum LedgerCommands {
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Truth source: https://ledger.ohmygh.com (repo github.com/raystyle/dctl_rs).
-  Reads need no key; writes sign with the local Ed25519 key and need it set up.
-  `issue close` posts result (digest reference) then status=done; a done close
-  requires a registered digest.
+  Reads need no key; writes sign with the local Ed25519 key (DCTL_LEDGER_KEY is
+  only a carrier for the SAME keypair as the built-in kid — swapping in a
+  different key fails verification until the new public JWK ships in the CLI).
+  `issue close` posts result (digest reference) then status=done; the done event
+  is what closes. If a close fails halfway, rerunning appends another result
+  event — harmless, but the issue stays open until done lands.
   Typical flow: `ledger issue new` -> work -> `ledger artifact publish` -> `ledger issue close --digest <digest>`.")]
     Issue {
         #[command(subcommand)]
@@ -85,7 +88,9 @@ pub enum IssueCommands {
     /// Close an issue as done, referencing a registered digest
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Posts a result event referencing the digest, then a status=done event.
+  Posts a result event referencing the digest, then a status=done event — done
+  is what closes the issue. No chain-level idempotency: rerunning after a
+  partial failure appends another result event (append-only ledger).
   Publish the artifact first (`ledger artifact publish`) and paste its digest.")]
     Close {
         /// Issue number

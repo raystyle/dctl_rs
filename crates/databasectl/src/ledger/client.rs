@@ -9,10 +9,14 @@ pub(crate) const DEFAULT_BASE_URL: &str = "https://ledger.ohmygh.com";
 const URL_ENV: &str = "DCTL_LEDGER_URL";
 
 pub(crate) fn base_url() -> String {
+    // A trailing slash would double up the path (`//repos/...`) and the
+    // server does not normalize it — trim operator typos away.
     std::env::var(URL_ENV)
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 fn repo_path(suffix: &str) -> String {
@@ -51,7 +55,9 @@ pub(crate) async fn get(path: &str, query: &[(&str, String)]) -> Result<Json> {
 }
 
 pub(crate) async fn get_page(path: &str, limit: u32, before: Option<&str>) -> Result<Page> {
-    let mut query = vec![("limit", limit.to_string())];
+    // The server only computes has_more when `before` is present or more=1;
+    // always ask so the first page reports saturation too.
+    let mut query = vec![("limit", limit.to_string()), ("more", "1".to_string())];
     if let Some(before) = before {
         query.push(("before", before.to_string()));
     }
@@ -94,7 +100,7 @@ pub(crate) async fn list_artifacts(
     env: Option<&str>,
 ) -> Result<Page> {
     let path = repo_path("artifacts");
-    let mut query = vec![("limit", limit.to_string())];
+    let mut query = vec![("limit", limit.to_string()), ("more", "1".to_string())];
     if let Some(before) = before {
         query.push(("before", before.to_string()));
     }
@@ -164,7 +170,9 @@ pub(crate) async fn signed_post(path: &str, body: serde_json::Value) -> Result<J
 
 fn api_error(status: u16, body: &str) -> Error {
     let hint = match status {
-        401 => " (check X-Timestamp drift and the registered public key)",
+        401 => {
+            " (X-Timestamp drift, or the private key is not the pair of the built-in kid — the server verifies X-Key-Id against the registered public key; see `dctl ledger key`)"
+        }
         409 => " (idempotency key collision with different content; rerun to mint a fresh key)",
         429 => " (per-key daily quota reached; writes resume next UTC day)",
         _ => "",

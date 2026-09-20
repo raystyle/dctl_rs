@@ -44,9 +44,13 @@ impl fmt::Display for IssueListOutput {
             .issues
             .iter()
             .map(|row| IssueRow {
-                number: field(row, "number"),
+                number: field(row, "issue_n"),
                 kind: field(row, "kind"),
                 status: field(row, "status"),
+                result: match &row["hasResult"] {
+                    serde_json::Value::Bool(true) => "yes".to_string(),
+                    _ => "-".to_string(),
+                },
                 title: truncate_cell(&field(row, "title"), 60),
             })
             .collect();
@@ -75,6 +79,8 @@ struct IssueRow {
     kind: String,
     #[tabled(rename = "Status")]
     status: String,
+    #[tabled(rename = "Result")]
+    result: String,
     #[tabled(rename = "Title")]
     title: String,
 }
@@ -101,10 +107,15 @@ pub struct RegisteredOutput {
 
 impl fmt::Display for RegisteredOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let id = field(&self.registered, "id");
-        let seq = field(&self.registered, "seq");
-        if id != "-" || seq != "-" {
-            write!(f, "Registered (id {id}, seq {seq})")?;
+        // Real write responses: {"ok":true,"issue":<n>} for issues,
+        // {"ok":true,"artifact_id":...,"digest":...} for artifacts.
+        let issue = field(&self.registered, "issue");
+        let artifact = field(&self.registered, "artifact_id");
+        if issue != "-" {
+            write!(f, "Opened issue {issue}")?;
+        } else if artifact != "-" {
+            let digest = field(&self.registered, "digest");
+            write!(f, "Published artifact {artifact} ({digest})")?;
         } else {
             write!(f, "Registered")?;
         }

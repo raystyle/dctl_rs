@@ -46,14 +46,14 @@ async fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
         }
         IssueCommands::List { limit, before } => {
             let page = client::list_issues(limit, before.as_deref()).await?;
-            let next_before = page.rows.last().and_then(|row| {
-                row.get("number")
-                    .or_else(|| row.get("id"))
-                    .map(|value| match value {
-                        serde_json::Value::String(text) => text.clone(),
-                        other => other.to_string(),
-                    })
-            });
+            let next_before = page
+                .rows
+                .last()
+                .and_then(|row| row.get("issue_n"))
+                .map(|value| match value {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                });
             output::print(
                 &output::IssueListOutput {
                     issues: page.rows,
@@ -76,14 +76,17 @@ async fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
             note,
         } => {
             sign::validate_digest(&digest)?;
+            // Server shape (workers/ledger/src/index.ts:486-504): events
+            // carry a nested payload; free text belongs in the top-level
+            // body, structured fields in payload.
             let mut result = json!({
                 "type": "result",
-                "digest": digest,
+                "payload": {"digest": digest},
             });
             if let Some(note) = note {
-                result["note"] = json!(note);
+                result["body"] = json!(note);
             }
-            let done = json!({"type": "status", "status": "done"});
+            let done = json!({"type": "status", "payload": {"to": "done"}});
             // Ordered chain per the contract: done is only accepted on top of
             // a result event referencing a registered digest.
             let first = client::signed_post(&events_path(&number), result).await?;
@@ -132,13 +135,13 @@ async fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
             Ok(())
         }
         ArtifactCommands::Attest { id, kind } => {
-            let body = json!({"type": kind.as_str()});
+            let body = json!({"type": kind.as_str(), "payload": {}});
             let registered = client::signed_post(&attestations_path(&id), body).await?;
             output::print(&output::RegisteredOutput { registered }, json);
             Ok(())
         }
         ArtifactCommands::Promote { id } => {
-            let body = json!({"type": "promote"});
+            let body = json!({"type": "promote", "payload": {}});
             let registered = client::signed_post(&attestations_path(&id), body).await?;
             output::print(&output::RegisteredOutput { registered }, json);
             Ok(())
@@ -160,9 +163,9 @@ async fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
             let count = rows.len();
             let has_more = page.has_more;
             let next_before = rows.last().and_then(|row| {
-                row.get("id").map(|value| match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
+                row.get("artifact_id").and_then(|value| match value {
+                    serde_json::Value::String(text) => Some(text.clone()),
+                    _ => None,
                 })
             });
             // The artifact list reuses the issue list renderer shape: rows
@@ -201,8 +204,21 @@ impl std::fmt::Display for ArtifactListOutputShim {
             name: String,
             #[tabled(rename = "Kind")]
             kind: String,
+            #[tabled(rename = "Dev")]
+            dev: String,
+            #[tabled(rename = "Prod")]
+            prod: String,
+            #[tabled(rename = "Cur")]
+            current: String,
             #[tabled(rename = "Digest")]
             digest: String,
+        }
+        fn flag(row: &serde_json::Value, key: &str) -> String {
+            match &row[key] {
+                serde_json::Value::Bool(true) => "yes".to_string(),
+                serde_json::Value::Bool(false) => "-".to_string(),
+                _ => "-".to_string(),
+            }
         }
         fn field(row: &serde_json::Value, key: &str) -> String {
             match &row[key] {
@@ -214,9 +230,12 @@ impl std::fmt::Display for ArtifactListOutputShim {
             .artifacts
             .iter()
             .map(|row| Row {
-                id: field(row, "id"),
+                id: field(row, "artifact_id"),
                 name: field(row, "name"),
                 kind: field(row, "kind"),
+                dev: flag(row, "dev_verified"),
+                prod: flag(row, "prod_verified"),
+                current: flag(row, "current"),
                 digest: field(row, "digest"),
             })
             .collect();

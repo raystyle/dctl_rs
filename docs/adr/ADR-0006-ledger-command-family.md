@@ -21,6 +21,8 @@ tags: [ledger, integration, security]
 
 ## Consequences
 
+补充(评审请二沉淀):签名基中的 path = URL pathname,不含 query(与总台 worker 实现逐字一致);CLI 写面路径带 query 直接本地拒绝。DCTL_LEDGER_KEY 只是同一密钥对的载体(金库/CI 注入面),换钥须改 CLI 内置公钥常量并重新注册 kid:env 换一把不配套的私钥只会 401。
+
 - 好面:身份分发面闭环(CLI 自带验签材料,总台注册一次 kid 即通);密钥泄漏面最小化(argv 与仓均不触及);读面无签名无配额,立即可用
 - 坏面:repo_id 写死,仓改名或迁移需改常量重发版;keypair 丢失则该 kid 身份作废,需总台重注册新公钥(无轮换协议前是一锤子买卖);事件体字段(result/status 的确切 schema)以契约摘要实现,写面实弹时可能需微调
 - 注意:配额 per-key 50/UTC 日,CLI 不做本地计数,429 由服务端权威;幂等键语义(同键同内容回放、异内容 409)是服务端保证,CLI 每次新键
