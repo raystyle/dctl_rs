@@ -316,7 +316,7 @@ async fn start(
             docker::ensure_name_free(
                 &docker,
                 &docker::pg_container_name(&user_name, &major),
-                "postgres",
+                docker::ENGINE_POSTGRES,
                 &project_cwd,
             )
             .await?;

@@ -62,8 +62,10 @@ pub struct ServerInfo {
     pub name: String,
     /// Active ClickHouse process PID; 0 when stopped or for Postgres.
     pub pid: u32,
-    /// Running ClickHouse version like "25.12.5.44", empty when stopped, or
-    /// "postgres:<tag>" for Postgres.
+    /// Running ClickHouse version like "25.12.5.44", empty when stopped,
+    /// "postgres:<tag>" for Postgres, or "falkordb:v<X.Y.Z>" / "falkordb:latest"
+    /// for FalkorDB — a logical display form, not a directly pullable image
+    /// reference (build refs via `falkordb::fk_image_ref`).
     pub version: String,
     /// Running ClickHouse HTTP port; 0 when stopped or for Postgres.
     pub http_port: u16,
