@@ -37,11 +37,15 @@ fn free_port_pair() -> (u16, u16) {
     (http, tcp)
 }
 
-/// Suite-wide pinned ports, reserved once on first use.
-static HTTP_PORT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| free_port_pair().0.to_string());
-static TCP_PORT: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| free_port_pair().1.to_string());
+/// Suite-wide pinned port pair, reserved atomically in one LazyLock so
+/// both halves always come from the same free_port_pair() call (two
+/// independent locks could theoretically race onto the same port).
+/// These tests share the pair: they run on failure paths that exit before
+/// actually binding, and the port-behavior tests bring their own ports.
+static PORTS: std::sync::LazyLock<(String, String)> = std::sync::LazyLock::new(|| {
+    let (http, tcp) = free_port_pair();
+    (http.to_string(), tcp.to_string())
+});
 
 fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
     command(project, home)
@@ -265,9 +269,9 @@ fn version_port_and_startup_failures_have_typed_safe_shapes() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--no-wait",
@@ -352,9 +356,9 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--config",
@@ -381,9 +385,9 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--config",
@@ -408,9 +412,9 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--config",
@@ -436,9 +440,9 @@ fn config_and_argument_failures_carry_their_full_human_detail_in_json() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--",
@@ -531,9 +535,9 @@ fn foreground_child_exit_is_not_wrapped_as_a_local_error() {
             "server",
             "start",
             "--http-port",
-            &HTTP_PORT,
+            &PORTS.0,
             "--tcp-port",
-            &TCP_PORT,
+            &PORTS.1,
             "--version",
             VERSION,
             "--foreground",
