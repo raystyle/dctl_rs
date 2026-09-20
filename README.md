@@ -112,7 +112,7 @@ Start overlays `~/.dctl/configs/<name>` partial configs onto the managed
 server config when passed `--config <name>`. Orphaned servers (started in a
 project, then the metadata moved) are discovered by process cwd scanning.
 
-### Postgres (Docker-backed)
+### Postgres via Docker
 
 ```console
 $ dctl local postgres start [NAME] [--user U --database D]

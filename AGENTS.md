@@ -1,146 +1,42 @@
-# AGENTS.md
+# dctl_rs
 
-`CLAUDE.md` is a symlink to this file. Edit `AGENTS.md`; never replace the symlink.
+dctl(DataBase Control):本地 ClickHouse 官方二进制与 Postgres(Docker)生命周期管理 CLI,是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
 
-dctl (`databasectl` crate, binary `dctl`) is the DataBase Control CLI: local ClickHouse
-(official binaries) and Postgres (Docker) lifecycle management. It is a fork of
-ClickHouse/clickhousectl with the Cloud surface removed. Use `--help` to learn the
-current command surface; `README.md` documents the CLI. Do not duplicate user-facing
-documentation here.
-
-## Collaboration model (who does what)
-
-Three agents work this repo through the herdr review gate:
-
-- **Claude authors PRs.** Branch per feature/issue, follow the invariants below,
-  keep every commit independently green (fmt, both clippy configs, tests).
-- **Codex reviews** in the herdr pane before anything reaches `main`. Receipts are
-  three-valued: `F` must-fix, `G` suggestion, `CONFIRM` final approval. Rounds
-  iterate (fix, re-review, quick second pass) until `CONFIRM`; only then push.
-  Verify every finding before fixing it: a high-severity claim may be partly wrong,
-  and every fix itself gets re-reviewed.
-- **Kimi owns tests.** Follow the test taxonomy in Tests below; never write
-  wording-pin tests (`help.contains("some sentence")`, `include_str!` on README,
-  whole-screen equality). Test structure: parse outcomes, `ErrorKind`, defaults,
-  value names, hidden flags staying hidden.
-
-CI is the fourth, sleepless reviewer: clippy with `-D warnings` in both feature
-configurations, fmt, the fail-closed install classifier, and the docker-backed
-suites. Human/agent review focuses on what machines cannot judge (design trade-offs,
-invariant bypasses).
+`CLAUDE.md` 是一行 `@AGENTS.md` 桥接;只编辑 `AGENTS.md`,不另写第二份。
 
 ## Commands
 
-- `cargo fmt --all` before every commit (`fmt.yml` runs `cargo fmt --all --check`).
-- `cargo clippy -p databasectl --all-targets --features telemetry -- -D warnings`
-  and `cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings`.
-- `cargo test -p databasectl` (default features; telemetry tests are gated behind
-  the feature) and `cargo test -p databasectl --features telemetry` when touching
-  `src/telemetry.rs` or `src/failure.rs`.
-- `python3 scripts/tests/test_classify_install_integration.py` when the install
-  classifier or its path map changes.
+- `cargo fmt --all`:提交前必跑(fmt.yml 门禁同款)
+- `cargo clippy -p databasectl --all-targets --features telemetry -- -D warnings`:telemetry 开启配置
+- `cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings`:telemetry 编译排除配置
+- `cargo test -p databasectl`:默认 feature 测试;改 telemetry.rs 或 failure.rs 时改跑 `cargo test -p databasectl --features telemetry`
+- `python3 scripts/tests/test_classify_install_integration.py`:改安装分类器或其路径映射后必跑
 
-**Done** means: `cargo fmt --all`; both clippy configurations clean; tests pass;
-classifier mappings updated if a source or test file was added or renamed; README
-updated for user-visible behaviour; work on a branch, with an associated issue and
-a PR that passed the review gate.
+## Must
 
-## Workspace
+- 不可逆技术选择先立 `docs/adr/` 的 ADR 再动手;新需求先立 `docs/requirements/` 的 REQ 再写码
+- 改命令面同步更新 clap 定义内帮助文本与 README,并补 `try_parse_from` 解析测试
+- 推 main 前过 herdr 评审闸门:codex 回执轮次到 CONFIRM 才放行(流程见 `docs/guides/review-gate.md`)
+- 每次交付跑双 clippy 配置与全量测试;依赖真实 Docker 的测试在 lan-linux 容器复验(配方见环境节)
 
-- Single crate: `crates/databasectl/` (binary `dctl`). Everything is local engine
-  logic; there is no cloud stack and no API library anymore.
-- Project-local data lives in `.dctl/`; global state (versions, default marker,
-  named configs) in `~/.dctl/`. `~/.local/bin/clickhouse` is the global product
-  symlink and keeps its name.
-- `src/telemetry.rs` and `src/failure.rs` are feature-gated (`telemetry`, off by
-  default) and on the removal list; do not build new functionality on them.
+## Must not
 
-## CLI invariants
+- 不写措辞钉死测试(`help.contains(...)`、`include_str!` README、整屏相等);只测结构(解析结果、默认值、隐藏旗标隐藏)
+- 不把逻辑堆进 main.rs:单出口不变量,新命令处理器进 `src/local/` 专属模块(配方见 `docs/guides/adding-a-command.md`)
+- 不在 telemetry.rs 与 failure.rs 上建新功能:feature 隔离且在删除路线上(ADR-0003)
+- 不改 builds.clickhouse.com 与 packages.clickhouse.com 产品下载 URL(那是 ClickHouse 产品的下载源,非本项目身份)
+- 不手改生成物,不另写第二份命令面真相文档
 
-- `main.rs` has a single exit path (the telemetry tail); do not add exit paths.
-  Exit codes: `0` success, `1` error, `3` cancelled, clap `2` for usage errors;
-  `ChildExit(code)` passes a spawned child's status through.
-- Every successful output type implements both `Serialize` and `Display` and is
-  printed through `local::output::print_output(&out, json)`. JSON mode is
-  `flag || is_ai_agent::detect().is_some()` (`json_output()` in `main.rs`).
-- Runtime failures render through the stable local error envelope
-  (`local/output.rs`): closed `LocalErrorCode` vocabulary, `parity` (JSON message
-  equals human text) or `redacted` (curated summary for foreign subprocess text).
-- Cross-flag constraints clap cannot express go in `validate_post_parse`
-  (`main.rs`), reported as the owning subcommand's usage error (exit 2).
+## Read first
 
-## Adding a command
+- 命令面:`dctl --help`;用户行为:README.md
+- 决策与 why:`docs/adr/`(改对应决策时才读);需求:`docs/requirements/`
+- 协作流程:`docs/guides/`;过程与踩坑:`docs/diary/` 与 `docs/research/`
+- 源码检索:先 `crates/databasectl/src/local/cli.rs`(命令定义)到 `crates/databasectl/src/local/mod.rs`(分发)到专属模块
 
-1. Add a variant to the relevant enum in `src/local/cli.rs` using clap derive macros.
-2. Add the match arm in `run()` in `src/local/mod.rs`; `main.rs` delegates to that
-   boundary. Implement the handler in a dedicated module under `src/local/` - never
-   pile logic into `main.rs`.
-3. Add `Cli::try_parse_from` coverage next to the command definition, asserting
-   parsed values, defaults, and hidden flags staying hidden.
+## 环境
 
-## Writing help text
-
-- Help lives in `#[command(about/after_help)]` and arg doc comments in `src/cli.rs`
-  and `src/local/cli.rs`. A help screen has only: one-line `about`, clap's
-  `Usage:`/`Arguments:`/`Options:`/`Commands:`, and an optional trailing
-  `CONTEXT FOR AGENTS:` block (hard cap 8 content lines, one fact per line).
-- `about`: imperative verb phrase, no trailing period, keep siblings parallel.
-  Flag help: one line, include units/format, never repeat clap's
-  `[default: ...]` or `[possible values: ...]` in prose.
-- Shared flags (`--json`) read identically everywhere; `help_order::JSON` keeps
-  them in a final ordered block.
-- Content users still need but help must not carry goes to `README.md` as a short
-  example or a note of at most 3 lines.
-
-## Tests
-
-Test coverage is non-negotiable.
-
-- **Clap parsing** - `Cli::try_parse_from` tests next to each command definition;
-  assert flag names, types, defaults, repeatability.
-- **Local subprocess** - one binary per concern under `crates/databasectl/tests/`
-  (the `local_*` files): spawn the real binary against fake Docker sockets, fake
-  `clickhouse`/`psql`/`pgrep`/`lsof` in an isolated `PATH`, `env_clear()` plus
-  temp `HOME`. Add a new file for a new concern.
-- **Pure logic** - inline `mod tests` blocks across `src/` for version resolution,
-  output formatting, platform detection, module-local helpers.
-- **Help and README text** - structural assertions only. No wording pins.
-- **Docker-dependent** - `scripts/test-postgres-integration.sh` runs the real
-  container boundary cases; run it where a Docker socket exists.
-
-## CI gates
-
-- Pin all GitHub Actions deps to SHA hashes, not tags.
-- The install classifier (`scripts/classify-install-integration.py`) fails closed;
-  it needs an entry when a source or test file is added or renamed, or CI breaks.
-  `scripts/tests/test_classify_install_integration.py` keeps its path map honest.
-- Workflows: `fmt.yml`, `test-cli.yml`, `test-postgres-integration.yml`,
-  `test-install.yml`, `release.yml` (GitHub Releases only; no registry publishes).
-
-## Dependencies
-
-Use `cargo add` with the latest version and an explicit crate,
-e.g. `cargo add -p databasectl url`.
-
-## Releases
-
-- Push a version tag (`git tag v0.2.3 && git push origin v0.2.3`) to run the
-  release workflow: build matrix (musl static verified), 8-distro smoke test,
-  GitHub Release. Distribution: install.sh + cargo-binstall + release assets.
-- Bump `crates/databasectl/Cargo.toml` (`version`) only; there is no lockstep
-  with other packages anymore.
-
-## Upstream
-
-`upstream` points at `ClickHouse/clickhousectl` (very active; most changes land
-in the removed cloud stack). Selectively backport local-engine improvements:
-`git fetch upstream`, cherry-pick or port the commit, adapt identity
-(`clickhousectl`/`chctl` -> `dctl`, `.clickhouse` -> `.dctl`), keep the original
-commit reference in the message, then run the full gate and review cycle.
-
-## Git workflow and documentation
-
-- Branch per feature/issue and use the PR workflow with the review gate above.
-- Root `README.md` documents CLI capabilities and behaviour; update it only for
-  functionality exposed through the CLI.
-- Keep `AGENTS.md` up to date when development practice changes materially.
+- 开发机 WSL(/mnt/wsl/repos/dctl_rs,无 Docker);Docker 依赖测试用 `ssh ray@lan-linux`(Docker 29.8.1,无 Rust,以 rust:1-slim 容器跑,完整配方与权限坑见 `docs/diary/2026-09-20-fork-bootstrap.md`)
+- 状态目录:项目级 `.dctl/`,全局 `~/.dctl/`;`~/.local/bin/clickhouse` 为产品符号链接,名字不改
+- 上游:`upstream` remote 指 ClickHouse/clickhousectl,选择性 backport,纪律见 ADR-0001
+- 文档路径统一正斜杠写法 `docs/adr/`
