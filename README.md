@@ -104,6 +104,20 @@ $ dctl local postgres stop [NAME]
 
 停止保留容器以便恢复;remove 删除容器。生成的密码由 start 打印一次,之后经 `dotenv` 重读。
 
+### FalkorDB 图数据库与 Docker
+
+```console
+$ dctl local install falkordb@4.20.6   # 或 falkordb@latest,预拉镜像
+$ dctl local falkordb start            # 默认随机密码,6379 协议口 + 3000 Browser 口自动挑
+$ dctl local falkordb client -q 'GRAPH.QUERY g "CREATE (:n {name: '\''root'\''})"'
+$ dctl local falkordb client           # 交互式 redis-cli(宿主优先,回退 docker exec)
+$ dctl local falkordb dotenv           # 写 FALKORDB_HOST/PORT/PASSWORD/BROWSER_URL
+$ dctl local falkordb stop             # 保留容器与密码,可 resume
+$ dctl local falkordb remove           # 须先停止;删除容器与数据
+```
+
+FalkorDB 是 Redis 模块图数据库(openCypher);`client -q` 直通 redis 命令,Cypher 参数记得加引号。Browser 可视化在 start 输出的地址。
+
 ### agent 技能安装
 
 ```console
