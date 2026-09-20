@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Edge-case battery for `clickhousectl local postgres`. Runs each test in
+# Edge-case battery for `dctl local postgres`. Runs each test in
 # isolation in a temp directory, prints PASS/FAIL, and continues on
 # failure so we get a full picture in one run.
 #
@@ -8,10 +8,10 @@
 #   * `jq` on PATH
 #
 # Usage:
-#   scripts/test-postgres-integration.sh [path/to/clickhousectl]
+#   scripts/test-postgres-integration.sh [path/to/dctl]
 #
 # If no argument is given, falls back to $CLICKHOUSECTL or the debug build
-# at target/debug/clickhousectl relative to the repo root.
+# at target/debug/dctl relative to the repo root.
 set -u
 
 export DO_NOT_TRACK=1
@@ -19,11 +19,11 @@ export DO_NOT_TRACK=1
 CTL="${1:-${CLICKHOUSECTL:-}}"
 if [[ -z "$CTL" ]]; then
     repo_root=$(cd "$(dirname "$0")/.." && pwd)
-    CTL="$repo_root/target/debug/clickhousectl"
+    CTL="$repo_root/target/debug/dctl"
 fi
 if [[ ! -x "$CTL" ]]; then
-    echo "clickhousectl binary not found at: $CTL" >&2
-    echo "Run 'cargo build -p clickhousectl' first, or pass the path as argument." >&2
+    echo "dctl binary not found at: $CTL" >&2
+    echo "Run 'cargo build -p databasectl' first, or pass the path as argument." >&2
     exit 2
 fi
 if ! command -v jq >/dev/null 2>&1; then
@@ -56,7 +56,7 @@ run_case() {
         FAILED_TESTS+=("$name")
     fi
     # Best-effort cleanup of any containers this test left behind.
-    docker ps -a --filter "label=clickhousectl.project=$real_dir" -q 2>/dev/null \
+    docker ps -a --filter "label=dctl.project=$real_dir" -q 2>/dev/null \
         | xargs -r docker rm -f >/dev/null 2>&1
     cd /
     # On Linux, residual postgres data dirs are owned by uid 999 (the
@@ -74,7 +74,7 @@ die() { echo "    -> $*"; return 1; }
 # ── 1. Reuses existing container after stop/delete-metadata via discovery ──
 case_orphan_recovery() {
     "$CTL" local postgres start --name a --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
-    local meta=.clickhouse/servers/a-pg18.json
+    local meta=.dctl/servers/a-pg18.json
     local cid_before; cid_before=$(jq -r .container_id "$meta")
     "$CTL" local postgres stop a >/dev/null 2>&1 || { die "stop"; return 1; }
     rm "$meta"
@@ -89,7 +89,7 @@ case_orphan_recovery() {
 # ── 2. start with externally-removed container errors with recovery guidance ──
 case_externally_removed_container() {
     "$CTL" local postgres start --name b --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
-    local cid; cid=$(jq -r .container_id .clickhouse/servers/b-pg18.json)
+    local cid; cid=$(jq -r .container_id .dctl/servers/b-pg18.json)
     docker rm -f "$cid" >/dev/null 2>&1 || { die "docker rm failed"; return 1; }
     # Metadata still references the dead id. Should error with explicit
     # recovery guidance, not silently recreate against potentially-corrupt PGDATA.
@@ -108,8 +108,8 @@ case_two_concurrent_servers() {
     "$CTL" local postgres start --name c1 --version 18-alpine >/dev/null 2>&1 || { die "start c1"; return 1; }
     "$CTL" local postgres start --name c2 --version 18-alpine >/dev/null 2>&1 || { die "start c2"; return 1; }
     local p1 p2
-    p1=$(jq -r .tcp_port .clickhouse/servers/c1-pg18.json)
-    p2=$(jq -r .tcp_port .clickhouse/servers/c2-pg18.json)
+    p1=$(jq -r .tcp_port .dctl/servers/c1-pg18.json)
+    p2=$(jq -r .tcp_port .dctl/servers/c2-pg18.json)
     [[ "$p1" != "$p2" ]] || { die "ports collide: $p1 == $p2"; return 1; }
     [[ "$p1" -gt 0 && "$p2" -gt 0 ]] || { die "ports invalid"; return 1; }
     "$CTL" local postgres stop c1 >/dev/null 2>&1
@@ -123,10 +123,10 @@ case_per_version_isolation() {
     "$CTL" local postgres start --name d --version 17-alpine >/dev/null 2>&1 || { die "start 17"; return 1; }
     "$CTL" local postgres stop d >/dev/null 2>&1
     "$CTL" local postgres start --name d --version 18-alpine >/dev/null 2>&1 || { die "start 18"; return 1; }
-    [[ -f .clickhouse/servers/d-pg17.json ]] || { die "17 metadata vanished"; return 1; }
-    [[ -f .clickhouse/servers/d-pg18.json ]] || { die "18 metadata not created"; return 1; }
-    [[ -d .clickhouse/servers/d-pg17/data ]] || { die "17 data dir vanished"; return 1; }
-    [[ -d .clickhouse/servers/d-pg18/data ]] || { die "18 data dir not created"; return 1; }
+    [[ -f .dctl/servers/d-pg17.json ]] || { die "17 metadata vanished"; return 1; }
+    [[ -f .dctl/servers/d-pg18.json ]] || { die "18 metadata not created"; return 1; }
+    [[ -d .dctl/servers/d-pg17/data ]] || { die "17 data dir vanished"; return 1; }
+    [[ -d .dctl/servers/d-pg18/data ]] || { die "18 data dir not created"; return 1; }
     # Bare `local postgres stop d` should ask for --version since multiple match.
     local out; out=$("$CTL" local postgres stop d 2>&1) || true
     echo "$out" | grep -q "pass --version" || { die "no disambiguation message: $out"; return 1; }
@@ -165,15 +165,15 @@ case_install_rejects_latest() {
 # ── 8. Cross-engine name reuse coexists (CH and PG can share a name) ──
 case_cross_engine_coexist() {
     # Fake a stopped CH "shared" instance with metadata only.
-    mkdir -p .clickhouse/servers/shared/data
-    cat > .clickhouse/servers/shared.json <<EOF
+    mkdir -p .dctl/servers/shared/data
+    cat > .dctl/servers/shared.json <<EOF
 {"name":"shared","pid":99999,"version":"25.12.5.44","http_port":8123,"tcp_port":9000,"started_at":"0","cwd":"$PWD","engine":"clickhouse"}
 EOF
     # Starting Postgres "shared" should succeed — CH and PG live in different files.
     "$CTL" local postgres start --name shared --version 18-alpine >/dev/null 2>&1 \
         || { die "postgres start with same name failed"; return 1; }
-    [[ -f .clickhouse/servers/shared.json ]] || { die "CH metadata clobbered"; return 1; }
-    [[ -f .clickhouse/servers/shared-pg18.json ]] || { die "PG metadata not created"; return 1; }
+    [[ -f .dctl/servers/shared.json ]] || { die "CH metadata clobbered"; return 1; }
+    [[ -f .dctl/servers/shared-pg18.json ]] || { die "PG metadata not created"; return 1; }
     "$CTL" local postgres stop shared >/dev/null 2>&1
     "$CTL" local postgres remove shared >/dev/null 2>&1
 }
@@ -185,8 +185,8 @@ case_stop_all_engine_scopes() (
     disown "$ch_pid"
     trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true' EXIT
 
-    mkdir -p .clickhouse/servers/c/data
-    cat > .clickhouse/servers/c.json <<EOF
+    mkdir -p .dctl/servers/c/data
+    cat > .dctl/servers/c.json <<EOF
 {"name":"c","pid":$ch_pid,"version":"25.12.5.44","http_port":8123,"tcp_port":9000,"started_at":"0","cwd":"$PWD","engine":"clickhouse"}
 EOF
     "$CTL" local postgres start --name p --version 18-alpine >/dev/null 2>&1 || { die "start postgres"; return 1; }
@@ -225,7 +225,7 @@ case_non_tty_query() {
     "$CTL" local postgres start --name q --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
     # Wait for pg to be query-ready (up to ~5s); the first start already waits
     # for the container, but pg itself takes a moment to accept queries.
-    local cid; cid=$(jq -r .container_id .clickhouse/servers/q-pg18.json)
+    local cid; cid=$(jq -r .container_id .dctl/servers/q-pg18.json)
     # `pg_isready` without -h checks a unix socket dir that may not exist in
     # alpine builds yet; force TCP to wait for actual query readiness.
     for _ in {1..50}; do
@@ -273,7 +273,7 @@ case_majors_start_and_serve() {
             fail=1
             continue
         fi
-        local cid; cid=$(jq -r .container_id ".clickhouse/servers/$n-pg$tag.json")
+        local cid; cid=$(jq -r .container_id ".dctl/servers/$n-pg$tag.json")
         local ready=0
         for _ in {1..50}; do
             if docker exec "$cid" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then

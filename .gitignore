@@ -27,4 +27,4 @@
 /.command-code/
 /.kiro/
 __pycache__/
-/crates/clickhousectl/.clickhouse/
+/crates/databasectl/.dctl/

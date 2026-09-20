@@ -3,25 +3,25 @@ name: Test Install
 on:
   pull_request:
     paths:
-      - "crates/clickhousectl/src/version_manager/**"
-      - "crates/clickhousectl/src/main.rs"
-      - "crates/clickhousectl/src/cli.rs"
-      - "crates/clickhousectl/src/local/cli.rs"
-      - "crates/clickhousectl/src/local/mod.rs"
-      - "crates/clickhousectl/src/local/output.rs"
-      - "crates/clickhousectl/src/local/server.rs"
-      - "crates/clickhousectl/src/local/discovery.rs"
-      - "crates/clickhousectl/src/local/symlink.rs"
-      - "crates/clickhousectl/src/init.rs"
-      - "crates/clickhousectl/src/paths.rs"
-      - "crates/clickhousectl/src/error.rs"
-      - "crates/clickhousectl/src/http.rs"
-      - "crates/clickhousectl/src/user_agent.rs"
-      - "crates/clickhousectl/tests/local_install_local_first_test.rs"
-      - "crates/clickhousectl/tests/local_version_error_test.rs"
+      - "crates/databasectl/src/version_manager/**"
+      - "crates/databasectl/src/main.rs"
+      - "crates/databasectl/src/cli.rs"
+      - "crates/databasectl/src/local/cli.rs"
+      - "crates/databasectl/src/local/mod.rs"
+      - "crates/databasectl/src/local/output.rs"
+      - "crates/databasectl/src/local/server.rs"
+      - "crates/databasectl/src/local/discovery.rs"
+      - "crates/databasectl/src/local/symlink.rs"
+      - "crates/databasectl/src/init.rs"
+      - "crates/databasectl/src/paths.rs"
+      - "crates/databasectl/src/error.rs"
+      - "crates/databasectl/src/http.rs"
+      - "crates/databasectl/src/user_agent.rs"
+      - "crates/databasectl/tests/local_install_local_first_test.rs"
+      - "crates/databasectl/tests/local_version_error_test.rs"
       - "Cargo.toml"
       - "Cargo.lock"
-      - "crates/clickhousectl/Cargo.toml"
+      - "crates/databasectl/Cargo.toml"
       - "scripts/classify-install-integration.py"
       - "scripts/tests/test_classify_install_integration.py"
       - ".github/workflows/test-install.yml"
@@ -127,43 +127,43 @@ jobs:
 
       - name: Test install latest
         run: |
-          ./target/debug/clickhousectl local install latest
+          ./target/debug/dctl local install latest
           # Verify a version was installed
-          ./target/debug/clickhousectl local list | grep -E "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"
+          ./target/debug/dctl local list | grep -E "[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+"
 
       - name: Test install minor version
         run: |
-          ./target/debug/clickhousectl local install 25.12
-          ./target/debug/clickhousectl local list | grep "25.12"
+          ./target/debug/dctl local install 25.12
+          ./target/debug/dctl local list | grep "25.12"
 
       - name: Test local use
         run: |
-          ./target/debug/clickhousectl local use 25.12
-          ./target/debug/clickhousectl local which | grep "25.12"
+          ./target/debug/dctl local use 25.12
+          ./target/debug/dctl local which | grep "25.12"
 
       - name: Test already installed (skips download)
         run: |
-          ./target/debug/clickhousectl local install 25.12 2>&1 | grep "already installed"
+          ./target/debug/dctl local install 25.12 2>&1 | grep "already installed"
 
       - name: Test force re-install
         run: |
-          ./target/debug/clickhousectl local install 25.12 --force
+          ./target/debug/dctl local install 25.12 --force
 
       - name: Test invalid version (expect error)
         run: |
-          if ./target/debug/clickhousectl local install foo 2>&1; then
+          if ./target/debug/dctl local install foo 2>&1; then
             echo "Should have errored for invalid version"
             exit 1
           fi
 
       - name: Test 3-part version rejected (expect error)
         run: |
-          if ./target/debug/clickhousectl local install 25.12.9 2>&1; then
+          if ./target/debug/dctl local install 25.12.9 2>&1; then
             echo "Should have errored for 3-part version"
             exit 1
           fi
 
       - name: Verify installed binary works
         run: |
-          version_dir=$(ls -d ~/.clickhouse/versions/*/clickhouse | head -1)
+          version_dir=$(ls -d ~/.dctl/versions/*/clickhouse | head -1)
           $version_dir --version

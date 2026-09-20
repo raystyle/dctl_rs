@@ -1,5 +1,5 @@
 name: Bug report
-description: Report a problem with clickhousectl (chctl)
+description: Report a problem with dctl (dctl)
 title: "[bug]: "
 labels: ["bug"]
 body:
@@ -12,7 +12,7 @@ body:
     attributes:
       label: What happened?
       description: A clear description of the bug, including what you expected to happen instead.
-      placeholder: When I run `clickhousectl ...`, I expected ... but instead ...
+      placeholder: When I run `dctl ...`, I expected ... but instead ...
     validations:
       required: true
   - type: textarea
@@ -21,8 +21,8 @@ body:
       label: Steps to reproduce
       description: The exact commands you ran, in order. Include relevant flags and config.
       placeholder: |
-        1. `clickhousectl local server start ...`
-        2. `clickhousectl ...`
+        1. `dctl local server start ...`
+        2. `dctl ...`
         3. ...
       render: shell
     validations:
@@ -30,16 +30,16 @@ body:
   - type: input
     id: version
     attributes:
-      label: clickhousectl version
-      description: Output of `clickhousectl --version`.
-      placeholder: clickhousectl 0.2.4
+      label: dctl version
+      description: Output of `dctl --version`.
+      placeholder: dctl 0.2.4
     validations:
       required: true
   - type: dropdown
     id: install-method
     attributes:
       label: Installation method
-      description: How did you install clickhousectl?
+      description: How did you install dctl?
       options:
         - Quick install script (curl ... | sh)
         - cargo binstall

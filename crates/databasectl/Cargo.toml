@@ -1,0 +1,61 @@
+[package]
+name = "databasectl"
+version = "0.5.0"
+edition = "2024"
+description = "dctl (DataBase Control): manage local ClickHouse and Postgres servers."
+license = "Apache-2.0"
+repository = "https://github.com/raystyle/dctl_rs"
+homepage = "https://github.com/raystyle/dctl_rs"
+keywords = ["clickhouse", "postgres", "cli", "database"]
+categories = ["command-line-utilities", "database"]
+readme = "../../README.md"
+
+[[bin]]
+name = "dctl"
+path = "src/main.rs"
+
+[package.metadata.binstall]
+pkg-url = "https://github.com/raystyle/dctl_rs/releases/download/v{ version }/dctl-{ target }-v{ version }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "dctl-{ target }-v{ version }/{ bin }{ binary-ext }"
+
+[features]
+default = []
+# Anonymous usage telemetry (first-run notice, `telemetry` subcommand, detached
+# send). Off by default in this fork: enabling it sends nothing unless
+# DCTL_TELEMETRY_URL points at a collector you own.
+telemetry = []
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "rustls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+dirs = "6"
+indicatif = "0.18"
+futures-util = "0.3"
+rpassword = "7.5.2"
+libc = "0.2.183"
+urlencoding = "2.1.3"
+flate2 = "1.1.9"
+tar = "0.4.45"
+chrono = "0.4.44"
+open = "5.3.3"
+url = "2.5.8"
+tabled = "0.20.0"
+uuid = { version = "1.23.0", features = ["v4"] }
+is-ai-agent = "0.5.0"
+base64 = "0.22.1"
+bollard = "0.21.0"
+crossterm = "0.29.0"
+rand = "0.10.1"
+tempfile = "3.27.0"
+sha2 = "0.11.0"
+serde_ignored = "0.1.14"
+
+[dev-dependencies]
+serde_json = "1"
+tokio = { version = "1", features = ["test-util"] }
+wiremock = "0.6.5"

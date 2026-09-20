@@ -58,7 +58,7 @@ jobs:
       - name: Verify static linking
         if: contains(matrix.target, 'linux-musl')
         run: |
-          binary="target/${{ matrix.target }}/release/clickhousectl"
+          binary="target/${{ matrix.target }}/release/dctl"
           echo "--- file output ---"
           file "$binary"
           file "$binary" | grep -qE "statically linked|static-pie linked"
@@ -76,16 +76,16 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           TARGET="${{ matrix.target }}"
-          DIR="clickhousectl-${TARGET}-v${VERSION}"
+          DIR="dctl-${TARGET}-v${VERSION}"
           mkdir "$DIR"
-          cp "target/${TARGET}/release/clickhousectl" "$DIR/"
+          cp "target/${TARGET}/release/dctl" "$DIR/"
           tar -czf "${DIR}.tar.gz" "$DIR"
 
       - name: Upload artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: clickhousectl-${{ matrix.target }}-v${{ steps.version.outputs.version }}
-          path: clickhousectl-${{ matrix.target }}-v${{ steps.version.outputs.version }}.tar.gz
+          name: dctl-${{ matrix.target }}-v${{ steps.version.outputs.version }}
+          path: dctl-${{ matrix.target }}-v${{ steps.version.outputs.version }}.tar.gz
 
   smoke-test:
     name: Smoke test (${{ matrix.distro }})
@@ -113,23 +113,23 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: clickhousectl-${{ env.TARGET }}-v${{ steps.version.outputs.version }}
+          name: dctl-${{ env.TARGET }}-v${{ steps.version.outputs.version }}
 
       - name: Extract archive
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          DIR="clickhousectl-${TARGET}-v${VERSION}"
+          DIR="dctl-${TARGET}-v${VERSION}"
           tar -xzf "${DIR}.tar.gz"
-          chmod +x "${DIR}/clickhousectl"
-          echo "BIN_PATH=${PWD}/${DIR}/clickhousectl" >> "$GITHUB_ENV"
+          chmod +x "${DIR}/dctl"
+          echo "BIN_PATH=${PWD}/${DIR}/dctl" >> "$GITHUB_ENV"
 
       - name: Run smoke test in ${{ matrix.distro }}
         run: |
           docker run --rm \
             -e DO_NOT_TRACK=1 \
-            -v "${BIN_PATH}:/usr/local/bin/clickhousectl:ro" \
+            -v "${BIN_PATH}:/usr/local/bin/dctl:ro" \
             ${{ matrix.distro }} \
-            sh -c 'clickhousectl --version && clickhousectl --help'
+            sh -c 'dctl --version && dctl --help'
 
   release:
     name: Create Release
@@ -151,7 +151,7 @@ jobs:
       - name: Collect archives
         run: |
           mkdir release
-          for dir in artifacts/clickhousectl-*-v*/; do
+          for dir in artifacts/dctl-*-v*/; do
             cp "$dir"/*.tar.gz release/
           done
           ls -l release/
@@ -192,10 +192,10 @@ jobs:
         if: env.SKIP_API_PROPAGATION != '1'
         run: sleep 30
 
-      - name: Publish clickhousectl
+      - name: Publish dctl
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p clickhousectl
+        run: cargo publish -p databasectl
 
   publish-npm:
     name: Publish to npm
@@ -272,7 +272,7 @@ jobs:
           # Cargo.toml was not bumped before tagging. Mirrors the npm step above.
           # awk (not `sed -i`) so this is portable to the BSD sed on macOS
           # runners, where the GNU-only `0,/re/` range silently no-ops.
-          f=crates/clickhousectl/Cargo.toml
+          f=crates/databasectl/Cargo.toml
           awk -v ver="$VERSION" \
             'done!=1 && /^version = "[^"]*"$/ { print "version = \"" ver "\""; done=1; next } { print }' \
             "$f" > "$f.tmp"
