@@ -36,6 +36,15 @@ CONTEXT FOR AGENTS:
   Typical flow: `local server start` -> `local client -q 'SELECT 1'`")]
     Local(LocalArgs),
 
+    /// Work with the repo's ledger (issues and shared artifacts)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Truth source: https://ledger.ohmygh.com. Reads need no credentials.
+  Writes require the local Ed25519 key (DCTL_LEDGER_KEY or ~/.dctl/ledger/dctl_rs.pem).
+  `ledger key` prints the embedded public JWK and kid for registration.
+  Typical flow: `ledger issue new` -> `ledger artifact publish` -> `ledger issue close --digest <digest>`.")]
+    Ledger(crate::ledger::cli::LedgerArgs),
+
     /// Install ClickHouse agent skills into supported coding agents
     #[command(after_help = "\
 CONTEXT FOR AGENTS:

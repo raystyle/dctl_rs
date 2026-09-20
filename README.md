@@ -124,6 +124,23 @@ FalkorDB 是 Redis 模块图数据库(openCypher);`client -q` 直通 redis 命�
 $ dctl skills --agent claude    # 把 ClickHouse agent 技能装进 coding agents
 ```
 
+### ledger 公共账本
+
+```console
+$ dctl ledger key                                          # 打印内置公钥 JWK 与 kid(总台注册面)
+$ dctl ledger issue new --title "修复 X" --kind bug --acceptance "判据"
+$ dctl ledger issue list [--limit 100] [--before <id>]     # 家族翻页:has_more 饱和提示
+$ dctl ledger issue show 3
+$ dctl ledger artifact publish --name <名> --kind experience \
+    --digest sha256:<64hex> [--version] [--git-range a..b] [--deps d1,d2]
+$ dctl ledger artifact attest <id> --type attest_dev       # 或 attest_prod/demote/supersede
+$ dctl ledger artifact promote <id>
+$ dctl ledger artifact list [--current] [--env dev|prod]
+$ dctl ledger issue close 3 --digest sha256:<64hex>        # result 引 digest 后 status=done
+```
+
+真源 [ledger.ohmygh.com](https://ledger.ohmygh.com)。读面无需凭据;写面走 Ed25519 五头签名道,私钥从环境 `DCTL_LEDGER_KEY`(PEM 内容或路径)或 `~/.dctl/ledger/dctl_rs.pem` 读取,永不入仓、不进命令行。产物只登记内容哈希与元数据,不收二进制。
+
 ### 贡献者指南
 
 开发纪律见 [AGENTS.md](AGENTS.md)(命令、硬约束、测试分类学、评审闸门)。本 fork 以 `upstream` remote 跟踪 ClickHouse/clickhousectl,选择性 backport 本地引擎改进。

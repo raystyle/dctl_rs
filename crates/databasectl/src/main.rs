@@ -4,6 +4,7 @@ mod error;
 mod failure;
 mod http;
 mod init;
+mod ledger;
 mod local;
 mod paths;
 mod skills;
@@ -268,6 +269,7 @@ fn command_json_flag(cmd: &Commands) -> Option<bool> {
     match cmd {
         Commands::Update(_) => None,
         Commands::Local(args) => Some(args.json),
+        Commands::Ledger(args) => Some(args.json),
         Commands::Skills(args) => Some(args.json),
         #[cfg(feature = "telemetry")]
         Commands::Telemetry(args) => Some(args.json),
@@ -295,6 +297,7 @@ fn json_output(flag: bool) -> bool {
 async fn run(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Local(args) => local::run(args.command, json_output(args.json)).await,
+        Commands::Ledger(args) => ledger::run(args.command, json_output(args.json)).await,
         Commands::Skills(args) => run_skills(args).await,
         Commands::Update(args) => run_update(args).await,
         #[cfg(feature = "telemetry")]

@@ -707,6 +707,11 @@ pub enum Error {
     #[error("{0}")]
     Skills(String),
 
+    /// A ledger command failure whose text dctl composes itself (missing or
+    /// unusable signing key, API error surfaces). Rendered verbatim.
+    #[error("{0}")]
+    Ledger(String),
+
     #[error("Invalid server name '{0}': must not contain path separators or '..'")]
     InvalidServerName(String),
 
