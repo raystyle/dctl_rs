@@ -2,188 +2,145 @@
 
 `CLAUDE.md` is a symlink to this file. Edit `AGENTS.md`; never replace the symlink.
 
-clickhousectl (`chctl`) is the CLI for ClickHouse and Postgres, local and in ClickHouse Cloud. Use `--help` to
-learn the current command surface. Root `README.md` documents the CLI; the API library has its own README.
-Do not duplicate user-facing documentation here.
+dctl (`databasectl` crate, binary `dctl`) is the DataBase Control CLI: local ClickHouse
+(official binaries) and Postgres (Docker) lifecycle management. It is a fork of
+ClickHouse/clickhousectl with the Cloud surface removed. Use `--help` to learn the
+current command surface; `README.md` documents the CLI. Do not duplicate user-facing
+documentation here.
+
+## Collaboration model (who does what)
+
+Three agents work this repo through the herdr review gate:
+
+- **Claude authors PRs.** Branch per feature/issue, follow the invariants below,
+  keep every commit independently green (fmt, both clippy configs, tests).
+- **Codex reviews** in the herdr pane before anything reaches `main`. Receipts are
+  three-valued: `F` must-fix, `G` suggestion, `CONFIRM` final approval. Rounds
+  iterate (fix, re-review, quick second pass) until `CONFIRM`; only then push.
+  Verify every finding before fixing it: a high-severity claim may be partly wrong,
+  and every fix itself gets re-reviewed.
+- **Kimi owns tests.** Follow the test taxonomy in Tests below; never write
+  wording-pin tests (`help.contains("some sentence")`, `include_str!` on README,
+  whole-screen equality). Test structure: parse outcomes, `ErrorKind`, defaults,
+  value names, hidden flags staying hidden.
+
+CI is the fourth, sleepless reviewer: clippy with `-D warnings` in both feature
+configurations, fmt, the fail-closed install classifier, and the docker-backed
+suites. Human/agent review focuses on what machines cannot judge (design trade-offs,
+invariant bypasses).
 
 ## Commands
 
-- `cargo fmt --all` before every commit (`fmt.yml` runs `cargo fmt --all --check`; bulk formatting commits are in `.git-blame-ignore-revs`).
-- `cargo clippy -p clickhousectl -- -D warnings` && `cargo test -p clickhousectl`.
-- Keep telemetry-compiled-out building and linting, as CI does: `cargo check -p clickhousectl --no-default-features`
-  && `cargo clippy -p clickhousectl --all-targets --no-default-features -- -D warnings`.
-- Library crates: `cargo clippy -p clickhouse-cloud-api -p clickhouse-openapi-analyzer --all-targets -- -D warnings`
-  && `cargo test -p clickhouse-cloud-api -p clickhouse-openapi-analyzer`; `python3 -m unittest discover -s scripts/tests -p 'test_*.py'`.
-  If `deprecated-fields` changed, also `cargo check --workspace --all-features`.
+- `cargo fmt --all` before every commit (`fmt.yml` runs `cargo fmt --all --check`).
+- `cargo clippy -p databasectl --all-targets --features telemetry -- -D warnings`
+  and `cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings`.
+- `cargo test -p databasectl` (default features; telemetry tests are gated behind
+  the feature) and `cargo test -p databasectl --features telemetry` when touching
+  `src/telemetry.rs` or `src/failure.rs`.
+- `python3 scripts/tests/test_classify_install_integration.py` when the install
+  classifier or its path map changes.
 
-**Done** means: `cargo fmt --all`; both clippy configurations clean; tests pass for every crate touched;
-classifier mappings updated if a file was added or renamed; the relevant README updated for user-visible behaviour;
-work on a branch, with an associated issue and a PR.
+**Done** means: `cargo fmt --all`; both clippy configurations clean; tests pass;
+classifier mappings updated if a source or test file was added or renamed; README
+updated for user-visible behaviour; work on a branch, with an associated issue and
+a PR that passed the review gate.
 
 ## Workspace
 
-- `crates/clickhousectl/` — the CLI. All local logic; wraps `clickhouse-cloud-api` for cloud.
-- `crates/clickhouse-cloud-api/` — typed Cloud API client, published to crates.io.
-- `crates/clickhouse-openapi-analyzer/` — private OpenAPI/Rust drift tooling.
-  Both library crates are governed by `crates/clickhouse-cloud-api/AGENTS.md`; read it before touching either.
-- Update the API library on its own; add CLI exposure separately. The CLI need not cover 100% of the library's
-  endpoints — be intentional.
-- Project-local data lives in `.clickhouse/`; globally installed ClickHouse binaries in `~/.clickhouse/`. OAuth
-  tokens (`~/.clickhouse/tokens.json`) are the exception — global user identity, not project-scoped.
+- Single crate: `crates/databasectl/` (binary `dctl`). Everything is local engine
+  logic; there is no cloud stack and no API library anymore.
+- Project-local data lives in `.dctl/`; global state (versions, default marker,
+  named configs) in `~/.dctl/`. `~/.local/bin/clickhouse` is the global product
+  symlink and keeps its name.
+- `src/telemetry.rs` and `src/failure.rs` are feature-gated (`telemetry`, off by
+  default) and on the removal list; do not build new functionality on them.
 
 ## CLI invariants
 
-- New Cloud handlers go through `CloudClient` wrapper methods co-located in each domain module, not
-  `clickhouse_cloud_api::Client` directly. `src/cloud/client.rs` owns the core client, credential precedence,
-  error conversion, and response unwrapping.
-- Exception, do not copy: `src/cloud/postgres.rs` handlers and the query paths in `src/cloud/services.rs` still
-  call `client.api()` directly (`postgres.rs` also uses a local `unwrap_api` instead of `unwrap_response`).
-- Cloud handlers support `--json` unless there is good reason not to. JSON is emitted automatically when `--json`
-  is passed or a coding agent is detected — `json_output()` in `main.rs` wraps `is_ai_agent::detect()`.
-- `CloudError` carries `kind: CloudErrorKind` (`Auth` for 401/403 and missing credentials, else `Generic`) and an
-  optional `details: CloudErrorDetail`. `cloud_error_to_top_level` (entered from `cloud::run`) maps `Auth` →
-  `Error::AuthRequired`, `Generic` → `Error::CloudDetailed`, retaining existing details or deriving a fallback
-  code from `FailureKind`. JSON mode renders every Cloud runtime failure via `cloud::output::print_error`,
-  including auth and cancellation; rendering never changes exit codes. Human output keeps the same message.
-- Exit codes: `0` success, else `Error::exit_code()` — `1` error, `3` cancelled, `4` auth required, and
-  `ChildExit(code)` passes a spawned child's status through. Clap uses `2` for usage errors.
-
-### Telemetry failure classification (#450)
-
-- `CloudError` also carries `failure: Option<ApiFailure>` (`src/failure.rs`). `failure::classify_api_error` is the
-  single place a library error variant becomes a `FailureKind`; reach it through `CloudClient::convert_error`,
-  `convert_error_for_organization`, or `convert_error_for_lookup`, so classification is inherited by conversion.
-- A handler adds the *stage* with `error.at_stage(FailureStage::…)` in `map_err` at the boundary that owns it.
-  Recording is first-write-wins: a coarse outer fallback never overwrites a precise inner one.
-- Never derive a category from message text. Never widen a vocabulary to anything but a `&'static str` from an enum
-  or an allowlisted status — those types are what make SQL, identifiers, response bodies and credentials
-  structurally unable to reach telemetry.
-- A boundary that rewrites a message must carry `failure` across (`..error` in a struct literal, or `with_failure`).
+- `main.rs` has a single exit path (the telemetry tail); do not add exit paths.
+  Exit codes: `0` success, `1` error, `3` cancelled, clap `2` for usage errors;
+  `ChildExit(code)` passes a spawned child's status through.
+- Every successful output type implements both `Serialize` and `Display` and is
+  printed through `local::output::print_output(&out, json)`. JSON mode is
+  `flag || is_ai_agent::detect().is_some()` (`json_output()` in `main.rs`).
+- Runtime failures render through the stable local error envelope
+  (`local/output.rs`): closed `LocalErrorCode` vocabulary, `parity` (JSON message
+  equals human text) or `redacted` (curated summary for foreign subprocess text).
+- Cross-flag constraints clap cannot express go in `validate_post_parse`
+  (`main.rs`), reported as the owning subcommand's usage error (exit 2).
 
 ## Adding a command
 
-Local clap definitions live in `src/local/cli.rs`. Cloud clap definitions, handlers, builders, wrapper methods,
-dispatch, and tests are co-located in the owning `src/cloud/<domain>.rs`; `src/cloud/cli.rs` owns the top-level
-cloud arguments, command enum, domain re-exports, delegation, and top-level tests.
-
-**Local:** 1. Add a variant to the relevant enum in `src/local/cli.rs` using clap derive macros. 2. Add the match
-arm in `run()` in `src/local/mod.rs`; `main.rs` delegates to that boundary. 3. Implement the handler in a dedicated
-module under `src/local/` (e.g. `server.rs`, `postgres.rs`) — don't pile new logic into `main.rs`.
-
-**Cloud:**
-
-1. Make sure `clickhouse-cloud-api` already supports the necessary endpoints and models.
-2. Add the clap variant and argument structs to the owning `src/cloud/<domain>.rs`. Create a new domain module and
-   privately re-export its command enum from `src/cloud/cli.rs` if the surface warrants its own grouping.
-3. Classify the variant in the domain enum's exhaustive `is_write()` match. OAuth (Bearer) auth is read-only; write
-   commands require API key auth and fail fast on OAuth + write. `CloudCommands::is_write_command()` in
-   `src/cloud/cli.rs` exhaustively delegates to each domain. Add read/write tests next to the clap definitions.
-4. Add the exhaustive command match to the domain's `run()` dispatcher. `dispatch()` in `src/cloud/mod.rs` (private;
-   entered from `cloud::run`) delegates only at the top-level `CloudCommands` boundary — add an arm there only when
-   introducing a new domain.
-5. Add a thin wrapper method in the domain module's `impl CloudClient` block: delegate to `self.api().<lib_method>()`,
-   map errors via `self.convert_error(e)` / `convert_error_for_organization(e, org_id)` /
-   `convert_error_for_lookup(e, lookup)`, and unwrap with `Self::unwrap_response`. Use the library's types here.
-6. If the command sends a body, extract `build_<name>_request(...)` in the same domain module returning the library's
-   request struct. Cover it with minimal + maximal unit tests asserting on library request-struct fields.
-7. Implement the handler in the same domain module. Body-sending handlers call the build helper, pass the result
-   through the `CloudClient` wrapper, and print with
-   `if json { println!("{}", serde_json::to_string_pretty(&data)?); } else { print_human(&data)?; }`.
-   Drive every detail/get view through `print_human` so it shares serde's behaviour — deprecated-field hiding, and
-   summarising a PEM-framed certificate or key instead of dumping its body; a `println!` or `tabled` cell bypasses
-   both. List views stay `tabled`; short action confirmations stay plain `println!`. Every field of a library
-   response type is `Option`, so never `unwrap()`/`expect()` one: render absence with
-   `crate::cloud::output::or_absent` (`-`) or `ABSENT`, and have `--filter` predicates treat absence as non-matching.
-8. Add `Cli::try_parse_from` coverage next to the domain command definition for the new command's body-related
-   flags, asserting parsed values.
+1. Add a variant to the relevant enum in `src/local/cli.rs` using clap derive macros.
+2. Add the match arm in `run()` in `src/local/mod.rs`; `main.rs` delegates to that
+   boundary. Implement the handler in a dedicated module under `src/local/` - never
+   pile logic into `main.rs`.
+3. Add `Cli::try_parse_from` coverage next to the command definition, asserting
+   parsed values, defaults, and hidden flags staying hidden.
 
 ## Writing help text
 
-- Help lives in `#[command(about/after_help)]` and arg doc comments in `src/cli.rs`, `src/local/cli.rs`,
-  `src/cloud/cli.rs`, and `src/cloud/<domain>.rs`; one block is `const INSTALL_AFTER_HELP` in `src/local/cli.rs`.
-- A help screen has only: one-line `about`, clap's `Usage:`, `Arguments:`/`Options:`, `Commands:`, and an optional
-  trailing `CONTEXT FOR AGENTS:` block via `after_help`. No `long_about`; no other `after_help` header.
-- `about`: imperative verb phrase, ≤ ~60 chars, no trailing period, no implementation detail; keep siblings parallel
-  ("List X", "Get X details", "Create X", "Delete X"). Flag help: one line, ≤ ~70 chars, include units/format
-  ("Interval in seconds"), and never repeat clap's `[default: …]` or `[possible values: …]` in prose.
-- Use `(Beta)` for beta markers; keep `(limited preview)` distinct.
-- State cross-flag constraints on the flag itself ("only with `--replication-mode cdc_only`"). Add a second
-  doc-comment paragraph (≤ ~3 lines) only for a constraint the flag's name and type cannot convey.
-- Shared flags (`--api-key`, `--api-secret`, `--url`, `--org-id`, `--org-name`, `--json`, `--debug`) read identically everywhere.
-- Help options: command-specific flags first (display ranks below 900), then the contiguous shared block
-  `--org-id`, `--org-name` (when available), `--api-key`, `--api-secret`, `--url`, `--json`, `--debug`, `--help`.
-  Use `src/cli.rs`'s `help_order` ranks 900–906; `--org-name` uses 901, and clap supplies help at 999.
-  Apply ranks at every declaration, including local JSON and auth flags; inheritance must preserve the block.
-  Both local clients order common arguments as name, host, port, version, query, queries-file. Names stay in
-  Arguments; compatibility flags stay hidden. Keep standard headings and release-only URL hiding.
-- `CONTEXT FOR AGENTS:` — hard cap 8 content lines, target 3-6, one fact per line. May hold: an auth requirement or
-  precondition; credential precedence without storage paths; where to get required inputs
-  ("Service ID: `cloud service list`"); non-obvious runtime behaviour
-  (timeouts, stdin handling, irreversibility, "must be stopped first"); an output note only when it changes what the
-  agent does; a `Typical flow:` line; at most one docs URL.
-  It must NOT hold implementation details, crates/files, HTTP or API mechanics, storage paths, history or
-  compatibility notes, reassurance, or anything already in the flag list, `[default:]`, or the `about` line.
-- Put shared context (auth model, how to find IDs, typical flow) on the parent (`cloud service`, `local server`);
-  leaves add a block only for a leaf-specific gotcha. A plain `get`/`list` usually needs none.
-- Do not write tests that pin help or README wording (`help.contains("some sentence")`, `include_str!` on
-  `README.md`, whole-screen equality). They protect phrasing, not facts, and turn every rewording into a test edit.
-  Test structure instead: `try_parse_from` outcomes, `ErrorKind`, defaults and value names clap renders, hidden
-  flags staying hidden, every subcommand having an `about`, block size, and a flag reading identically everywhere.
-  A fact that must not disappear from help is guarded by review against this section, not by a substring.
-- Content users still need but help must not carry goes to `README.md` as a short example or ≤ 3-line note.
+- Help lives in `#[command(about/after_help)]` and arg doc comments in `src/cli.rs`
+  and `src/local/cli.rs`. A help screen has only: one-line `about`, clap's
+  `Usage:`/`Arguments:`/`Options:`/`Commands:`, and an optional trailing
+  `CONTEXT FOR AGENTS:` block (hard cap 8 content lines, one fact per line).
+- `about`: imperative verb phrase, no trailing period, keep siblings parallel.
+  Flag help: one line, include units/format, never repeat clap's
+  `[default: ...]` or `[possible values: ...]` in prose.
+- Shared flags (`--json`) read identically everywhere; `help_order::JSON` keeps
+  them in a final ordered block.
+- Content users still need but help must not carry goes to `README.md` as a short
+  example or a note of at most 3 lines.
 
 ## Tests
 
 Test coverage is non-negotiable.
 
-- **Clap parsing** — `Cli::try_parse_from` tests next to each command definition (`src/cli.rs`, the owning
-  `src/cloud/<domain>.rs`, `src/cloud/cli.rs`, `src/local/cli.rs`). Assert flag names, types, defaults, repeatability.
-- **Request builders** — unit tests for `build_*_request` helpers next to the owning cloud domain code, asserting on
-  library request-struct fields with minimal + maximal inputs.
-- **Cloud subprocess + wiremock** — `tests/cli_request_shape_test.rs`. Spawn the real binary against a local mock
-  server and assert on requests, auth, errors, and output; use it when handler runtime behavior is not covered by
-  clap or request-builder tests.
-- **Local subprocess** — one binary per concern under `crates/clickhousectl/tests/`: 21 `local_*` binaries
-  (`local_server_*`, `local_postgres_*`, `local_docker_*`, `local_client_*`, `local_install_*`, `local_remove_*`,
-  `local_init_json_test.rs`, `local_structured_errors_test.rs`, `local_version_error_test.rs`) plus
-  `telemetry_test.rs`. Add a new file rather than growing `cli_request_shape_test.rs`, which is Cloud-only.
-- **Pure logic** — inline `mod tests` blocks across `src/` for version resolution, auth precedence, output
-  formatting, platform detection, and other module-local helpers.
-- **Help and README text** — structural assertions only (see Writing help text). No wording pins.
+- **Clap parsing** - `Cli::try_parse_from` tests next to each command definition;
+  assert flag names, types, defaults, repeatability.
+- **Local subprocess** - one binary per concern under `crates/databasectl/tests/`
+  (the `local_*` files): spawn the real binary against fake Docker sockets, fake
+  `clickhouse`/`psql`/`pgrep`/`lsof` in an isolated `PATH`, `env_clear()` plus
+  temp `HOME`. Add a new file for a new concern.
+- **Pure logic** - inline `mod tests` blocks across `src/` for version resolution,
+  output formatting, platform detection, module-local helpers.
+- **Help and README text** - structural assertions only. No wording pins.
+- **Docker-dependent** - `scripts/test-postgres-integration.sh` runs the real
+  container boundary cases; run it where a Docker socket exists.
 
 ## CI gates
 
-- Pin all GitHub Actions deps to SHA hashes, not tags. Never populate secrets in Actions triggered by external PRs.
-- Two path classifiers fail closed; **both** need an entry when a source or test file is added or renamed, or CI
-  breaks. `scripts/classify-cloud-integration.py` maps API-library source/test paths to the `service`, `postgres`,
-  `organization`, `clickpipes` suites (unknown paths select all suites);
-  `scripts/classify-install-integration.py` holds `INSTALL_EXACT_PATHS`/`INSTALL_PREFIXES` for the live local install
-  matrix, verified by `test-cli.yml` and `test-install.yml` on PRs that touch the classifier or the CLI
-  (`scripts/tests/test_classify_install_integration.py`).
-- Internal PRs classify the exact base-to-head diff on every push via a secret-free planner job; the
-  `Cloud integration decision` check goes green automatically when no suites are affected. Affected suites only run
-  after the `run-cloud-integration` label is applied (one-shot, bound to the labeled head SHA). Scheduled runs select
-  all suites; manual runs use the requested scope. Label, override, and fork rules: `.github/CLOUD_INTEGRATION.md`
-  (driven by `cloud-integration-decision.yml` + `scripts/cloud-integration-decision.py`).
+- Pin all GitHub Actions deps to SHA hashes, not tags.
+- The install classifier (`scripts/classify-install-integration.py`) fails closed;
+  it needs an entry when a source or test file is added or renamed, or CI breaks.
+  `scripts/tests/test_classify_install_integration.py` keeps its path map honest.
+- Workflows: `fmt.yml`, `test-cli.yml`, `test-postgres-integration.yml`,
+  `test-install.yml`, `release.yml` (GitHub Releases only; no registry publishes).
 
 ## Dependencies
 
-Use `cargo add` with the latest version and an explicit crate, e.g. `cargo add -p clickhouse-cloud-api url`.
+Use `cargo add` with the latest version and an explicit crate,
+e.g. `cargo add -p databasectl url`.
 
 ## Releases
 
-- Push a version tag (`git tag v0.2.3 && git push origin v0.2.3`) to run the release workflow.
-- Bump in lockstep: `crates/clickhousectl/Cargo.toml` (`version` and the `clickhouse-cloud-api` dep version),
-  `crates/clickhouse-cloud-api/Cargo.toml`, `npm/package.json`. `pypi/pyproject.toml` needs no manual bump — maturin
-  takes the version from `crates/clickhousectl/Cargo.toml` via `dynamic = ["version"]`.
-- `clickhouse-cloud-api` publishes to crates.io; `clickhousectl` to GitHub releases, crates.io, npm and PyPI from
-  the same workflow in separate jobs (crates.io uses a token, npm and PyPI use OIDC).
+- Push a version tag (`git tag v0.2.3 && git push origin v0.2.3`) to run the
+  release workflow: build matrix (musl static verified), 8-distro smoke test,
+  GitHub Release. Distribution: install.sh + cargo-binstall + release assets.
+- Bump `crates/databasectl/Cargo.toml` (`version`) only; there is no lockstep
+  with other packages anymore.
+
+## Upstream
+
+`upstream` points at `ClickHouse/clickhousectl` (very active; most changes land
+in the removed cloud stack). Selectively backport local-engine improvements:
+`git fetch upstream`, cherry-pick or port the commit, adapt identity
+(`clickhousectl`/`chctl` -> `dctl`, `.clickhouse` -> `.dctl`), keep the original
+commit reference in the message, then run the full gate and review cycle.
 
 ## Git workflow and documentation
 
-- Branch per feature/issue and use the PR workflow. PRs should have an associated issue.
-- Root `README.md` sections document `clickhousectl` CLI capabilities and behaviour. Update them only for
-  functionality exposed through the CLI. API-library-only changes (including OpenAPI drift remediation) belong
-  in `crates/clickhouse-cloud-api/README.md`; do not add Rust methods, models, migration notes, or analyzer
-  changes to the root README. A library-only PR does not require a root README change.
+- Branch per feature/issue and use the PR workflow with the review gate above.
+- Root `README.md` documents CLI capabilities and behaviour; update it only for
+  functionality exposed through the CLI.
 - Keep `AGENTS.md` up to date when development practice changes materially.
