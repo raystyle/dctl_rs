@@ -8,3 +8,4 @@
 | ADR-0002 | accepted | 命名与状态目录(dctl/databasectl/.dctl) | 无 |
 | ADR-0003 | accepted | telemetry 默认编译排除且上报端点置空 | 无 |
 | ADR-0004 | accepted | 分发只走 GitHub Releases | 无 |
+| ADR-0005 | accepted | 接入 FalkorDB 图数据库引擎,Docker 托管全功能镜像 | 无 |
