@@ -46,7 +46,9 @@ ssh lan-linux 'docker run --rm -v /tmp/dctl_ci:/repo -v /var/run/docker.sock:/va
 - 骨架合规:check.py 十二项全 PASS [实证: 2026-09-20 PE-01 至 PE-12]
 - 未做:codex 评审闸门待走;main 未推
 
-## FalkorDB 引擎单(同日追加,falkor-engine 分支)
+## FalkorDB 引擎单
+
+同日追加于 falkor-engine 分支:
 
 - 立项:ADR-0005 + REQ-003(当日回填 implemented,trace 为 falkor readiness 套件)
 - 交付:五提交(ADR/REQ、引擎主体、测试与文档、实弹修复);三引擎并存,pg/ch 零回归
