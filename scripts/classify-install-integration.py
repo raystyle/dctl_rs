@@ -40,11 +40,14 @@ INSTALL_PREFIXES = ()
 # inventory test to reject an unclassified new shared/local source or test.
 NON_INSTALL_EXACT_PATHS = frozenset(
     {
-        "crates/clickhouse-cloud-api/src/client/query_api_endpoints.rs",
-        "crates/clickhouse-cloud-api/src/models/query_api_endpoints.rs",
         "crates/databasectl/src/local/config.rs",
         "crates/databasectl/src/local/docker.rs",
+        "crates/databasectl/src/local/falkordb.rs",
         "crates/databasectl/src/local/postgres.rs",
+        "crates/databasectl/src/ledger/cli.rs",
+        "crates/databasectl/src/ledger/keys.rs",
+        "crates/databasectl/src/ledger/mod.rs",
+        "crates/databasectl/src/ledger/output.rs",
         "crates/databasectl/src/skills.rs",
         "crates/databasectl/src/update.rs",
         "crates/databasectl/tests/local_docker_diagnostics_test.rs",
@@ -54,6 +57,10 @@ NON_INSTALL_EXACT_PATHS = frozenset(
         "crates/databasectl/tests/local_postgres_client_input_test.rs",
         "crates/databasectl/tests/local_postgres_readiness_test.rs",
         "crates/databasectl/tests/local_postgres_start_validation_test.rs",
+        "crates/databasectl/tests/ledger_request_test.rs",
+        "crates/databasectl/tests/local_clickhouse_client_test.rs",
+        "crates/databasectl/tests/local_clickhouse_docker_test.rs",
+        "crates/databasectl/tests/local_falkor_readiness_test.rs",
         "crates/databasectl/tests/skills_usage_test.rs",
     }
 )

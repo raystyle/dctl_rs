@@ -14,11 +14,11 @@ trace: 第三引擎由 FalkorDB 批(PR #1)满足;四引擎明确不做
 
 ## Criteria
 
-- [ ] 现有 `Engine` 枚举(src/local/server.rs)重构为引擎 trait 或等价扩展点,新增引擎不改 local 命令分发主干
-- [ ] 至少接入一个新引擎走通 install/start/stop/status/client 生命周期
-- [ ] 新引擎的 Docker 或二进制管理路径有假替身集成测试(对齐 local_postgres_readiness_test 风格)
-- [ ] `CONTEXT FOR AGENTS` 帮助块与 README 覆盖新引擎
-- [ ] 剪枝时保留的双引擎行为零回归(全量测试通过)
+- [x] ~~现有 `Engine` 枚举重构为 trait~~:按 2026-09-21 裁定不做(YAGNI);三引擎共用 docker.rs 原语 + server.rs 元数据层即扩展点,PR #6 已验证新引擎不改分发主干
+- [x] 第三引擎(FalkorDB,PR #1):install/start/stop/list/remove/client/dotenv 全生命周期
+- [x] local_falkor_readiness_test(FakeDocker 假替身)
+- [x] falkordb 命令族 CONTEXT 块 + README FalkorDB 节
+- [x] 双引擎零回归;PR #6 后三引擎全量绿
 
 备注:动工前先立对应 ADR(引擎接入策略:二进制直管对应 Docker 托管的边界)。
 
