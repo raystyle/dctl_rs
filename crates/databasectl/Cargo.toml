@@ -2,11 +2,11 @@
 name = "databasectl"
 version = "0.6.0"
 edition = "2024"
-description = "dctl (DataBase Control): manage local ClickHouse and Postgres servers."
+description = "dctl (DataBase Control): unified Docker container lifecycle management for ClickHouse, Postgres and FalkorDB, with built-in clients."
 license = "Apache-2.0"
 repository = "https://github.com/raystyle/dctl_rs"
 homepage = "https://github.com/raystyle/dctl_rs"
-keywords = ["clickhouse", "postgres", "cli", "database"]
+keywords = ["clickhouse", "postgres", "falkordb", "cli", "database"]
 categories = ["command-line-utilities", "database"]
 readme = "../../README.md"
 
