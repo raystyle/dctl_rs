@@ -188,7 +188,7 @@ $ dctl ledger artifact list [--current] [--env dev|prod]
 
 ### 贡献者指南
 
-开发纪律见 [AGENTS.md](AGENTS.md)(命令、硬约束、测试分类学、评审闸门)。本 fork 以 `upstream` remote 跟踪 ClickHouse/clickhousectl,选择性 backport 本地引擎改进。
+开发纪律见 [AGENTS.md](AGENTS.md)(命令、硬约束、测试分类学、评审闸门)。本 fork 独立演进,不跟踪上游 remote(2026-09-21 裁定,见 ADR-0001 追注)。
 
 ## 许可证
 
