@@ -13,3 +13,4 @@
 | REQ-007 | implemented | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | PR #6;ADR-0007 |
 | REQ-008 | implemented | should | Postgres 与 FalkorDB 原生客户端集成(全引擎宿主免装客户端) | native-clients 批;ADR-0009 |
 | REQ-010 | draft | should | 镜像拉取默认走私仓并可指定自定义仓库 | null |
+| REQ-011 | draft | must | 去掉 local 命令前缀层,默认即本地操作 | null |
