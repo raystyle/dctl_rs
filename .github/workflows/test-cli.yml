@@ -14,8 +14,6 @@ on:
 permissions:
   contents: read
 
-env:
-
 
 jobs:
   test:
