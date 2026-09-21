@@ -30,6 +30,9 @@ jobs:
       - name: Build
         run: cargo build -p databasectl
 
+      - name: Markdown forbidden-character gate
+        run: python3 scripts/check-md.py
+
       - name: Clippy
         run: cargo clippy -p databasectl -- -D warnings
 

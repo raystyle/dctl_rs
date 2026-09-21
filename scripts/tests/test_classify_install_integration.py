@@ -44,11 +44,8 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
             "scripts/classify-install-integration.py": True,
             "crates/databasectl/src/local/postgres.rs": False,
             "crates/databasectl/src/local/docker.rs": False,
-            "crates/databasectl/tests/local_client_selectors_test.rs": False,
-            "crates/databasectl/tests/local_client_output_contract_test.rs": False,
             "crates/databasectl/tests/local_docker_pull_progress_test.rs": False,
             "crates/databasectl/tests/local_postgres_readiness_test.rs": False,
-            "crates/databasectl/tests/local_server_metadata_test.rs": False,
             "crates/databasectl/src/cloud/services.rs": False,
             "README.md": False,
         }
@@ -59,15 +56,13 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
     def test_new_or_renamed_candidates_are_unknown(self):
         for path in (
             "crates/databasectl/src/new_shared.rs",
-            "crates/databasectl/src/local/new_installer_helper.rs",
-            "crates/databasectl/tests/new_install_subprocess_test.rs",
-            "crates/databasectl/tests/snapshots/new_install.snap",
+            "crates/databasectl/tests/local_new_engine_test.rs",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(classifier.classify_path(path))
 
     def test_current_cli_sources_and_subprocess_tests_are_classified(self):
-        crate = classifier.REPO_ROOT / "crates" / "dctl"
+        crate = classifier.REPO_ROOT / "crates" / "databasectl"
         candidates = [*sorted((crate / "src").rglob("*.rs"))]
         candidates.extend(
             path for path in sorted((crate / "tests").rglob("*")) if path.is_file()
@@ -114,24 +109,16 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
             classifier.NON_INSTALL_EXACT_PATHS,
             frozenset(
                 {
-                    "crates/clickhouse-cloud-api/src/client/query_api_endpoints.rs",
-                    "crates/clickhouse-cloud-api/src/models/query_api_endpoints.rs",
-                    "crates/databasectl/src/cloud/clickstack.rs",
-                    "crates/databasectl/src/cloud/config.rs",
-                    "crates/databasectl/src/cloud/query_api_endpoints.rs",
-                    "crates/databasectl/src/cloud/udfs.rs",
-                    "crates/databasectl/src/dotenv.rs",
-                    "crates/databasectl/src/failure.rs",
                     "crates/databasectl/src/local/config.rs",
                     "crates/databasectl/src/local/docker.rs",
+                    "crates/databasectl/src/local/falkordb.rs",
                     "crates/databasectl/src/local/postgres.rs",
+                    "crates/databasectl/src/ledger/cli.rs",
+                    "crates/databasectl/src/ledger/keys.rs",
+                    "crates/databasectl/src/ledger/mod.rs",
+                    "crates/databasectl/src/ledger/output.rs",
                     "crates/databasectl/src/skills.rs",
-                    "crates/databasectl/src/telemetry.rs",
                     "crates/databasectl/src/update.rs",
-                    "crates/databasectl/tests/cli_request_shape_test.rs",
-                    "crates/databasectl/tests/local_client_project_scope_errors_test.rs",
-                    "crates/databasectl/tests/local_client_selectors_test.rs",
-                    "crates/databasectl/tests/local_client_output_contract_test.rs",
                     "crates/databasectl/tests/local_docker_diagnostics_test.rs",
                     "crates/databasectl/tests/local_docker_status_test.rs",
                     "crates/databasectl/tests/local_docker_pull_progress_test.rs",
@@ -139,19 +126,10 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                     "crates/databasectl/tests/local_postgres_client_input_test.rs",
                     "crates/databasectl/tests/local_postgres_readiness_test.rs",
                     "crates/databasectl/tests/local_postgres_start_validation_test.rs",
-                    "crates/databasectl/tests/local_remove_default_test.rs",
-                    "crates/databasectl/tests/local_remove_global_guard_test.rs",
-                    "crates/databasectl/tests/local_server_metadata_test.rs",
-                    "crates/databasectl/tests/local_server_name_compatibility_test.rs",
-                    "crates/databasectl/tests/local_server_project_scope_errors_test.rs",
-                    "crates/databasectl/tests/local_server_readiness_test.rs",
-                    "crates/databasectl/tests/local_server_selection_test.rs",
-                    "crates/databasectl/tests/local_server_start_args_test.rs",
-                    "crates/databasectl/tests/local_server_state_machine_test.rs",
-                    "crates/databasectl/tests/local_server_stopped_test.rs",
-                    "crates/databasectl/tests/local_server_watchdog_pid_test.rs",
-                    "crates/databasectl/tests/local_structured_errors_test.rs",
-                    "crates/databasectl/tests/telemetry_test.rs",
+                    "crates/databasectl/tests/ledger_request_test.rs",
+                    "crates/databasectl/tests/local_clickhouse_client_test.rs",
+                    "crates/databasectl/tests/local_clickhouse_docker_test.rs",
+                    "crates/databasectl/tests/local_falkor_readiness_test.rs",
                     "crates/databasectl/tests/skills_usage_test.rs",
                 }
             ),
@@ -169,6 +147,25 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
             workflow = classifier.REPO_ROOT / ".github" / "workflows" / name
             with self.subTest(workflow=name):
                 self.assertIn(command, workflow.read_text())
+
+    def test_declared_paths_all_exist(self):
+        """The tables may not carry ghosts: every declared path must exist.
+
+        Guard born in review (PR #9 round 1, F1/F2): the upstream-era
+        clickhouse-cloud-api entries survived every cleanup because nothing
+        compared the tables against the filesystem.
+        """
+        for path in classifier.INSTALL_EXACT_PATHS | classifier.NON_INSTALL_EXACT_PATHS:
+            if path.endswith("/"):
+                self.assertTrue(
+                    (classifier.REPO_ROOT / path).is_dir(),
+                    f"declared prefix does not exist: {path}",
+                )
+            else:
+                self.assertTrue(
+                    (classifier.REPO_ROOT / path).is_file(),
+                    f"declared path does not exist: {path}",
+                )
 
 
 if __name__ == "__main__":

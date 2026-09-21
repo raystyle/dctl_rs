@@ -4,10 +4,10 @@
 
 | id | 状态 | 优先级 | 标题 | trace |
 | --- | --- | --- | --- | --- |
-| REQ-001 | draft | should | Engine 抽象泛化,接入第三引擎 | null |
-| REQ-002 | draft | should | 物理删除 telemetry.rs 与 failure.rs | null |
+| REQ-001 | implemented | should | Engine 抽象泛化,接入第三引擎 | 第三引擎由 FalkorDB 批(PR #1)满足;四引擎不做(2026-09-21 裁定) |
+| REQ-002 | implemented | should | 物理删除 telemetry.rs 与 failure.rs | PR #8;全仓 telemetry 引用清零 |
 | REQ-003 | implemented | must | FalkorDB 图数据库引擎接入 | cargo test -p databasectl --test local_falkor_readiness_test |
 | REQ-004 | implemented | should | 集成 ledger 标准的 issue 与 artifact 命令族 | cargo test -p databasectl --test ledger_request_test |
 | REQ-005 | draft | could | registry.ohmygh.com 私仓直连与离线回落 | null |
-| REQ-006 | draft | must | 迁移到共享 ledger-rs crate 并统一权限收口 | null |
-| REQ-007 | draft | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | null |
+| REQ-006 | implemented | must | 迁移到共享 ledger-rs crate 并统一权限收口 | PR #7;ledger-client v0.1.1 |
+| REQ-007 | implemented | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | PR #6;ADR-0007 |
