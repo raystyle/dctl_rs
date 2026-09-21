@@ -138,7 +138,7 @@ CONTEXT FOR AGENTS:
         deps: Vec<String>,
     },
 
-    /// Attach an attestation or lifecycle event to an artifact
+    /// Attach a verification attestation to an artifact
     Attest {
         /// Artifact id
         id: String,

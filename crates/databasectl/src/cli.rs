@@ -42,7 +42,7 @@ CONTEXT FOR AGENTS:
   Truth source: https://ledger.ohmygh.com. Reads need no credentials.
   Writes require the local Ed25519 key (DCTL_LEDGER_KEY or ~/.dctl/ledger/dctl_rs.pem).
   `ledger key` prints the embedded public JWK and kid for registration.
-  Typical flow: `ledger issue new` -> `ledger artifact publish` -> `ledger issue close --digest <digest>`.")]
+  Typical flow: `ledger issue new` -> work -> `ledger artifact publish`; close/delete via the omc workbench.")]
     Ledger(crate::ledger::cli::LedgerArgs),
 
     /// Install ClickHouse agent skills into supported coding agents

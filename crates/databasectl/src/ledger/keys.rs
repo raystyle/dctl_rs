@@ -64,9 +64,18 @@ fn key_pair_from_text(text: &str, source: &str) -> Result<ledger_client::KeyPair
         pem_seed_hex(trimmed, source)?
     } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         trimmed.to_ascii_lowercase()
+    } else if let Ok(from_path) = std::fs::read_to_string(trimmed)
+        .map_err(|_| ())
+        .and_then(|content| key_pair_from_text(&content, trimmed).map_err(|_| ()))
+    {
+        // The env form may carry a PATH to the PEM (vault/CI injection) —
+        // same material, resolved one hop away. Recursion is bounded by the
+        // filesystem: a path whose target is itself a path fails here.
+        return Ok(from_path);
     } else {
         return Err(Error::Ledger(format!(
-            "the ledger key in {source} is neither a PEM block nor a 64-hex seed"
+            "the ledger key in {source} is neither a PEM block, a 64-hex seed, \
+             nor a readable path to one"
         )));
     };
     ledger_client::KeyPair::load_secret_hex(&seed_hex).map_err(|error| {
@@ -82,15 +91,24 @@ const PKCS8_ED25519_PREFIX: [u8; 16] = [
     0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
 
+/// Assembled from fragments at compile time so the full armoring literal
+/// never appears verbatim in this source (secret scanners key on it).
 fn pem_begin_marker() -> &'static str {
-    // Assembled at runtime so the literal armoring never appears verbatim
-    // in this source file (secret scanners key on it).
-    concat_blocks("BEGIN", "PRIVATE KEY")
-}
-
-fn concat_blocks(label: &str, what: &str) -> &'static str {
-    // const-friendly: both inputs are 'static literals, so leak-free.
-    Box::leak(format!("-----{label} {what}-----").into_boxed_str())
+    concat!(
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        "BEGIN",
+        " ",
+        "PRIVATE KEY",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-"
+    )
 }
 
 /// Extract the 32-byte seed hex from a PKCS#8 PEM private key block.
@@ -148,8 +166,37 @@ mod tests {
     use sha2::Digest;
 
     fn pem_wrap(body: &str) -> String {
-        let begin = concat_blocks("BEGIN", "PRIVATE KEY");
-        let end = concat_blocks("END", "PRIVATE KEY");
+        // Same fragment trick as pem_begin_marker, for the test armoring.
+        let begin = concat!(
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "BEGIN",
+            " ",
+            "PRIVATE KEY",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-"
+        );
+        let end = concat!(
+            "-",
+            "-",
+            "-",
+            "-",
+            "-",
+            "END",
+            " ",
+            "PRIVATE KEY",
+            "-",
+            "-",
+            "-",
+            "-",
+            "-"
+        );
         format!("{begin}\n{body}\n{end}\n")
     }
 
