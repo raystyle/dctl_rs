@@ -35,4 +35,5 @@ dctl 移除自研 src/ledger/ 客户端代码,以 Cargo 依赖引入全舰队唯
 - HTTP 桩测试被 crate 的常量 BASE_URL 挡住(crate 的 with_base 仅 cfg(test));重写后的套件覆盖离线可定的全部面,HTTP 形状以 crate 自身单测为准。若需仓级端到端桩,建议 crate 开放 `pub fn with_base`(已反馈 ledger-rs 维护方)。
 - dispatch 用 tokio::task::spawn_blocking 包裹:阻塞 client 内嵌 runtime 在 async 上下文 drop 会 panic(实测),不能直接同步调。
 - 写面实弹探测(2026-09-21):真 CLI 发冒烟 issue,服务端回 401 "X-Key-Id 不在册、已吊销或不绑定本仓",此回应证明签名道与信封全链工作,唯 kid 注册待总台;注册后按舰队 write-face 轮复测即可。
+- 写面复测收口(2026-09-21 下午):总台将 kid bc03b1ed…5149 直插 D1 pubkeys(status active,与 keys.rs 常量逐字一致);本侧 `dctl ledger issue new` 冒烟即 issue #1 注册成功、退出 0,401 消失。write-face 判据满足,关闭权在 omc 不变。
 - **HTTP 投影形状的覆盖责任在 ledger-client 的单测 + 舰队 write-face 轮**,不在本仓:issue/artifact 列表的字段提取(rows/has_more/issue_n/artifact_id)若在服务端改名,漏网由 crate 侧测试与舰队实弹兜住,本仓测试只锁离线可定面。此为显式契约,不是缺口(评审轮 1 G5)。

@@ -31,8 +31,13 @@ lan-linux(Docker 29.8.1,containerd 镜像存储)真 registry:2 + 真 daemon 端�
 ## 遗留(记档不做或后续)
 
 - docker_load 整 tar 入内存 Vec:GB 级镜像需流式化,后续批。(已随同日 pull-streaming 批完成,见下节)
-- 私仓 repo 命名(Hub 原名还是别名托管)与 latest 锚清单:归总台裁定,REQ-005 追注在册。
+- 私仓 repo 命名(Hub 原名还是别名托管)与 latest 锚清单:归总台裁定,REQ-005 追注在册。(同日下午已裁定:原名托管零映射、建清单机制,见上文总台三件回执节;余下仅补种执行)
 - lan-linux 上本轮残留:dctl-registry-test 容器(含播种数据)、三个已灌镜像与裸名别名、/tmp/dctl_cargo 与 /tmp/dctl_target 缓存卷;复验后按需清理。(终审后已全清)
+
+## 总台三件回执与 write-face 收口(同日下午,飞轮派单)
+
+- 经 herdr 派单 ohmycloud 工位:件 1 registry 命名裁定为 Hub 原名托管零映射(现存六仓均为原样先例;三引擎尚未托管,态缺,补种道 omc dist images push 经 tc-bj 中转,等总台令);件 2 裁定建 latest 锚清单机制(草案 postgres:18、falkordb/falkordb:v4.20.6、clickhouse/clickhouse-server:26.8,平台随上游 multi-arch,落点 catalog 侧镜像锚节);件 3 kid 注册完成(D1 pubkeys 直插,active,与 keys.rs 逐字一致)。
+- 本侧断言:keys.rs 常量对账一致;write-face 复测 `dctl ledger issue new` 冒烟即 issue #1 注册成功、401 消失,REQ-006 写面判据收口。
 
 ## 流式化批(pull-streaming,同日第二批)
 

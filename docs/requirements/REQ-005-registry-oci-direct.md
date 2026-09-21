@@ -24,5 +24,5 @@ trace: registry-fallback 批(ADR-0008;crates/databasectl/src/local/registry.rs;t
 ## 实现追注(2026-09-21)
 
 - 落地为 `dctl local registry pull/catalog` 显式命令加 install/start 透明回落链;测试面 stub v2 registry + fake docker 端到端,真 Docker 复验走 lan-linux 配方(docs/diary/2026-09-20-fork-bootstrap.md)。
-- 私仓 repo 命名约定(Hub 风格 org/name 是否原样托管)与 latest 锚清单归总台裁定;若需别名映射另立需求。
+- 私仓 repo 命名约定(Hub 风格 org/name 是否原样托管)与 latest 锚清单归总台裁定;若需别名映射另立需求。(2026-09-21 下午总台已裁定:Hub 原名托管零映射、建锚清单机制,草案 postgres:18、falkordb/falkordb:v4.20.6、clickhouse/clickhouse-server:26.8;三引擎镜像待补种进私仓)
 - lan-linux 真 Docker(Docker 29.8.1,containerd 镜像存储)实证:docker load 按 layout 的 ref.name 注记**字面**起名,而引用解析按归一名(docker.io/library/postgres)匹配;注记写全限定名后才可被 run/create 解析。classic 存储无此坑,属 containerd 存储特有。
