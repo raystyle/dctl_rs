@@ -22,7 +22,7 @@
 
 > 追注(2026-09-21,用户令经总台转):决策 1 第 2 步的直连腿由自研原生 v2 HTTP 客户端**换轨为官方生态库 oci-client**(github.com/oras-project/rust-oci-client,crates.io 名 oci-client,v0.18);自研腿收敛为库封装(manifest 原始字节、平台选择、blob 流式与 digest 校验、basic 挑战式鉴权均由库承担,OCI layout 组装与缓存仍在本仓)。背景:总台把 registry.ohmygh.com 切 R2 Worker 只读面(ohmycloud 仓 ADR-0002 加 REQ-064,实施中),对外 v2 协议面不变(GET 加 HEAD),basic 凭据与本地密档供给道不变,写入面恒 405;回落链序与本 ADR 其余决策不变。REQ-005 验收面不动。
 >
-> **服务端挑战契约(显式化,评审轮 G1)**:库的 Basic 是挑战门控(匿名探 `/v2/`,命中 WWW-Authenticate 才携带凭据),故服务端(含 R2 Worker 只读面)须对匿名 `/v2/` 回 401 且带 `WWW-Authenticate: Basic`;registry:2 与本仓 stub 均如此。R2 面落地后按此点专测一轮(总台侧待办)。
+> **服务端契约(定口径 c9c7fda9,2026-09-21 晚用户令)**:「匿名可拉取,不可枚举」:`/v2/` ping、manifests、blobs 匿名 200,oci-client 零凭据走完拉取链;`/v2/_catalog` 与 tags/list 恒 401 加 `WWW-Authenticate: Basic` 挑战(错凭据同挑战)。库的 Basic 是挑战门控且仅在 `/v2/` 探测点触发,匿名 200 面下凭据不会随库请求携带,故**枚举保留一处自建面**:`catalog` 命令走预带 Basic 头的显式请求(换轨令边界本为拉 manifest 加 blob,枚举不属换轨面,此例外记档);dctl 不做 tag 发现(引擎版本锚为固定引用,latest 锚清单即总台此用途),回落链按 ref 拉取零影响。沿革:439402f8 为匿名读中间态(此前全挑战式,与本仓 stub 行为同形),终口径 c9c7fda9。
 
 ## Consequences
 

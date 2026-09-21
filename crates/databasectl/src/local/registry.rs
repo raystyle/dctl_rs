@@ -34,8 +34,22 @@ const MANIFEST_TYPES: [&str; 4] = [
 
 /// Basic credentials for the private registry, resolved from the carrier
 /// env or the local archive. Absent credentials are fine — the registry
-/// decides what needs auth.
-fn registry_credentials() -> Result<OciRegistryAuth> {
+/// decides what needs auth (pulls are anonymous on the R2 face).
+enum Credentials {
+    Anonymous,
+    Basic(String, String),
+}
+
+impl Credentials {
+    fn as_oci(&self) -> OciRegistryAuth {
+        match self {
+            Self::Anonymous => OciRegistryAuth::Anonymous,
+            Self::Basic(user, password) => OciRegistryAuth::Basic(user.clone(), password.clone()),
+        }
+    }
+}
+
+fn registry_credentials() -> Result<Credentials> {
     if let Some(text) = std::env::var(AUTH_ENV).ok().filter(|s| !s.is_empty()) {
         return parse_credentials(&text);
     }
@@ -47,7 +61,7 @@ fn registry_credentials() -> Result<OciRegistryAuth> {
             ))
         })?;
     let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(OciRegistryAuth::Anonymous);
+        return Ok(Credentials::Anonymous);
     };
     warn_if_insecure(&path);
     parse_credentials(text.trim())
@@ -55,16 +69,13 @@ fn registry_credentials() -> Result<OciRegistryAuth> {
 
 /// Accept `user:password` or a ready basic token; anything else is an
 /// explicit error naming the expected shape.
-fn parse_credentials(text: &str) -> Result<OciRegistryAuth> {
+fn parse_credentials(text: &str) -> Result<Credentials> {
     use base64::Engine as _;
     if text.is_empty() {
-        return Ok(OciRegistryAuth::Anonymous);
+        return Ok(Credentials::Anonymous);
     }
     if let Some((user, password)) = text.split_once(':') {
-        return Ok(OciRegistryAuth::Basic(
-            user.to_string(),
-            password.to_string(),
-        ));
+        return Ok(Credentials::Basic(user.to_string(), password.to_string()));
     }
     if let Some(token) = text.strip_prefix("Basic ") {
         let decoded = base64::engine::general_purpose::STANDARD
@@ -76,7 +87,7 @@ fn parse_credentials(text: &str) -> Result<OciRegistryAuth> {
                     .map(|(user, password)| (user.to_string(), password.to_string()))
             });
         if let Some((user, password)) = decoded {
-            return Ok(OciRegistryAuth::Basic(user, password));
+            return Ok(Credentials::Basic(user, password));
         }
     }
     Err(Error::Registry(
@@ -141,6 +152,10 @@ pub(crate) struct RegistryClient {
     auth: OciRegistryAuth,
     /// host[:port] of the endpoint, scheme already resolved into the config
     registry: String,
+    scheme: &'static str,
+    credentials: Credentials,
+    /// enumeration needs an explicit preemptive Basic request; see catalog()
+    http: reqwest::Client,
 }
 
 impl RegistryClient {
@@ -164,25 +179,67 @@ impl RegistryClient {
             connect_timeout: Some(Duration::from_secs(30)),
             ..Default::default()
         };
+        let credentials = registry_credentials()?;
+        let http = crate::http::client_builder()
+            .timeout(Duration::from_secs(60))
+            .build()
+            .map_err(|error| Error::Registry(format!("http client: {error}")))?;
         Ok(Self {
             client: OciClient::new(config),
-            auth: registry_credentials()?,
+            auth: credentials.as_oci(),
             registry: host.trim_end_matches('/').to_string(),
+            scheme,
+            credentials,
+            http,
         })
     }
 
     /// Repository names from `/v2/_catalog`.
+    ///
+    /// Deliberately NOT the library call: oci-client's auth is
+    /// challenge-gated and only probes `/v2/`, which answers 200
+    /// anonymously under the R2 read contract, so its credentials never
+    /// ride and catalog would 401 forever regardless of the local
+    /// archive. Enumeration therefore stays a small self-built request
+    /// with a preemptive Basic header (the one self-built surface the
+    /// oci-client switch keeps; pulls stay fully on the library).
     pub(crate) async fn catalog(&self) -> Result<Vec<String>> {
-        let reference = Reference::with_tag(
-            self.registry.clone(),
-            "_catalog".to_string(),
-            "latest".to_string(),
-        );
-        self.client
-            .catalog(&reference, &self.auth, None, None)
+        use base64::Engine as _;
+        let Credentials::Basic(user, password) = &self.credentials else {
+            return Err(Error::Registry(
+                "registry catalog requires credentials (this face closes anonymous \
+                 enumeration); provide ~/.dctl/registry/auth or DCTL_REGISTRY_AUTH"
+                    .into(),
+            ));
+        };
+        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+        let response = self
+            .http
+            .get(format!("{}://{}/v2/_catalog", self.scheme, self.registry))
+            .header("Authorization", format!("Basic {token}"))
+            .send()
             .await
-            .map(|response| response.repositories)
-            .map_err(|error| Error::Registry(format!("registry catalog request failed: {error}")))
+            .map_err(|error| {
+                Error::Registry(format!("registry catalog request failed: {error}"))
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(Error::Registry(format!(
+                "registry catalog {status} (credentials rejected or unavailable)"
+            )));
+        }
+        let body: Value = response
+            .json()
+            .await
+            .map_err(|error| Error::Registry(format!("registry catalog decode failed: {error}")))?;
+        Ok(body["repositories"]
+            .as_array()
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|value| value.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     /// Fetch a manifest by reference, selecting the platform image when the

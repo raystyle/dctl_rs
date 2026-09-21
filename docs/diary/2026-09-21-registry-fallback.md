@@ -39,6 +39,13 @@ lan-linux(Docker 29.8.1,containerd 镜像存储)真 registry:2 + 真 daemon 端�
 - 经 herdr 派单 ohmycloud 工位:件 1 registry 命名裁定为 Hub 原名托管零映射(现存六仓均为原样先例;三引擎尚未托管,态缺,补种道 omc dist images push 经 tc-bj 中转,等总台令);件 2 裁定建 latest 锚清单机制(草案 postgres:18、falkordb/falkordb:v4.20.6、clickhouse/clickhouse-server:26.8,平台随上游 multi-arch,落点 catalog 侧镜像锚节);件 3 kid 注册完成(D1 pubkeys 直插,active,与 keys.rs 逐字一致)。
 - 本侧断言:keys.rs 常量对账一致;write-face 复测 `dctl ledger issue new` 冒烟即 issue #1 注册成功、401 消失,REQ-006 写面判据收口。
 
+## oci-client 换轨批与 R2 面专测轮(同日晚间)
+
+- 换轨批(3801d2e,总台转用户令):直连腿换 oci-client 0.18,评审 CONFIRM 零 F 项;真机三 digest 与自研腿逐字节一致;ADR-0008 追注换轨记录。
+- R2 面(registry.ohmygh.com Worker 化)当晚上线,口径两跳:439402f8 为匿名读中间态(此前全挑战式),终口径 c9c7fda9「匿名可拉取,不可枚举」(ping/manifests/blobs 匿名 200;catalog 与 tags/list 恒 401 加 Basic 挑战,错凭据同挑战)。本侧三面实证吻合。
+- 专测轮:三引擎生产面匿名拉取全过,postgres:18 digest 与 Hub 侧逐字节一致(0377e72c),两个 latest(bc33a0f4/13197149)属移动 tag 上游漂移,拉取与运行正常;回落链第二级实测(断 hosts 断 Hub)教科书级通过:Hub 失败原因通报、R2 回落、install 成功、链灌镜像 --pull=never 可运行。
+- 契约文档轮评审 F1(评审方抓的深坑):oci-client 挑战门控仅在 /v2/ 探测点触发,匿名 200 面下凭据永不随库请求携带,catalog 走库必 401,落密档也不解,「枚举须携凭据」高估了库能力。处置选代码侧:catalog 保留一处自建预带 Basic 的显式请求(换轨令边界本为拉 manifest 加 blob,枚举不在列,例外记档 ADR-0008);无凭据时报边界错且零外发请求(结构判别负例钉住)。真面枚举验证待密档落位。
+
 ## 流式化批(pull-streaming,同日第二批)
 
 registry-fallback 批 G5 记档的内存面收口,行为零变化:

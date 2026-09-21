@@ -497,7 +497,23 @@ fn catalog_lists_repositories() {
     let registry = StubRegistry::start(fixtures, false);
     let sandbox = Sandbox::new();
 
-    let output = sandbox.run(&registry.url(), &["local", "--json", "registry", "catalog"]);
+    // Enumeration rides a preemptive Basic request (the library call would
+    // stay anonymous under a no-challenge /v2/ face), so catalog needs the
+    // carrier.
+    let output = Command::new(dctl_binary())
+        .env_clear()
+        .env("HOME", sandbox.home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("DCTL_REGISTRY_URL", registry.url())
+        .env("DCTL_REGISTRY_AUTH", "fleet-user:secret-pass")
+        .env(
+            "DOCKER_HOST",
+            format!("unix://{}", sandbox.docker.socket.display()),
+        )
+        .current_dir(sandbox.home.path())
+        .args(["local", "--json", "registry", "catalog"])
+        .output()
+        .expect("run dctl");
     assert!(
         output.status.success(),
         "stderr: {}",
@@ -505,6 +521,23 @@ fn catalog_lists_repositories() {
     );
     let body: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(body["repositories"], json!(["db/tools"]));
+}
+
+#[test]
+fn catalog_without_credentials_reports_the_boundary() {
+    let fixtures = Arc::new(Fixtures::image("db/tools", "1.0", b"x"));
+    let registry = StubRegistry::start(fixtures, false);
+    let sandbox = Sandbox::new();
+
+    let output = sandbox.run(&registry.url(), &["local", "registry", "catalog"]);
+    assert!(!output.status.success());
+    // Structural discriminators: the failure is local and preemptive — no
+    // catalog request ever left the process.
+    let requests = registry.requests();
+    assert!(
+        !requests.iter().any(|line| line.contains("_catalog")),
+        "{requests:?}"
+    );
 }
 
 #[test]
