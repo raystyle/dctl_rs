@@ -1,15 +1,11 @@
 mod cli;
 mod error;
-#[cfg(feature = "telemetry")]
-mod failure;
 mod http;
 mod init;
 mod ledger;
 mod local;
 mod paths;
 mod skills;
-#[cfg(feature = "telemetry")]
-mod telemetry;
 mod update;
 mod user_agent;
 
@@ -21,71 +17,37 @@ use error::{Error, Result};
 
 #[tokio::main]
 async fn main() {
-    // Snapshot the executable path before the command runs: a successful
-    // `dctl update` replaces the binary on disk, after which a lazy
-    // `current_exe()` lookup fails on Linux and the update's own telemetry
-    // event would be dropped.
-    #[cfg(feature = "telemetry")]
-    telemetry::init();
-
-    // Parse via ArgMatches (rather than `Cli::try_parse()`) so the telemetry
-    // capture below can read the command path and passed-flag *names* from the
-    // clap definitions — argument values are never consulted. Argv is
-    // collected once so a failed parse can be re-walked by `capture_lossy`.
+    // Parse via ArgMatches (rather than `Cli::try_parse()`) so post-parse
+    // validation can attach errors to the right subcommand in the tree.
     let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
     let mut cmd = Cli::command();
 
     // Single-exit invariant (#320): every invocation — bare, help, version,
-    // typo, dispatched command — falls through to the common telemetry tail
-    // below.
-    // The sole intended exemption is the hidden `telemetry send` child inside
-    // `run_parsed`; the `exec()` handoffs (`local client`, host psql) record
-    // their event via `telemetry::finalize_before_exec` just before the
-    // process image is replaced. Child-process exit codes are returned as
-    // `Error::ChildExit` so they also flow through this tail. Do not add exit
-    // paths.
-    let outcome = match cmd.try_get_matches_from_mut(argv.iter()) {
+    // typo, dispatched command — falls through to this one exit. The `exec()`
+    // handoffs (`local client`, host psql) replace the process image and are
+    // the sanctioned departures. Child-process exit codes are returned as
+    // `Error::ChildExit` so they also flow through this tail. Do not add
+    // exit paths.
+    let exit_code = match cmd.try_get_matches_from_mut(argv.iter()) {
         Ok(matches) => {
-            #[cfg(feature = "telemetry")]
-            let mut invocation = telemetry::capture(&cmd, &matches);
-            // Stashed so the pre-exec hook can reach it from inside a
-            // handler when `exec()` makes the tail below unreachable.
-            #[cfg(feature = "telemetry")]
-            telemetry::stash_invocation(invocation.clone());
-            #[cfg(not(feature = "telemetry"))]
-            let invocation = ();
             // The matches were produced by this very `cmd`, so a mismatch is
             // a clap derive bug, not a user error.
             let cli = Cli::from_arg_matches(&matches)
                 .expect("Cli::from_arg_matches must accept matches from Cli::command()");
-            let read_only_telemetry_status = is_read_only_telemetry_status(&cli.command);
-            let run_result = match validate_post_parse(&cli, &mut cmd) {
-                Ok(()) => run_parsed(cli, read_only_telemetry_status).await,
+            match validate_post_parse(&cli, &mut cmd) {
+                Ok(()) => run_parsed(cli).await,
                 Err(e) => {
                     let _ = e.print();
-                    (e.exit_code(), false, false)
+                    e.exit_code()
                 }
-            };
-            let (exit_code, is_child_exit, defer_telemetry_notice) = run_result;
-            #[cfg(feature = "telemetry")]
-            if is_child_exit {
-                invocation.mark_child_exit();
             }
-            #[cfg(not(feature = "telemetry"))]
-            let _ = is_child_exit;
-            (
-                exit_code,
-                invocation,
-                defer_telemetry_notice,
-                read_only_telemetry_status,
-            )
         }
         Err(e) => {
             // clap keeps its own formatting and colors; help/version print to
             // stdout, usage errors to stderr. Print failures are swallowed
             // like clap's own `Error::exit` swallows them: a broken pipe must
-            // not turn exit 2 into a panic (which would also bypass the
-            // telemetry tail below).
+            // not turn exit 2 into a panic (which would also bypass this
+            // single exit).
             let _ = e.print();
             match e.kind() {
                 // --version always hits the network to refresh the cache + timer,
@@ -97,35 +59,13 @@ async fn main() {
                 // --help shows the notice from cache (no blocking network call).
                 ErrorKind::DisplayHelp => update::print_cached_update_notice(),
                 // Usage errors do no update-cache work: a mistyped invocation
-                // must not cause network activity beyond the consented
-                // telemetry send.
+                // must not cause network activity.
                 _ => {}
             }
-            #[cfg(feature = "telemetry")]
-            let invocation = telemetry::capture_lossy(&mut cmd, &argv, &e);
-            #[cfg(not(feature = "telemetry"))]
-            let invocation = ();
             // clap's own exit codes: 0 for help/version, 2 for usage errors.
-            // Dispatched commands reserve 3 for cancellation, so 2 remains
-            // unambiguous to shell callers.
-            (e.exit_code(), invocation, false, false)
+            e.exit_code()
         }
     };
-    let (exit_code, telemetry_invocation, defer_telemetry_notice, read_only_telemetry_status) =
-        outcome;
-
-    // Consent is evaluated here, after the command ran, so `telemetry disable`
-    // silences its own event and `telemetry enable` sends one.
-    #[cfg(feature = "telemetry")]
-    if !read_only_telemetry_status {
-        telemetry::finalize(telemetry_invocation, exit_code, defer_telemetry_notice);
-    }
-    #[cfg(not(feature = "telemetry"))]
-    {
-        let () = telemetry_invocation;
-        let _ = defer_telemetry_notice;
-        let _ = read_only_telemetry_status;
-    }
 
     std::process::exit(exit_code);
 }
@@ -171,29 +111,15 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
 }
 
 /// Run a successfully parsed invocation to completion and report the exit
-/// code for `main`'s single exit, whether it came from a child process, and
-/// whether a structured error requires deferring the first-run telemetry notice.
-/// The hidden `telemetry send` child is the one deliberate early exit in the
-/// binary: it does exactly one POST — no update-cache refresh, no dispatch,
-/// and no telemetry hook of its own, so a send can never trigger another send.
-async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, bool) {
-    #[cfg(feature = "telemetry")]
-    if matches!(
-        cli.command,
-        Commands::Telemetry(cli::TelemetryArgs {
-            command: cli::TelemetryCommands::Send,
-            ..
-        })
-    ) {
-        telemetry::run_child_send().await;
-        std::process::exit(0);
-    }
-
+/// code for `main`'s single exit. The `exec()` handoffs (`local client`,
+/// host psql) replace the process image mid-run and are the sanctioned
+/// departures from that invariant.
+async fn run_parsed(cli: Cli) -> i32 {
     // Spawn a background task to refresh the update cache for non-update
     // commands. The refresh is gated to one network call per 24h; the notice
     // below is driven off whatever the cache currently holds.
     let is_update_cmd = matches!(cli.command, Commands::Update(_));
-    let cache_refresh = if !is_update_cmd && !read_only_telemetry_status {
+    let cache_refresh = if !is_update_cmd {
         Some(tokio::spawn(update::refresh_update_cache()))
     } else {
         None
@@ -216,8 +142,8 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
         let _ = tokio::time::timeout(std::time::Duration::from_millis(500), handle).await;
     }
 
-    let (exit_code, is_child_exit, defer_telemetry_notice) = match result {
-        Ok(()) => (0, false, false),
+    let exit_code = match result {
+        Ok(()) => 0,
         Err(e) => {
             let is_child_exit = matches!(&e, Error::ChildExit(_));
             if !is_child_exit {
@@ -225,13 +151,12 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
                     _ if local_json => local::output::print_error(&e),
                     _ => {
                         use std::io::Write;
-                        // Not `eprintln!`, which panics on a closed stderr — see
-                        // `telemetry::print_first_run_notice`.
+                        // Not `eprintln!`, which panics on a closed stderr.
                         let _ = writeln!(std::io::stderr(), "Error: {}", e);
                     }
                 }
             }
-            (e.exit_code(), is_child_exit, local_json && !is_child_exit)
+            e.exit_code()
         }
     };
 
@@ -241,27 +166,7 @@ async fn run_parsed(cli: Cli, read_only_telemetry_status: bool) -> (i32, bool, b
         update::print_cached_update_notice();
     }
 
-    (exit_code, is_child_exit, defer_telemetry_notice)
-}
-
-/// `telemetry status` reports persisted consent without changing any global
-/// state itself: it neither records a telemetry event nor refreshes the update
-/// cache. Keep this check on the parsed enum so aliases or argument text can
-/// never accidentally select the exemption.
-#[cfg(feature = "telemetry")]
-fn is_read_only_telemetry_status(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Telemetry(cli::TelemetryArgs {
-            command: cli::TelemetryCommands::Status,
-            ..
-        })
-    )
-}
-
-#[cfg(not(feature = "telemetry"))]
-fn is_read_only_telemetry_status(_command: &Commands) -> bool {
-    false
+    exit_code
 }
 
 /// The explicit `--json` flag for a command, or `None` for commands that never
@@ -273,8 +178,6 @@ fn command_json_flag(cmd: &Commands) -> Option<bool> {
         Commands::Local(args) => Some(args.json),
         Commands::Ledger(args) => Some(args.json),
         Commands::Skills(args) => Some(args.json),
-        #[cfg(feature = "telemetry")]
-        Commands::Telemetry(args) => Some(args.json),
     }
 }
 
@@ -311,8 +214,6 @@ async fn run(cmd: Commands) -> Result<()> {
         }
         Commands::Skills(args) => run_skills(args).await,
         Commands::Update(args) => run_update(args).await,
-        #[cfg(feature = "telemetry")]
-        Commands::Telemetry(args) => telemetry::run_command(args.command, json_output(args.json)),
     }
 }
 
@@ -408,17 +309,6 @@ mod tests {
         );
         // The update command never surfaces the notice.
         assert_eq!(command_json_flag(&parse(&["dctl", "update"])), None);
-        // Telemetry inherits --json on its subcommands.
-        #[cfg(feature = "telemetry")]
-        assert_eq!(
-            command_json_flag(&parse(&["dctl", "telemetry", "status"])),
-            Some(false)
-        );
-        #[cfg(feature = "telemetry")]
-        assert_eq!(
-            command_json_flag(&parse(&["dctl", "telemetry", "status", "--json"])),
-            Some(true)
-        );
     }
 
     #[test]

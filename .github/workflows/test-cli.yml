@@ -15,7 +15,7 @@ permissions:
   contents: read
 
 env:
-  DO_NOT_TRACK: "1"
+
 
 jobs:
   test:
@@ -34,10 +34,6 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -p databasectl -- -D warnings
-
-      # Telemetry must compile out entirely for distro packagers.
-      - name: Check without default features (telemetry compiled out)
-        run: cargo check -p databasectl --no-default-features
 
       - name: Clippy without default features
         run: cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings

@@ -7,9 +7,8 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 ## Commands
 
 - `cargo fmt --all`:提交前必跑(fmt.yml 门禁同款)
-- `cargo clippy -p databasectl --all-targets --features telemetry -- -D warnings`:telemetry 开启配置
-- `cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings`:telemetry 编译排除配置
-- `cargo test -p databasectl`:默认 feature 测试;改 telemetry.rs 或 failure.rs 时改跑 `cargo test -p databasectl --features telemetry`
+- `cargo clippy -p databasectl --all-targets -- -D warnings`
+- `cargo test -p databasectl`
 - `python3 scripts/tests/test_classify_install_integration.py`:改安装分类器或其路径映射后必跑
 
 ## Must
@@ -23,7 +22,6 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 
 - 不写措辞钉死测试(`help.contains(...)`、`include_str!` README、整屏相等);只测结构(解析结果、默认值、隐藏旗标隐藏)
 - 不把逻辑堆进 main.rs:单出口不变量,新命令处理器进 `src/local/` 专属模块(配方见 `docs/guides/adding-a-command.md`)
-- 不在 telemetry.rs 与 failure.rs 上建新功能:feature 隔离且在删除路线上(ADR-0003)
 - 不改 builds.clickhouse.com 与 packages.clickhouse.com 产品下载 URL(那是 ClickHouse 产品的下载源,非本项目身份)
 - 不手改生成物,不另写第二份命令面真相文档
 

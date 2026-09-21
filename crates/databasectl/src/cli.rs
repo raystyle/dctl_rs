@@ -57,47 +57,6 @@ CONTEXT FOR AGENTS:
 
     /// Update dctl to the latest version
     Update(UpdateArgs),
-
-    /// Manage anonymous usage telemetry
-    #[cfg(feature = "telemetry")]
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Collected: command name, flag and argument names (never their values), success/failure, version,
-  OS/arch, CI/agent detection. No user or machine IDs.
-  DO_NOT_TRACK=1 also disables telemetry, without writing any config.
-  Details: https://clickhouse.com/docs/concepts/features/interfaces/cli#telemetry")]
-    Telemetry(TelemetryArgs),
-}
-
-#[cfg(feature = "telemetry")]
-#[derive(Args, Debug)]
-pub struct TelemetryArgs {
-    /// Output as JSON
-    #[arg(long, global = true, display_order = help_order::JSON)]
-    pub json: bool,
-
-    #[command(subcommand)]
-    pub command: TelemetryCommands,
-}
-
-#[cfg(feature = "telemetry")]
-#[derive(Subcommand, Debug)]
-pub enum TelemetryCommands {
-    /// Enable anonymous usage telemetry
-    Enable,
-    /// Disable anonymous usage telemetry
-    Disable,
-    /// Show whether telemetry is enabled and why
-    Status,
-    /// (internal) Fire one telemetry POST from DCTL_TELEMETRY_PAYLOAD and exit
-    //
-    // Stable cross-version interface — never remove or rename. After a
-    // self-update the parent (old version) spawns the freshly installed
-    // binary (new version) as `telemetry send` with the payload in
-    // DCTL_TELEMETRY_PAYLOAD, so this subcommand and that env var must keep
-    // working across releases.
-    #[command(hide = true)]
-    Send,
 }
 
 #[derive(Args, Debug)]
@@ -597,90 +556,6 @@ mod tests {
         let message = error.to_string();
         for agent in crate::skills::supported_agent_keys() {
             assert!(message.contains(agent), "missing `{agent}`: {message}");
-        }
-    }
-
-    #[cfg(feature = "telemetry")]
-    #[test]
-    fn parses_telemetry_subcommands() {
-        for (arg, expected) in [
-            ("enable", "Enable"),
-            ("disable", "Disable"),
-            ("status", "Status"),
-            ("send", "Send"),
-        ] {
-            let cli = Cli::try_parse_from(["dctl", "telemetry", arg]).unwrap();
-            let Commands::Telemetry(args) = cli.command else {
-                panic!("expected telemetry command for {arg}");
-            };
-            assert_eq!(format!("{:?}", args.command), expected);
-        }
-    }
-
-    #[cfg(feature = "telemetry")]
-    #[test]
-    fn telemetry_requires_a_subcommand() {
-        assert!(Cli::try_parse_from(["dctl", "telemetry"]).is_err());
-    }
-
-    #[test]
-    fn management_commands_parse_json_without_changing_defaults() {
-        for json in [false, true] {
-            for command in ["skills", "update"] {
-                let mut argv = vec!["dctl", command];
-                if json {
-                    argv.push("--json");
-                }
-                let cli = Cli::try_parse_from(argv).unwrap();
-                match cli.command {
-                    Commands::Skills(args) => {
-                        assert_eq!(args.json, json);
-                        assert!(!args.all && !args.detected_only && !args.global);
-                        assert!(args.agents.is_empty());
-                    }
-                    Commands::Update(args) => {
-                        assert_eq!(args.json, json);
-                        assert!(!args.check);
-                    }
-                    _ => unreachable!(),
-                }
-            }
-        }
-        let cli = Cli::try_parse_from(["dctl", "update", "--check", "--json"]).unwrap();
-        let Commands::Update(args) = cli.command else {
-            panic!("update")
-        };
-        assert!(args.check && args.json);
-        let cli = Cli::try_parse_from([
-            "dctl",
-            "skills",
-            "--agent",
-            "claude,codex",
-            "--global",
-            "--json",
-        ])
-        .unwrap();
-        let Commands::Skills(args) = cli.command else {
-            panic!("skills")
-        };
-        assert!(args.global && args.json);
-        assert_eq!(args.agents, ["claude", "codex"]);
-    }
-
-    #[cfg(feature = "telemetry")]
-    #[test]
-    fn telemetry_json_is_available_before_and_after_each_subcommand() {
-        for command in ["status", "enable", "disable"] {
-            for argv in [
-                vec!["dctl", "telemetry", "--json", command],
-                vec!["dctl", "telemetry", command, "--json"],
-            ] {
-                let cli = Cli::try_parse_from(argv).unwrap();
-                let Commands::Telemetry(args) = cli.command else {
-                    panic!("telemetry")
-                };
-                assert!(args.json);
-            }
         }
     }
 }
