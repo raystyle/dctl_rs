@@ -10,8 +10,6 @@ permissions:
   contents: read
 
 env:
-  DO_NOT_TRACK: "1"
-
 jobs:
   build:
     name: Build ${{ matrix.target }}
@@ -126,7 +124,6 @@ jobs:
       - name: Run smoke test in ${{ matrix.distro }}
         run: |
           docker run --rm \
-            -e DO_NOT_TRACK=1 \
             -v "${BIN_PATH}:/usr/local/bin/dctl:ro" \
             ${{ matrix.distro }} \
             sh -c 'dctl --version && dctl --help'

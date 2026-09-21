@@ -14,7 +14,6 @@
 # at target/debug/dctl relative to the repo root.
 set -u
 
-export DO_NOT_TRACK=1
 
 CTL="${1:-${CLICKHOUSECTL:-}}"
 if [[ -z "$CTL" ]]; then
