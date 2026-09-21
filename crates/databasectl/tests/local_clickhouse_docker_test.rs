@@ -111,11 +111,11 @@ impl FakeDocker {
                 logs,
                 live_before_start,
                 discovered_stopped,
-                inspect_http_port,
-                inspect_native_port,
+                // inspect ports ride the shared cell, seeded synchronously
+                // in start(); tests may override via set_inspect_ports.
+                inspect_http_port: _,
+                inspect_native_port: _,
             } = scenario;
-            thread_inspect_ports.lock().unwrap().0 = inspect_http_port; // seeded; tests may override later
-            thread_inspect_ports.lock().unwrap().1 = inspect_native_port;
             let mut started = false;
             let inspect_ports = Arc::clone(&thread_inspect_ports);
             let discovered_body = format!(
@@ -140,7 +140,10 @@ impl FakeDocker {
                 stream
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("set fake Docker read timeout");
-                let request = read_request(&mut stream);
+                let Some(request) = read_request(&mut stream) else {
+                    let _ = stream.shutdown(Shutdown::Both);
+                    continue;
+                };
                 thread_requests.lock().unwrap().push(request.clone());
 
                 match (request.method.as_str(), request.path.as_str()) {
@@ -297,12 +300,18 @@ impl Drop for FakeDocker {
     }
 }
 
-fn read_request(stream: &mut UnixStream) -> DockerRequest {
+fn read_request(stream: &mut UnixStream) -> Option<DockerRequest> {
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 4096];
     let header_end = loop {
-        let count = stream.read(&mut buffer).expect("read fake Docker request");
-        assert!(count > 0, "Docker request ended before its headers");
+        let count = stream
+            .read(&mut buffer)
+            .expect("read fake Docker request socket");
+        if count == 0 {
+            // The client hung up before sending anything (its own timeout);
+            // not this daemon's problem.
+            return None;
+        }
         bytes.extend_from_slice(&buffer[..count]);
         if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
             break index + 4;
@@ -321,17 +330,21 @@ fn read_request(stream: &mut UnixStream) -> DockerRequest {
         .expect("valid Content-Length")
         .unwrap_or(0);
     while bytes.len() - header_end < content_length {
-        let count = stream.read(&mut buffer).expect("read fake Docker body");
-        assert!(count > 0, "Docker request ended before its body");
+        let count = stream
+            .read(&mut buffer)
+            .expect("read fake Docker request socket");
+        if count == 0 {
+            return None;
+        }
         bytes.extend_from_slice(&buffer[..count]);
     }
     let request_line = headers.lines().next().expect("HTTP request line");
     let mut request_parts = request_line.split_whitespace();
-    DockerRequest {
+    Some(DockerRequest {
         method: request_parts.next().expect("HTTP method").to_string(),
         path: request_parts.next().expect("HTTP path").to_string(),
         body: String::from_utf8_lossy(&bytes[header_end..header_end + content_length]).into_owned(),
-    }
+    })
 }
 
 fn write_json(stream: &mut UnixStream, status: u16, body: &str) {
@@ -350,10 +363,9 @@ fn write_response(stream: &mut UnixStream, status: u16, content_type: &str, body
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream
+    let _ = stream
         .write_all(headers.as_bytes())
-        .and_then(|()| stream.write_all(body))
-        .expect("write fake Docker response");
+        .and_then(|()| stream.write_all(body));
 }
 
 /// A real localhost HTTP server standing in for the ClickHouse HTTP
@@ -490,10 +502,9 @@ fn respond_tcp(stream: &mut std::net::TcpStream, status: u16, body: &str) {
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    stream
+    let _ = stream
         .write_all(headers.as_bytes())
-        .and_then(|()| stream.write_all(body.as_bytes()))
-        .expect("write fake ClickHouse HTTP response");
+        .and_then(|()| stream.write_all(body.as_bytes()));
 }
 
 /// Like `start_after`, but POSTs with an Authorization header get a 516 —
