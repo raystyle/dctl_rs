@@ -148,10 +148,6 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
             with self.subTest(workflow=name):
                 self.assertIn(command, workflow.read_text())
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_declared_paths_all_exist(self):
         """The tables may not carry ghosts: every declared path must exist.
 
@@ -170,3 +166,7 @@ if __name__ == "__main__":
                     (classifier.REPO_ROOT / path).is_file(),
                     f"declared path does not exist: {path}",
                 )
+
+
+if __name__ == "__main__":
+    unittest.main()
