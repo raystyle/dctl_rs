@@ -362,7 +362,6 @@ impl Project {
     fn run(&self, args: &[&str]) -> Output {
         Command::new(dctl_binary())
             .env_clear()
-            .env("DO_NOT_TRACK", "1")
             .env("HOME", self.home.path())
             .env("PATH", "/usr/bin:/bin")
             .env("DOCKER_HOST", format!("unix://{}", self.socket.display()))

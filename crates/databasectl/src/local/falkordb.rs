@@ -1300,14 +1300,6 @@ fn exec_host_redis_cli(cli_args: &[String], password: Option<&str>) -> Result<()
     if let Some(password) = password {
         cmd.env("REDISCLI_AUTH", password);
     }
-    // `exec()` replaces the process image on success, so `main`'s telemetry
-    // tail never runs for this invocation; record the censored handoff
-    // attempt now (#320, #471). The caller probes for `redis-cli` first, so
-    // only a race can fail below this line; `redis-cli` then inherits this
-    // process's stdio, process group, session and controlling TTY unchanged,
-    // which is why the handoff stays an `exec()`.
-    #[cfg(feature = "telemetry")]
-    crate::telemetry::finalize_before_exec();
     let err = cmd.exec();
     Err(Error::DockerError(format!(
         "could not execute redis-cli: {err}"

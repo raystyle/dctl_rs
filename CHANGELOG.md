@@ -2,7 +2,8 @@
 
 ## 未发布
 
-- **ledger 权限收口(REQ-006,总台统一裁)**:`dctl ledger` 移除 `issue close`、`artifact promote` 与 attest 的 `promote/demote/supersede` 类别——本 CLI 只增 issue 与产物及验证类 attest;关闭与删除唯一道走 omc 工位(`omc ledger issue status <repo> <n> <to>` / `omc ledger issue delete`)。自研签名道退役,改为共享 ledger-client crate(v0.1.1)。
+- **遥测退役(REQ-002,ADR-0003)**:telemetry.rs、failure.rs 与 telemetry 命令族整体删除(约 4300 行);无采集、无上报、`DCTL_TELEMETRY_URL`/`DO_NOT_TRACK` 环境变量随之消失。退出码契约:0 成功、1 错误、2 usage、子进程码经 ChildExit 透传。
+- **ledger 权限收口(REQ-006,总台统一裁)**:`dctl ledger` 移除 `issue close`、`artifact promote` 与 attest 的 `promote/demote/supersede` 类别:本 CLI 只增 issue 与产物及验证类 attest;关闭与删除唯一道走 omc 工位(`omc ledger issue status <repo> <n> <to>` / `omc ledger issue delete`)。自研签名道退役,改为共享 ledger-client crate(v0.1.1)。
 
 ## v0.6.0
 

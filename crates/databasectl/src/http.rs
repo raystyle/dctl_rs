@@ -1,15 +1,11 @@
 //! Canonical construction of outbound HTTP clients.
 //!
-//! Every `reqwest::Client` the CLI builds — Cloud API, OAuth, the updater, the
-//! version manager — goes through [`client_builder`], so they uniformly carry
+//! Every `reqwest::Client` the CLI builds — the three Docker engines, the
+//! updater, the ledger client — goes through [`client_builder`], so they uniformly carry
 //! the `User-Agent` (built in `crate::user_agent`) and the agent
 //! session/trace correlation headers, and any future builder picks these up
 //! for free.
 //!
-//! Deliberate exception: the telemetry send child (`crate::telemetry`) builds
-//! its own client with only the User-Agent. Attaching the agent session/trace
-//! headers there would let the backend correlate anonymous telemetry events
-//! with an agent session.
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 
@@ -19,7 +15,7 @@ const AGENT_SESSION_ID: HeaderName = HeaderName::from_static("agent-session-id")
 const TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 
 /// Default headers that correlate every outbound request with the calling AI
-/// agent's session/trace, so backend telemetry can group a single agent run's
+/// agent's session/trace, so a backend can group a single agent run's
 /// calls. Empty when not running under a detected agent (or the agent exposes
 /// neither id).
 pub fn agent_headers() -> HeaderMap {

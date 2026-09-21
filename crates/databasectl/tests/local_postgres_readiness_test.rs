@@ -447,7 +447,6 @@ fn write_dotenv_server(project: &Path) {
 fn run_start(
     scenario: DockerScenario,
     resumed: bool,
-    telemetry_debug: bool,
     wait_timeout: u16,
     preexisting_data: bool,
 ) -> (
@@ -470,15 +469,6 @@ fn run_start(
             .expect("create pre-existing Postgres data directory");
         std::fs::write(marker, "keep").expect("write pre-existing data marker");
     }
-    if telemetry_debug {
-        let telemetry_dir = home.path().join(".dctl");
-        std::fs::create_dir_all(&telemetry_dir).expect("create telemetry state directory");
-        std::fs::write(
-            telemetry_dir.join("telemetry.json"),
-            r#"{"disabled":false}"#,
-        )
-        .expect("enable telemetry");
-    }
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(&socket_path, project.path(), scenario);
     let output = run_start_command(
@@ -486,7 +476,6 @@ fn run_start(
         project.path(),
         &socket_path,
         resumed,
-        telemetry_debug,
         wait_timeout,
     );
     let requests = docker.requests();
@@ -498,7 +487,6 @@ fn run_start_command(
     project: &Path,
     socket_path: &Path,
     resumed: bool,
-    telemetry_debug: bool,
     wait_timeout: u16,
 ) -> Output {
     let _guard = START_COMMAND_LOCK
@@ -524,11 +512,6 @@ fn run_start_command(
         command.args(["--name", "default"]);
     } else {
         command.args(["--port", &port, "--password", "fresh-secret"]);
-    }
-    if telemetry_debug {
-        command.env("DCTL_TELEMETRY_DEBUG", "1");
-    } else {
-        command.env("DO_NOT_TRACK", "1");
     }
     // Bound hangs after acquiring the fixture lock, independently of the
     // readiness deadline under test. Capturing on another thread also drains
@@ -595,7 +578,6 @@ fn fresh_start_waits_for_delayed_postgres_readiness_without_exposing_password() 
             write_partial_data: false,
             create_metadata_directory_on_start: false,
         },
-        false,
         false,
         2,
         false,
@@ -666,7 +648,6 @@ fn postgres_dotenv_releases_metadata_lock_before_docker_credentials_read() {
 
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project.path())
@@ -720,7 +701,6 @@ fn postgres_start_revalidates_metadata_after_image_inspection() {
 
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project.path())
@@ -773,7 +753,6 @@ fn resumed_start_also_waits_for_postgres_readiness() {
             create_metadata_directory_on_start: false,
         },
         true,
-        false,
         2,
         false,
     );
@@ -808,7 +787,6 @@ fn wall_clock_timeout_fails_and_rolls_back_fresh_data() {
             write_partial_data: false,
             create_metadata_directory_on_start: false,
         },
-        false,
         false,
         1,
         false,
@@ -849,7 +827,7 @@ fn wall_clock_timeout_fails_and_rolls_back_fresh_data() {
 }
 
 #[test]
-fn immediate_exit_redacts_bounded_logs_without_setup_success_or_telemetry_noise() {
+fn immediate_exit_redacts_bounded_logs_without_claiming_success() {
     let mut logs: Vec<String> = (0..80)
         .map(|index| format!("startup line {index}: {}", "x".repeat(300)))
         .collect();
@@ -867,7 +845,6 @@ fn immediate_exit_redacts_bounded_logs_without_setup_success_or_telemetry_noise(
             create_metadata_directory_on_start: false,
         },
         false,
-        true,
         2,
         false,
     );
@@ -912,7 +889,6 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
             write_partial_data: false,
             create_metadata_directory_on_start: false,
         },
-        false,
         false,
         2,
         true,
@@ -961,7 +937,6 @@ fn incomplete_container_cleanup_retains_pgdata_and_recovery_metadata() {
             write_partial_data: false,
             create_metadata_directory_on_start: false,
         },
-        false,
         false,
         2,
         false,
@@ -1032,7 +1007,7 @@ fn create_success_start_failure_rolls_back_exact_container_and_fresh_data() {
         },
     );
 
-    let output = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+    let output = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     let requests = docker.requests();
 
     assert_eq!(output.status.code(), Some(1));
@@ -1069,7 +1044,7 @@ fn initialization_timeout_removes_partial_pgdata() {
         },
     );
 
-    let output = run_start_command(home.path(), project.path(), &socket_path, false, false, 1);
+    let output = run_start_command(home.path(), project.path(), &socket_path, false, 1);
     let requests = docker.requests();
 
     assert_eq!(output.status.code(), Some(1));
@@ -1108,7 +1083,7 @@ fn metadata_failure_uses_the_fresh_start_rollback() {
         },
     );
 
-    let output = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+    let output = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     let requests = docker.requests();
 
     assert_eq!(output.status.code(), Some(1));
@@ -1144,11 +1119,11 @@ fn retry_after_rolled_back_start_failure_succeeds_cleanly() {
         },
     );
 
-    let first = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+    let first = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     assert_eq!(first.status.code(), Some(1));
     assert!(!fresh_instance_dir(project.path()).exists());
 
-    let second = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+    let second = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     let requests = docker.requests();
 
     assert!(
@@ -1195,7 +1170,7 @@ fn resume_failure_preserves_existing_container_metadata_and_data() {
         },
     );
 
-    let output = run_start_command(home.path(), project.path(), &socket_path, true, false, 2);
+    let output = run_start_command(home.path(), project.path(), &socket_path, true, 2);
     let requests = docker.requests();
 
     assert_eq!(output.status.code(), Some(1));
@@ -1228,7 +1203,7 @@ fn cleanup_failure_preserves_rollback_behavior_but_redacts_json_diagnostics() {
         },
     );
 
-    let output = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+    let output = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     let requests = docker.requests();
 
     assert_eq!(output.status.code(), Some(1));
@@ -1265,7 +1240,7 @@ fn removing_running_postgres_preserves_instance_and_supplies_stop_recovery() {
                 create_metadata_directory_on_start: false,
             },
         );
-        let started = run_start_command(home.path(), project.path(), &socket_path, false, false, 2);
+        let started = run_start_command(home.path(), project.path(), &socket_path, false, 2);
         assert!(started.status.success(), "{:?}", started);
         let servers = project.path().join(".dctl/servers");
         let metadata_path = servers.join(format!("{name}-pg18.json"));
@@ -1293,7 +1268,6 @@ fn removing_running_postgres_preserves_instance_and_supplies_stop_recovery() {
             command
                 .env_clear()
                 .env("HOME", home.path())
-                .env("DO_NOT_TRACK", "1")
                 .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
                 .current_dir(project.path())
                 .args(["local", "postgres", "remove"]);

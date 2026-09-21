@@ -40,7 +40,6 @@ impl Project {
         let mut command = Command::new(env!("CARGO_BIN_EXE_dctl"));
         command
             .env_clear()
-            .env("DO_NOT_TRACK", "1")
             .env("HOME", self.directory.path())
             .env("PATH", "/usr/bin:/bin")
             .env("DOCKER_HOST", docker_host)

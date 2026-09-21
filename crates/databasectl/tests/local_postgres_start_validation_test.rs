@@ -166,7 +166,6 @@ fn run_invalid_start(args: &[&str]) -> (Output, usize, bool) {
     let docker = FakeDocker::start(&socket_path);
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project.path())
@@ -210,7 +209,6 @@ fn run_resume(
     let mut command = Command::new(dctl_binary());
     command
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home)
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project)
@@ -375,7 +373,6 @@ fn postgres_start_help_renders_clap_structure() {
     let home = tempfile::tempdir().expect("create home tempdir");
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .args(["local", "postgres", "start", "--help"])
         .output()
@@ -447,7 +444,6 @@ fn postgres_lifecycle_and_dotenv_name_forms_select_the_same_instance() {
         for action in ["dotenv", "stop", "remove"] {
             let output = Command::new(dctl_binary())
                 .env_clear()
-                .env("DO_NOT_TRACK", "1")
                 .env("HOME", home.path())
                 .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
                 .current_dir(project.path())

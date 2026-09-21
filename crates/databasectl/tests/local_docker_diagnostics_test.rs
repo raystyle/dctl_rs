@@ -13,7 +13,6 @@ fn dctl_binary() -> PathBuf {
 fn run_postgres_start(home: &Path, project: &Path, docker_host: &str) -> Output {
     Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home)
         .env("DOCKER_HOST", docker_host)
         .current_dir(project)
@@ -127,7 +126,6 @@ fn missing_psql_reports_which_program_could_not_run() {
 
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("PATH", empty_path)
         .current_dir(project.path())

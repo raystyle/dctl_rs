@@ -123,7 +123,6 @@ impl Drop for Fixture {
 fn client_command(project: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_dctl"));
     command
-        .env("DO_NOT_TRACK", "1")
         // An empty directory forces fallback regardless of the host's tools.
         .env("PATH", project.join("empty-path"))
         .current_dir(project)
@@ -379,7 +378,6 @@ fn missing_host_file_fails_before_executing_query() {
         ]);
         command
             .env_clear()
-            .env("DO_NOT_TRACK", "1")
             .env("HOME", fixture.home.path())
             .env("PATH", fixture.project.path().join("empty-path"))
             .env(

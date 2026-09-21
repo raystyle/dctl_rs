@@ -335,8 +335,7 @@ pub fn print_cached_update_notice() {
         let current = env!("CARGO_PKG_VERSION");
         if is_newer(current, &cached_version) {
             use std::io::Write;
-            // Not `eprintln!`, which panics on a closed stderr — see
-            // `telemetry::print_first_run_notice`.
+            // Not `eprintln!`, which panics on a closed stderr.
             let _ = writeln!(
                 std::io::stderr(),
                 "\nThere is a new version of dctl. Update with `dctl update`."
