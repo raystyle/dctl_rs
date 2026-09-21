@@ -9,7 +9,7 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 - `cargo fmt --all`:提交前必跑(fmt.yml 门禁同款)
 - `cargo clippy -p databasectl --all-targets -- -D warnings`
 - `cargo test -p databasectl`
-- `python3 scripts/tests/test_classify_install_integration.py`:改安装分类器或其路径映射后必跑
+- `python3 scripts/tests/test_classify_install_integration.py`:改安装分类器、改其路径映射、或新增/移动 src 下 .rs 与 tests 下测试文件后必跑(清单守卫对未登记新文件 fail-closed,CI 同款)
 - `python3 scripts/check-md.py`:改任何 .md 后必跑(四类禁字门禁,CI 同款)
 
 ## Must
