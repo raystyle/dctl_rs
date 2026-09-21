@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 const DEFAULT_PG_PORT: u16 = 5432;
@@ -1095,30 +1094,12 @@ async fn client(
     extra_args: Vec<String>,
 ) -> Result<()> {
     if host.is_some() || port.is_some() {
-        // Direct connect — no server lookup; require host psql. Probing before
-        // the handoff (the same probe the managed path already uses to choose
-        // between host psql and `docker exec`) keeps a missing `psql` an
-        // ordinary error event instead of a censored `exec_attempt` (#471).
-        // `PostgresUsage`, not `Postgres`: this text is composed here, so it
-        // renders verbatim in `--json` and the repair hint reaches agents.
-        if !host_has_psql() {
-            return Err(Error::PostgresUsage(
-                "could not execute psql: not found on PATH (install the PostgreSQL client tools)"
-                    .to_string(),
-            ));
-        }
+        // Direct connect, native client (ADR-0009): no server lookup, the
+        // historical default credentials, no password — as before.
         let h = host.unwrap_or_else(|| "127.0.0.1".to_string());
         let p = port.unwrap_or(DEFAULT_PG_PORT);
-        return exec_host_psql(
-            &h,
-            p,
-            DEFAULT_USER,
-            None,
-            DEFAULT_DATABASE,
-            query,
-            queries_file,
-            extra_args,
-        );
+        let sql = gather_sql_input(query, queries_file)?;
+        return run_native_query(&h, p, DEFAULT_USER, None, DEFAULT_DATABASE, &sql).await;
     }
 
     let metadata_lock = server::lock_metadata()?;
@@ -1137,59 +1118,162 @@ async fn client(
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let (user, password, database) = read_pg_env(&docker, container_id).await;
 
-    // Prefer host psql; fall back to docker exec.
-    if host_has_psql() {
-        return exec_host_psql(
-            "127.0.0.1",
-            info.tcp_port,
-            &user,
-            Some(&password),
-            &database,
-            query,
-            queries_file,
-            extra_args,
-        );
-    }
-
     let explicit_input = query.is_some() || queries_file.is_some();
     let interactive =
         !explicit_input && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let mut psql_args: Vec<String> = vec!["-U".into(), user, "-d".into(), database];
-    if let Some(q) = query {
-        psql_args.push("-c".into());
-        psql_args.push(q);
+    if interactive {
+        // The psql REPL cannot be rebuilt from a library: interactive mode
+        // keeps the container's psql over docker exec (ADR-0009).
+        let mut psql_args: Vec<String> = vec!["-U".into(), user, "-d".into(), database];
+        psql_args.extend(extra_args);
+        return docker::exec_psql_in_container(&docker, container_id, &psql_args).await;
     }
-    // Host paths do not exist inside the container. Stream the selected file
-    // through psql's explicit stdin file argument, after any -c command.
-    let input: Option<Box<dyn std::io::Read + Send>> = match queries_file {
-        Some(file) => {
-            let reader: Box<dyn std::io::Read + Send> = if file == "-" {
-                Box::new(std::io::stdin())
-            } else {
-                Box::new(
-                    std::fs::File::open(&file).map_err(|error| Error::SqlInputOpen {
-                        path: file.into(),
-                        source: error,
-                    })?,
-                )
-            };
-            psql_args.extend(["-f".into(), "-".into()]);
-            Some(reader)
-        }
-        // Match host psql: without an explicit wrapper input, a non-terminal
-        // stdin is still SQL input. Docker must attach it and receive EOF.
-        None if !explicit_input && !interactive => Some(Box::new(std::io::stdin())),
-        None => None,
-    };
-    psql_args.extend(extra_args);
+    let sql = gather_sql_input(query, queries_file)?;
+    run_native_query(
+        "127.0.0.1",
+        info.tcp_port,
+        &user,
+        Some(&password),
+        &database,
+        &sql,
+    )
+    .await
+}
 
-    if !interactive {
-        // Non-interactive: no TTY, no raw mode, output goes to stdout/stderr
-        // so the caller can pipe / capture / redirect.
-        docker::exec_psql_one_shot(&docker, container_id, &psql_args, input).await
-    } else {
-        docker::exec_psql_in_container(&docker, container_id, &psql_args).await
+/// Resolve the SQL text for the programmatic path: an explicit query, a file
+/// ("-" for stdin), or — psql parity — a non-terminal stdin.
+fn gather_sql_input(query: Option<String>, queries_file: Option<String>) -> Result<String> {
+    if let Some(q) = query {
+        return Ok(q);
     }
+    if let Some(file) = queries_file {
+        if file == "-" {
+            return Ok(read_stdin_to_string());
+        }
+        return std::fs::read_to_string(&file).map_err(|error| Error::SqlInputOpen {
+            path: file.into(),
+            source: error,
+        });
+    }
+    Ok(read_stdin_to_string())
+}
+
+fn read_stdin_to_string() -> String {
+    let mut buffer = String::new();
+    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer);
+    buffer
+}
+
+/// One simple-protocol result set: column names plus row values (None is
+/// SQL NULL). Sets are grouped by column signature in
+/// [`group_simple_rows`].
+struct QuerySet {
+    columns: Vec<String>,
+    rows: Vec<Vec<Option<String>>>,
+}
+
+/// Group simple-query messages into result sets the way psql prints them:
+/// a `RowDescription` opens a statement's table (so empty SELECTs keep their
+/// headers), a `CommandComplete` closes it, and consecutive statements never
+/// merge — even with identical column signatures. Column-less completions
+/// (pure writes) render nothing, matching psql's silence for our purposes.
+fn group_simple_rows(messages: &[tokio_postgres::SimpleQueryMessage]) -> Vec<QuerySet> {
+    use tokio_postgres::SimpleQueryMessage;
+
+    let mut sets: Vec<QuerySet> = Vec::new();
+    let mut open: Option<QuerySet> = None;
+    for message in messages {
+        match message {
+            SimpleQueryMessage::RowDescription(columns) => {
+                if let Some(done) = open.take() {
+                    push_kept(&mut sets, done);
+                }
+                open = Some(QuerySet {
+                    columns: columns.iter().map(|c| c.name().to_string()).collect(),
+                    rows: Vec::new(),
+                });
+            }
+            SimpleQueryMessage::Row(row) => {
+                let set = open.get_or_insert_with(|| QuerySet {
+                    columns: row.columns().iter().map(|c| c.name().to_string()).collect(),
+                    rows: Vec::new(),
+                });
+                let values = (0..row.columns().len())
+                    .map(|index| row.try_get(index).ok().flatten().map(str::to_string))
+                    .collect();
+                set.rows.push(values);
+            }
+            SimpleQueryMessage::CommandComplete(_) => {
+                if let Some(done) = open.take() {
+                    push_kept(&mut sets, done);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(done) = open.take() {
+        push_kept(&mut sets, done);
+    }
+    sets
+}
+
+/// Column-less result sets are pure writes: psql prints a command tag we
+/// cannot reconstruct (the library reports only an affected count), so they
+/// are dropped rather than rendered as an empty headerless table.
+fn push_kept(sets: &mut Vec<QuerySet>, set: QuerySet) {
+    if !set.columns.is_empty() {
+        sets.push(set);
+    }
+}
+
+/// psql-style rendering: each result set becomes an aligned table with a
+/// row-count footer (shared renderer with the FalkorDB client).
+fn render_sets(sets: &[QuerySet]) -> String {
+    let mut out = String::new();
+    for set in sets {
+        out.push_str(&output::render_aligned_table(&set.columns, &set.rows, true));
+        let count = set.rows.len();
+        out.push_str(&format!(
+            "({count} row{})\n\n",
+            if count == 1 { "" } else { "s" }
+        ));
+    }
+    out
+}
+
+/// The native query leg (ADR-0009): connect with tokio-postgres over the
+/// container's published port and run the SQL through the simple protocol,
+/// which keeps psql's multi-statement semantics.
+async fn run_native_query(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    database: &str,
+    sql: &str,
+) -> Result<()> {
+    use tokio_postgres::NoTls;
+
+    let mut config = tokio_postgres::Config::new();
+    config.user(user).host(host).port(port).dbname(database);
+    if let Some(password) = password {
+        config.password(password);
+    }
+    let (client, connection) = config
+        .connect(NoTls)
+        .await
+        .map_err(|error| Error::Postgres(format!("could not connect to Postgres: {error}")))?;
+    tokio::spawn(async move {
+        if let Err(error) = connection.await {
+            eprintln!("postgres connection error: {error}");
+        }
+    });
+    let rows = client
+        .simple_query(sql)
+        .await
+        .map_err(|error| Error::Postgres(format!("{error}")))?;
+    print!("{}", render_sets(&group_simple_rows(&rows)));
+    Ok(())
 }
 
 /// Read POSTGRES_USER/PASSWORD/DB from the container's effective env so we
@@ -1209,51 +1293,6 @@ async fn read_pg_env(docker: &bollard::Docker, id: &str) -> (String, String, Str
         get("POSTGRES_PASSWORD").unwrap_or_default(),
         get("POSTGRES_DB").unwrap_or_else(|| DEFAULT_DATABASE.into()),
     )
-}
-
-fn host_has_psql() -> bool {
-    Command::new("psql")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn exec_host_psql(
-    host: &str,
-    port: u16,
-    user: &str,
-    password: Option<&str>,
-    database: &str,
-    query: Option<String>,
-    queries_file: Option<String>,
-    extra_args: Vec<String>,
-) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("psql");
-    cmd.arg("-h")
-        .arg(host)
-        .arg("-p")
-        .arg(port.to_string())
-        .arg("-U")
-        .arg(user)
-        .arg("-d")
-        .arg(database);
-    if let Some(p) = password {
-        cmd.env("PGPASSWORD", p);
-    }
-    if let Some(q) = query {
-        cmd.arg("-c").arg(q);
-    }
-    if let Some(f) = queries_file {
-        cmd.arg("-f").arg(f);
-    }
-    cmd.args(&extra_args);
-    let err = cmd.exec();
-    Err(Error::Postgres(format!("could not execute psql: {err}")))
 }
 
 fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool) -> Result<()> {
@@ -1323,6 +1362,61 @@ async fn read_pg_env_for_dotenv(container_id: &str) -> (String, String, String) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn set(columns: &[&str], rows: Vec<Vec<Option<&str>>>) -> QuerySet {
+        QuerySet {
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            rows: rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|value| value.map(str::to_string))
+                        .collect()
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn renders_aligned_tables_with_null_and_numeric_alignment() {
+        let rendered = render_sets(&[set(
+            &["id", "name"],
+            vec![vec![Some("1"), Some("alpha")], vec![Some("22"), None]],
+        )]);
+        assert!(rendered.contains("id | name\n"), "{rendered}");
+        assert!(rendered.contains("---+"), "{rendered}");
+        assert!(rendered.contains(" 1 | alpha"), "{rendered}");
+        assert!(rendered.contains("22 |"), "{rendered}");
+        assert!(rendered.contains("(2 rows)"), "{rendered}");
+    }
+
+    #[test]
+    fn renders_each_column_signature_as_its_own_table() {
+        let rendered = render_sets(&[
+            set(&["id"], vec![vec![Some("1")]]),
+            set(&["name"], vec![vec![Some("x")]]),
+        ]);
+        assert!(rendered.contains("\n\nname\n----"), "{rendered}");
+        assert_eq!(rendered.matches("(1 row)").count(), 2, "{rendered}");
+    }
+
+    #[test]
+    fn empty_set_renders_header_and_zero_rows() {
+        let rendered = render_sets(&[set(&["id", "name"], vec![])]);
+        assert!(rendered.contains("id | name\n"), "{rendered}");
+        assert!(rendered.contains("(0 rows)"), "{rendered}");
+    }
+
+    #[test]
+    fn numeric_detection_covers_scientific_and_signs_but_not_text() {
+        assert!(output::looks_numeric("42"));
+        assert!(output::looks_numeric("-3.5"));
+        assert!(output::looks_numeric("+1e9"));
+        assert!(!output::looks_numeric("12a"));
+        assert!(!output::looks_numeric(""));
+        assert!(!output::looks_numeric("late"));
+    }
+
     use std::cell::Cell;
     use std::collections::VecDeque;
 

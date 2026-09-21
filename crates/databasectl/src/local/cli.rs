@@ -86,6 +86,59 @@ impl LocalArgs {
         None
     }
 
+    /// Cross-flag constraints for the native client legs that clap cannot
+    /// express directly: trailing passthrough args are interactive-only, and
+    /// FalkorDB direct mode has no REPL so it requires --query. Reported at
+    /// the owning client subcommand as a usage error (exit 2).
+    pub(crate) fn client_usage_validation_error(&self, interactive: bool) -> Option<String> {
+        match &self.command {
+            LocalCommands::Postgres {
+                command:
+                    PostgresCommands::Client {
+                        args,
+                        query,
+                        queries_file,
+                        ..
+                    },
+            } => {
+                if !args.is_empty() && !(query.is_none() && queries_file.is_none() && interactive) {
+                    return Some(
+                        "extra psql arguments (after --) are only available in interactive \
+                         mode; run without --query/--queries-file"
+                            .into(),
+                    );
+                }
+            }
+            LocalCommands::Falkordb {
+                command:
+                    FalkorCommands::Client {
+                        args,
+                        host,
+                        port,
+                        query,
+                        ..
+                    },
+            } => {
+                if (host.is_some() || port.is_some()) && query.is_none() {
+                    return Some(
+                        "direct mode (--host/--port) requires --query; interactive sessions \
+                         need a managed instance"
+                            .into(),
+                    );
+                }
+                if !args.is_empty() && !(query.is_none() && interactive) {
+                    return Some(
+                        "extra redis-cli arguments (after --) are only available in \
+                         interactive mode"
+                            .into(),
+                    );
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     pub(crate) fn falkor_start_validation_error(&self) -> Option<String> {
         let LocalCommands::Falkordb {
             command: FalkorCommands::Start { env, .. },
@@ -381,12 +434,12 @@ CONTEXT FOR AGENTS:
     /// Connect to a running FalkorDB instance with redis-cli
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Managed mode (the default; NAME selects one) execs host `redis-cli` when it is on PATH, else
-  runs redis-cli inside the container via `docker exec`; the stored password authenticates.
-  Direct mode (--host/--port) requires `redis-cli` on PATH and reads no managed credentials —
-  bring auth through the passthrough args.
-  --query is a redis command: quote the Cypher, e.g. -q 'GRAPH.QUERY g \"MATCH (n) RETURN n\"'.
-  Put wrapper options before `--`; all arguments after it go to redis-cli.
+  Managed mode (the default; NAME selects one) connects with dctl's native FalkorDB client
+  over the container's published port; the stored password authenticates; no redis-cli needed.
+  Direct mode (--host/--port) connects to any Redis-protocol graph server; --password is optional.
+  --query takes a Cypher statement (redis-command passthrough retired 2026-09-22, ADR-0009);
+  --graph selects the graph (default \"g\"); piped stdin is one Cypher statement.
+  Put wrapper options before `--`; arguments after it reach redis-cli in interactive mode only.
   Interactive and --query output stays native, even with --json or a coding agent.")]
     Client {
         /// Managed instance to connect to (default: "default")
@@ -424,12 +477,22 @@ CONTEXT FOR AGENTS:
         #[arg(display_order = 2)]
         port: Option<u16>,
 
-        /// Execute a single redis command (quote Cypher arguments)
+        /// Execute a single Cypher query (ADR-0009; redis commands are no longer accepted)
         #[arg(long, short)]
         #[arg(display_order = 4)]
         query: Option<String>,
 
-        /// Native redis-cli arguments (require --)
+        /// Graph to query (default: "g")
+        #[arg(long)]
+        #[arg(display_order = 5)]
+        graph: Option<String>,
+
+        /// Password for direct mode; managed mode uses the stored instance password
+        #[arg(long)]
+        #[arg(display_order = 6)]
+        password: Option<String>,
+
+        /// Native redis-cli arguments (interactive mode only; require --)
         #[arg(last = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
@@ -747,11 +810,13 @@ CONTEXT FOR AGENTS:
     /// Connect to a running Postgres instance with psql
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Managed mode (the default; NAME selects one) execs host `psql` when it is on PATH, else runs
-  psql inside the container via `docker exec`.
-  Direct mode (--host/--port) requires `psql` on PATH and connects as user/database \"postgres\"
-  with no password; it does not read managed credentials.
-  Put wrapper options before `--`; all arguments after it go to psql.
+  Managed mode (the default; NAME selects one) connects with dctl's native Postgres client
+  over the container's published port; the stored credentials authenticate; no psql needed.
+  Direct mode (--host/--port) connects to any Postgres as user/database \"postgres\" with no
+  password (ADR-0009).
+  --query takes SQL (multi-statement fine), --queries-file or piped stdin likewise;
+  results render as aligned psql-style tables, non-row statements print nothing.
+  Put wrapper options before `--`; arguments after it reach psql in interactive mode only.
   Interactive, --query and --queries-file output stays native, even with --json or a coding agent.")]
     Client {
         /// Managed instance to connect to (default: "default")
@@ -959,6 +1024,61 @@ mod tests {
         else {
             panic!("expected registry catalog");
         };
+    }
+
+    // ── falkordb client (native Cypher leg) ──────────────────────────────
+
+    #[test]
+    fn falkordb_client_parses_cypher_graph_and_direct_password() {
+        let LocalCommands::Falkordb {
+            command:
+                FalkorCommands::Client {
+                    host,
+                    query,
+                    graph,
+                    password,
+                    ..
+                },
+        } = local_command(&[
+            "falkordb",
+            "client",
+            "--host",
+            "falkor.example.com",
+            "-q",
+            "MATCH (n) RETURN n",
+            "--graph",
+            "social",
+            "--password",
+            "sekret",
+        ])
+        else {
+            panic!("expected falkordb client");
+        };
+        assert_eq!(host.as_deref(), Some("falkor.example.com"));
+        assert_eq!(query.as_deref(), Some("MATCH (n) RETURN n"));
+        assert_eq!(graph.as_deref(), Some("social"));
+        assert_eq!(password.as_deref(), Some("sekret"));
+    }
+
+    #[test]
+    fn falkordb_client_defaults_graph_and_password_to_unset() {
+        let LocalCommands::Falkordb {
+            command:
+                FalkorCommands::Client {
+                    host,
+                    query,
+                    graph,
+                    password,
+                    ..
+                },
+        } = local_command(&["falkordb", "client", "-q", "MATCH (n) RETURN n"])
+        else {
+            panic!("expected falkordb client");
+        };
+        assert_eq!(host, None);
+        assert_eq!(query.as_deref(), Some("MATCH (n) RETURN n"));
+        assert_eq!(graph, None);
+        assert_eq!(password, None);
     }
 
     // ── server start (Docker flags) ──────────────────────────────────────

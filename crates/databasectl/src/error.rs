@@ -113,9 +113,6 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("could not read SQL input: {0}")]
-    SqlInputRead(#[source] std::io::Error),
-
     /// A Postgres validation or state error whose text dctl composes
     /// itself, including its recovery guidance. Kept separate from
     /// [`Error::Postgres`] so structured output can render it verbatim.

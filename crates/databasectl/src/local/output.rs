@@ -49,7 +49,6 @@ enum LocalErrorCode {
     /// A Docker-managed ClickHouse validation or state error.
     ClickhouseError,
     SqlInputOpenFailed,
-    SqlInputReadFailed,
     /// A managed server metadata file contains invalid JSON. The structured
     /// body names the file and gives conservative recovery guidance without
     /// exposing serde's source text.
@@ -328,10 +327,6 @@ impl LocalErrorOutput {
             Error::SqlInputOpen { .. } => Mapping::redacted(
                 LocalErrorCode::SqlInputOpenFailed,
                 "Could not open SQL input file; check that --queries-file exists and is readable",
-            ),
-            Error::SqlInputRead(_) => Mapping::redacted(
-                LocalErrorCode::SqlInputReadFailed,
-                "Could not read SQL input; check the file or stdin source is readable",
             ),
 
             // ── bounded fallback ────────────────────────────────────────────
@@ -964,6 +959,59 @@ pub fn print_output(output: &(impl Serialize + fmt::Display), json: bool) {
     } else {
         println!("{}", output);
     }
+}
+
+/// Single aligned table block (header, dash separator, rows) shared by the
+/// native Postgres and FalkorDB clients; lines are trimmed like psql output
+/// and numeric-looking cells right-align when `numeric_align` is set. The
+/// row-count footer belongs to the caller.
+pub(crate) fn render_aligned_table(
+    columns: &[String],
+    rows: &[Vec<Option<String>>],
+    numeric_align: bool,
+) -> String {
+    let mut widths: Vec<usize> = columns.iter().map(|c| c.len()).collect();
+    for row in rows {
+        for (index, value) in row.iter().enumerate() {
+            widths[index] = widths[index].max(value.as_deref().map_or(0, str::len));
+        }
+    }
+    let mut out = String::new();
+    let header: Vec<String> = columns
+        .iter()
+        .zip(&widths)
+        .map(|(name, width)| format!("{name:<width$}"))
+        .collect();
+    out.push_str(header.join(" | ").trim_end());
+    out.push('\n');
+    let dashes: Vec<String> = widths.iter().map(|width| "-".repeat(*width)).collect();
+    out.push_str(&dashes.join("-+-"));
+    out.push('\n');
+    for row in rows {
+        let cells: Vec<String> = row
+            .iter()
+            .zip(&widths)
+            .map(|(value, width)| match value {
+                Some(text) if numeric_align && looks_numeric(text) => {
+                    format!("{text:>width$}")
+                }
+                Some(text) => format!("{text:<width$}"),
+                None => " ".repeat(*width),
+            })
+            .collect();
+        out.push_str(cells.join(" | ").trim_end());
+        out.push('\n');
+    }
+    out
+}
+
+/// psql right-aligns values that look like numbers; keep that affordance.
+pub(crate) fn looks_numeric(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))
+        && text.chars().any(|c| c.is_ascii_digit())
 }
 
 #[cfg(test)]

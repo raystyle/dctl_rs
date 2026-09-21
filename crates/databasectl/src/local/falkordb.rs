@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::io::IsTerminal;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 const DEFAULT_FK_PORT: u16 = 6379;
@@ -260,8 +259,22 @@ pub async fn run(cmd: FalkorCommands, json: bool) -> Result<()> {
             host,
             port,
             query,
+            graph,
+            password,
             args,
-        } => client(name.or(name_flag), version, host, port, query, args).await,
+        } => {
+            client(
+                name.or(name_flag),
+                version,
+                host,
+                port,
+                query,
+                graph,
+                password,
+                args,
+            )
+            .await
+        }
         FalkorCommands::Dotenv {
             name,
             name_flag,
@@ -1143,83 +1156,28 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// Split a redis command line into argv tokens, honoring double quotes,
-/// single quotes, and backslash escapes inside double quotes. Unquoted
-/// whitespace separates tokens.
-pub(crate) fn split_redis_command(line: &str) -> Vec<String> {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    // Tracks "inside a quoted or in-progress token" so an explicitly quoted
-    // empty argument ("" or '') survives instead of being dropped.
-    let mut in_token = false;
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            ' ' | '\t' if !in_token => {}
-            ' ' | '\t' => {
-                tokens.push(std::mem::take(&mut current));
-                in_token = false;
-            }
-            '"' => {
-                in_token = true;
-                loop {
-                    match chars.next() {
-                        Some('"') | None => break,
-                        Some('\\') => {
-                            if let Some(escaped) = chars.next() {
-                                current.push(escaped);
-                            }
-                        }
-                        Some(c) => current.push(c),
-                    }
-                }
-            }
-            '\'' => {
-                in_token = true;
-                for c in chars.by_ref() {
-                    if c == '\'' {
-                        break;
-                    }
-                    current.push(c);
-                }
-            }
-            _ => {
-                in_token = true;
-                current.push(c);
-            }
-        }
-    }
-    if !current.is_empty() || in_token {
-        tokens.push(current);
-    }
-    tokens
-}
-
+#[allow(clippy::too_many_arguments)]
 async fn client(
     name: Option<String>,
     version: Option<String>,
     host: Option<String>,
     port: Option<u16>,
     query: Option<String>,
+    graph: Option<String>,
+    direct_password: Option<String>,
     extra_args: Vec<String>,
 ) -> Result<()> {
+    let graph_name = graph.unwrap_or_else(|| "g".to_string());
     if host.is_some() || port.is_some() {
-        // Direct connect — no managed lookup, no stored credentials; bring
-        // your own auth through the passthrough args (e.g. `-a <password>`).
-        if !host_has_redis_cli() {
-            return Err(Error::FalkorUsage(
-                "could not execute redis-cli: not found on PATH (install the Redis client tools)"
-                    .to_string(),
-            ));
-        }
+        // Direct connect, native client (ADR-0009): any Redis-protocol graph
+        // server, no managed lookup, optional password. No native REPL: an
+        // interactive session needs a managed instance.
         let h = host.unwrap_or_else(|| "127.0.0.1".to_string());
         let p = port.unwrap_or(DEFAULT_FK_PORT);
-        let mut cli_args: Vec<String> = vec!["-h".into(), h, "-p".into(), p.to_string()];
-        if let Some(q) = query {
-            cli_args.extend(split_redis_command(&q));
-        }
-        cli_args.extend(extra_args);
-        return exec_host_redis_cli(&cli_args, None);
+        // The query requirement and the interactive-only passthrough args
+        // are clap-level constraints now (validate_post_parse, exit 2).
+        let cypher = query.expect("clap rejects direct mode without --query");
+        return run_native_cypher(&h, p, direct_password.as_deref(), &graph_name, &cypher).await;
     }
 
     let metadata_lock = server::lock_metadata()?;
@@ -1238,72 +1196,151 @@ async fn client(
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let password = read_fk_password(&docker, container_id).await;
 
-    // Prefer host redis-cli; fall back to docker exec.
-    if host_has_redis_cli() {
-        let mut cli_args: Vec<String> = vec![
-            "-h".into(),
-            "127.0.0.1".into(),
-            "-p".into(),
-            info.tcp_port.to_string(),
-        ];
-        if let Some(q) = query {
-            cli_args.extend(split_redis_command(&q));
-        }
-        cli_args.extend(extra_args);
-        return exec_host_redis_cli(&cli_args, Some(&password));
-    }
-
     let interactive = query.is_none()
         && extra_args.is_empty()
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal();
-    // The exec fallback authenticates through the exec's REDISCLI_AUTH env —
-    // argv would leak the password into the container's process listing,
-    // same trade the host path already makes.
-    let mut cli_args: Vec<String> = vec!["--no-auth-warning".into()];
-    if let Some(q) = query {
-        cli_args.extend(split_redis_command(&q));
+    if interactive {
+        // The redis-cli REPL cannot be rebuilt from a library: interactive
+        // mode keeps the container's redis-cli over docker exec (ADR-0009),
+        // authenticating through REDISCLI_AUTH rather than argv.
+        let mut cli_args: Vec<String> = vec!["--no-auth-warning".into()];
+        cli_args.extend(extra_args);
+        return docker::exec_redis_cli_in_container(&docker, container_id, &cli_args, &password)
+            .await;
     }
-    cli_args.extend(extra_args);
+    let cypher = match query {
+        Some(cypher) => cypher,
+        // Piped stdin is one Cypher statement (the retired raw-command
+        // stream is part of the ADR-0009 breaking change).
+        None => {
+            let mut buffer = String::new();
+            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer);
+            buffer
+        }
+    };
+    run_native_cypher(
+        "127.0.0.1",
+        info.tcp_port,
+        Some(&password),
+        &graph_name,
+        &cypher,
+    )
+    .await
+}
 
-    if !interactive {
-        // Without an explicit wrapper input, a non-terminal stdin is still
-        // redis input (piped commands); Docker must attach it and see EOF.
-        let input: Option<Box<dyn std::io::Read + Send>> =
-            if interactive || (!std::io::stdin().is_terminal() && cli_args.len() == 1) {
-                None
-            } else {
-                Some(Box::new(std::io::stdin()))
-            };
-        docker::exec_redis_cli_one_shot(&docker, container_id, &cli_args, &password, input).await
-    } else {
-        docker::exec_redis_cli_in_container(&docker, container_id, &cli_args, &password).await
+/// The native Cypher leg (ADR-0009): connect with the official falkordb
+/// client over the Redis protocol, run one Cypher statement, render the
+/// result set as an aligned table.
+async fn run_native_cypher(
+    host: &str,
+    port: u16,
+    password: Option<&str>,
+    graph_name: &str,
+    cypher: &str,
+) -> Result<()> {
+    use falkordb::FalkorClientBuilder;
+    use futures_util::StreamExt;
+
+    let url = match password {
+        // The redis URL grammar carries the password with an empty username.
+        Some(password) => format!("redis://:{password}@{host}:{port}"),
+        None => format!("redis://{host}:{port}"),
+    };
+    let connection_info = url
+        .as_str()
+        .try_into()
+        .map_err(|error: falkordb::FalkorDBError| {
+            // The message must not embed the URL: it carries the password.
+            Error::FalkorUsage(format!("invalid FalkorDB endpoint {host}:{port}: {error}"))
+        })?;
+    let client = FalkorClientBuilder::new_async()
+        .with_connection_info(connection_info)
+        .build()
+        .await
+        .map_err(|error| {
+            Error::FalkorUsage(format!(
+                "could not connect to FalkorDB at {host}:{port}: {error}"
+            ))
+        })?;
+    let mut graph = client.select_graph(graph_name);
+    let result = graph
+        .query(cypher)
+        .execute()
+        .await
+        .map_err(|error| Error::FalkorUsage(format!("{error}")))?;
+
+    let columns: Vec<String> = result.header.iter().cloned().collect();
+    let mut rows: Vec<Vec<Option<String>>> = Vec::new();
+    let mut stream = result.data;
+    while let Some(row) = stream.next().await {
+        let row = row.map_err(|error| Error::FalkorUsage(format!("{error}")))?;
+        rows.push(
+            row.into_values()
+                .iter()
+                .map(|value| Some(render_falkor_value(value)))
+                .collect(),
+        );
+    }
+    print!("{}", render_falkor_table(&columns, &rows));
+    Ok(())
+}
+
+/// Render one FalkorDB value for the table: scalars in their natural text,
+/// graph entities as a compact-but-faithful summary with id and properties
+/// (the crate exposes no Display for FalkorValue).
+fn render_falkor_value(value: &falkordb::FalkorValue) -> String {
+    use falkordb::FalkorValue;
+    match value {
+        FalkorValue::String(text) => text.clone(),
+        FalkorValue::I64(number) => number.to_string(),
+        FalkorValue::F64(number) => number.to_string(),
+        FalkorValue::Bool(flag) => flag.to_string(),
+        FalkorValue::None => String::new(),
+        FalkorValue::Node(node) => {
+            let mut out = format!("(:{} #{}", node.labels.join(":"), node.entity_id);
+            if !node.properties.is_empty() {
+                out.push_str(&render_entity_properties(&node.properties));
+            }
+            out.push(')');
+            out
+        }
+        FalkorValue::Edge(edge) => {
+            let mut out = format!("-[{} #{}", edge.relationship_type, edge.entity_id);
+            if !edge.properties.is_empty() {
+                out.push_str(&render_entity_properties(&edge.properties));
+            }
+            out.push_str("]->");
+            out
+        }
+        FalkorValue::Path(path) => {
+            format!("[path {} nodes]", path.nodes.len())
+        }
+        other => format!("{other:?}"),
     }
 }
 
-fn host_has_redis_cli() -> bool {
-    Command::new("redis-cli")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+fn render_entity_properties(
+    properties: &std::collections::HashMap<String, falkordb::FalkorValue>,
+) -> String {
+    let mut pairs: Vec<String> = properties
+        .iter()
+        .map(|(key, value)| format!("{key}: {}", render_falkor_value(value)))
+        .collect();
+    pairs.sort();
+    format!(" {{{}}}", pairs.join(", "))
 }
 
-/// exec() into host redis-cli. The password travels through REDISCLI_AUTH
-/// rather than `-a`, so it never shows in a process listing.
-fn exec_host_redis_cli(cli_args: &[String], password: Option<&str>) -> Result<()> {
-    use std::os::unix::process::CommandExt;
-    let mut cmd = Command::new("redis-cli");
-    cmd.args(cli_args);
-    if let Some(password) = password {
-        cmd.env("REDISCLI_AUTH", password);
-    }
-    let err = cmd.exec();
-    Err(Error::DockerError(format!(
-        "could not execute redis-cli: {err}"
-    )))
+/// Aligned table rendering matching the Postgres client's shape (shared
+/// renderer; numeric-looking cells right-align) plus the row-count footer.
+fn render_falkor_table(columns: &[String], rows: &[Vec<Option<String>>]) -> String {
+    let mut out = output::render_aligned_table(columns, rows, true);
+    let count = rows.len();
+    out.push_str(&format!(
+        "({count} row{})\n",
+        if count == 1 { "" } else { "s" }
+    ));
+    out
 }
 
 fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool) -> Result<()> {
@@ -1553,23 +1590,6 @@ mod tests {
     }
 
     #[test]
-    fn redis_command_splitting_honors_quotes() {
-        assert_eq!(
-            split_redis_command("GRAPH.QUERY g \"MATCH (n) RETURN n\""),
-            vec!["GRAPH.QUERY", "g", "MATCH (n) RETURN n"]
-        );
-        assert_eq!(split_redis_command("ping"), vec!["ping"]);
-        assert_eq!(
-            split_redis_command("  GRAPH.RO_QUERY   'social'   \"it's one\"  "),
-            vec!["GRAPH.RO_QUERY", "social", "it's one"]
-        );
-        assert_eq!(
-            split_redis_command(r#"SET k "escaped \" quote""#),
-            vec!["SET", "k", "escaped \" quote"]
-        );
-    }
-
-    #[test]
     fn user_names_strip_the_fk_suffix_including_latest() {
         assert_eq!(user_name_from_key("dev-fklatest"), "dev");
         assert_eq!(user_name_from_key("dev-fk4.20.6"), "dev");
@@ -1589,14 +1609,6 @@ mod tests {
     }
 
     #[test]
-    fn redis_command_splitting_keeps_quoted_empty_arguments() {
-        assert_eq!(split_redis_command("SET k \"\""), vec!["SET", "k", ""]);
-        assert_eq!(split_redis_command("ping"), vec!["ping"]);
-        // Unquoted trailing spaces still produce no phantom token.
-        assert_eq!(split_redis_command("ping   "), vec!["ping"]);
-    }
-
-    #[test]
     fn tag_from_stored_version_maps_latest() {
         assert_eq!(tag_from_stored_version("falkordb:latest"), "latest");
         assert_eq!(tag_from_stored_version("falkordb:v4.20.6"), "4.20.6");
@@ -1612,5 +1624,55 @@ mod tests {
             docker::fk_container_name("dev", "4.20.6"),
             "dctl-fk-dev-4.20.6"
         );
+    }
+}
+
+#[cfg(test)]
+mod renderer_tests {
+    use super::{render_falkor_table, render_falkor_value};
+    use falkordb::FalkorValue;
+
+    #[test]
+    fn table_rendering_matches_the_postgres_shape() {
+        let rendered = render_falkor_table(
+            &["id".to_string(), "name".to_string()],
+            &[
+                vec![Some("1".to_string()), Some("root".to_string())],
+                vec![Some("22".to_string()), None],
+            ],
+        );
+        assert!(rendered.contains("id | name\n"), "{rendered}");
+        assert!(rendered.contains(" 1 | root"), "{rendered}");
+        assert!(rendered.contains("22 |"), "{rendered}");
+        assert!(rendered.ends_with("(2 rows)\n"), "{rendered}");
+    }
+
+    #[test]
+    fn entities_render_with_id_and_properties() {
+        let mut node = falkordb::Node {
+            entity_id: 7,
+            labels: vec!["Person".into()],
+            properties: std::collections::HashMap::new(),
+        };
+        node.properties
+            .insert("name".into(), FalkorValue::String("ada".into()));
+        assert_eq!(
+            render_falkor_value(&FalkorValue::Node(node)),
+            "(:Person #7 {name: ada})"
+        );
+
+        let edge = falkordb::Edge {
+            entity_id: 9,
+            relationship_type: "KNOWS".into(),
+            src_node_id: 1,
+            dst_node_id: 2,
+            properties: std::collections::HashMap::new(),
+        };
+        assert_eq!(
+            render_falkor_value(&FalkorValue::Edge(edge)),
+            "-[KNOWS #9]->"
+        );
+        assert_eq!(render_falkor_value(&FalkorValue::None), "");
+        assert_eq!(render_falkor_value(&FalkorValue::I64(42)), "42");
     }
 }

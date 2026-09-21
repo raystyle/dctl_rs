@@ -85,6 +85,25 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
     }
 
     if let Commands::Local(args) = &cli.command {
+        use std::io::IsTerminal;
+        if let Some(message) = args.client_usage_validation_error(
+            std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+        ) {
+            let client = cmd
+                .find_subcommand_mut("local")
+                .and_then(|local| match &args.command {
+                    crate::local::cli::LocalCommands::Postgres { .. } => {
+                        local.find_subcommand_mut("postgres")
+                    }
+                    crate::local::cli::LocalCommands::Falkordb { .. } => {
+                        local.find_subcommand_mut("falkordb")
+                    }
+                    _ => None,
+                })
+                .and_then(|engine| engine.find_subcommand_mut("client"))
+                .expect("engine client command must exist");
+            return Err(client.error(ErrorKind::ArgumentConflict, message));
+        }
         let Some(message) = args
             .postgres_start_validation_error()
             .or_else(|| args.clickhouse_start_validation_error())

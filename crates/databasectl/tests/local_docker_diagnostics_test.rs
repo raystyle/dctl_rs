@@ -116,28 +116,3 @@ fn stale_socket_reports_daemon_down_guidance_without_leaking_endpoint() {
     assert_platform_guidance(&stderr);
     assert!(!stderr.contains("docker-secret-token"), "{stderr}");
 }
-
-#[test]
-fn missing_psql_reports_which_program_could_not_run() {
-    let home = tempfile::tempdir().expect("create home tempdir");
-    let project = tempfile::tempdir().expect("create project tempdir");
-    let empty_path = home.path().join("empty-path");
-    fs::create_dir(&empty_path).expect("create empty PATH directory");
-
-    let output = Command::new(dctl_binary())
-        .env_clear()
-        .env("HOME", home.path())
-        .env("PATH", empty_path)
-        .current_dir(project.path())
-        .args(["local", "postgres", "client", "--host", "127.0.0.1"])
-        .output()
-        .expect("run dctl");
-
-    assert_eq!(output.status.code(), Some(1));
-    let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
-    assert!(
-        stderr.contains("Postgres error: could not execute psql:"),
-        "{stderr}"
-    );
-    assert!(!stderr.contains("Failed to execute ClickHouse"), "{stderr}");
-}

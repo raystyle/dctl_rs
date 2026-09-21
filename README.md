@@ -1,6 +1,6 @@
 # dctl
 
-**dctl**(DataBase Control)是本地数据库服务器管理 CLI:ClickHouse、Postgres、FalkorDB 图数据库三引擎统一走 Docker 容器生命周期,宿主无需装数据库客户端(ClickHouse 走 dctl 内置 HTTP 客户端;Postgres/FalkorDB 宿主已有客户端则优先使用,否则回退容器内执行)。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 与二进制下载部分,保留本地引擎生命周期作为核心。
+**dctl**(DataBase Control)是本地数据库服务器管理 CLI:ClickHouse、Postgres、FalkorDB 图数据库三引擎统一走 Docker 容器生命周期,宿主无需装数据库客户端(ClickHouse 走 dctl 内置 HTTP 客户端,Postgres 走内置 tokio-postgres,FalkorDB 走内置官方 falkordb 客户端;交互式 REPL 用容器内 psql/redis-cli)。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 与二进制下载部分,保留本地引擎生命周期作为核心。
 
 一条命令在项目目录里跑起数据库,无需手写配置:
 
@@ -156,14 +156,14 @@ $ dctl local postgres stop [NAME]
 ```console
 $ dctl local install falkordb@4.20.6   # 或 falkordb@latest,预拉镜像
 $ dctl local falkordb start            # 默认随机密码,6379 协议口 + 3000 Browser 口自动挑
-$ dctl local falkordb client -q 'GRAPH.QUERY g "CREATE (:n {name: '\''root'\''})"'
-$ dctl local falkordb client           # 交互式 redis-cli(宿主优先,回退 docker exec)
+$ dctl local falkordb client -q 'CREATE (:n {name: "root"})'   # Cypher;--graph 选图(默认 g)
+$ dctl local falkordb client           # 交互式 redis-cli(容器内 docker exec)
 $ dctl local falkordb dotenv           # 写 FALKORDB_HOST/PORT/PASSWORD/BROWSER_URL
 $ dctl local falkordb stop             # 保留容器与密码,可 resume
 $ dctl local falkordb remove           # 须先停止;删除容器与数据
 ```
 
-FalkorDB 是 Redis 模块图数据库(openCypher);`client -q` 直通 redis 命令,Cypher 参数记得加引号。Browser 可视化在 start 输出的地址。
+FalkorDB 是 Redis 模块图数据库(openCypher);`client -q` 接 Cypher 语句,结果按列对齐表格输出(2026-09-22 起,ADR-0009;此前透传 `GRAPH.QUERY` 等 redis 命令,迁移时把命令里的 Cypher 部分直接作为 `-q` 值、图名交给 `--graph`)。Browser 可视化在 start 输出的地址。直连 `--password` 会出现在进程命令行(ps 可见;ADR-0009 为直连面开的口子),敏感场景请用受管实例的存储凭据。
 
 ### agent 技能安装
 
