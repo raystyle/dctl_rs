@@ -129,26 +129,6 @@ impl fmt::Display for RegisteredOutput {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct KeyEventOutput {
-    pub events: Vec<Value>,
-}
-
-impl fmt::Display for KeyEventOutput {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Write responses nest the event: {"ok":true,"event":{seq,type}}.
-        for value in &self.events {
-            let kind = value["event"]["type"]
-                .as_str()
-                .map(str::to_string)
-                .unwrap_or_else(|| field(value, "type"));
-            let seq = field(&value["event"], "seq");
-            writeln!(f, "Event posted: {kind} (seq {seq})")?;
-        }
-        write!(f, "Issue closed")
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
 pub struct KeyOutput {
     pub jwk: String,
     pub kid: String,

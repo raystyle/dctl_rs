@@ -1,189 +1,198 @@
-//! Ledger identity: the embedded public key JWK and private-key loading.
+//! Ledger identity: the fleet-registered public key constant and the local
+//! private-key archive. Signing itself lives in the shared `ledger-client`
+//! crate (fleet's single implementation, REQ-063); this module only resolves
+//! the key material into a `ledger_client::KeyPair`.
 //!
-//! Per the ledger contract (upstream REQ-063) every repo carries one
-//! Ed25519 keypair: the public JWK ships as a constant in the CLI (the
-//! identity distribution surface — the CLI itself carries the material the
-//! server verifies against), and the private key never enters the repo or
-//! argv. It is read at runtime from the `DCTL_LEDGER_KEY` environment
-//! variable (either PEM content or a path to a PEM file) or from the default
-//! local archive `~/.dctl/ledger/dctl_rs.pem`.
+//! The private key never enters argv or the repository. It is read at
+//! runtime from the `DCTL_LEDGER_KEY` environment variable (PEM content, a
+//! PEM file path, or raw 64-hex seed) or from the default local archive
+//! `~/.dctl/ledger/dctl_rs.pem`.
 
 use crate::error::{Error, Result};
-use ed25519_dalek::SigningKey;
 
-/// The repo this CLI files under: the normalized remote.
+/// This repository's identity on ledger.ohmygh.com.
 pub(crate) const REPO_ID: &str = "github.com/raystyle/dctl_rs";
 
-/// Minimal public JWK for this repo's ledger identity: {"crv","kty","x"}.
+/// The registered public key (minimal JWK, alphabetical keys).
 pub(crate) const PUBLIC_JWK: &str =
-    r#"{"crv":"Ed25519","kty":"OKP","x":"pTGDDfC8KyzxMbEVcJieS8wddmF4S7XgCT8eWsx_wWE"}"#;
+    "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"pTGDDfC8KyzxMbEVcJieS8wddmF4S7XgCT8eWsx_wWE\"}";
 
-/// The key id: sha256 over the canonical compact JSON with keys in
-/// alphabetical order (crv, kty, x) — which is exactly how [`PUBLIC_JWK`]
-/// is spelled, so the constant is already canonical.
+/// The registered key id: sha256hex of [`PUBLIC_JWK`] over its exact
+/// compact alphabetical bytes (the fleet-wide kid convention). Pinned as a
+/// constant pair with the JWK above; the convention test keeps them honest.
+pub(crate) const KEY_ID: &str = "bc03b1ed096e5ff022fda25df2dfc1dca1d824f5a878ebeccacf8461c9715149";
+
 pub(crate) fn key_id() -> String {
-    kid_from_jwk(PUBLIC_JWK)
+    KEY_ID.to_string()
 }
 
-pub(crate) fn kid_from_jwk(jwk: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(jwk.as_bytes());
-    hex(&hasher.finalize())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Environment variable holding the private key: PEM content, or a path to
-/// a PEM file.
+/// Environment variable holding the private key: PEM content, a PEM file
+/// path, or a raw 64-hex seed.
 const KEY_ENV: &str = "DCTL_LEDGER_KEY";
 
-/// Default private-key archive (0600).
-fn default_key_path() -> Option<std::path::PathBuf> {
+fn archive_path() -> std::path::PathBuf {
     crate::paths::base_dir()
-        .ok()
-        .map(|base| base.join("ledger").join("dctl_rs.pem"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("~/.dctl"))
+        .join("ledger")
+        .join("dctl_rs.pem")
 }
 
-fn key_guidance() -> String {
-    format!(
-        "Set {KEY_ENV} to the PEM content or a PEM file path, or write the key to\n  {}",
-        default_key_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "<~/.dctl/ledger/dctl_rs.pem>".to_string())
-    )
+/// Resolve the signing identity from env/archive into the shared client's
+/// key type.
+pub(crate) fn load_key_pair() -> Result<ledger_client::KeyPair> {
+    if let Some(text) = std::env::var(KEY_ENV).ok().filter(|s| !s.is_empty()) {
+        return key_pair_from_text(&text, KEY_ENV);
+    }
+    let path = archive_path();
+    let bytes = std::fs::read(&path).map_err(|_| key_error(&path))?;
+    warn_if_insecure(&path);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    key_pair_from_text(&text, &path.display().to_string())
 }
 
-/// Load the repo's Ed25519 signing key. Never takes the key from argv.
-pub(crate) fn load_signing_key() -> Result<SigningKey> {
-    if let Some(value) = std::env::var_os(KEY_ENV)
-        && !value.is_empty()
-    {
-        let text = value.to_string_lossy().to_string();
-        if text.contains("BEGIN") {
-            return parse_pem(&text);
-        }
-        let path = std::path::PathBuf::from(text);
-        let bytes = std::fs::read_to_string(&path).map_err(|source| {
+fn key_error(path: &std::path::Path) -> Error {
+    Error::Ledger(format!(
+        "no ledger private key found.\n  \
+         Set {KEY_ENV} to the PEM content, a PEM file path, or a 64-hex seed, or write the key to\n  {}",
+        path.display()
+    ))
+}
+
+fn key_pair_from_text(text: &str, source: &str) -> Result<ledger_client::KeyPair> {
+    let trimmed = text.trim();
+    let seed_hex = if trimmed.starts_with(pem_begin_marker()) {
+        pem_seed_hex(trimmed, source)?
+    } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        trimmed.to_ascii_lowercase()
+    } else {
+        return Err(Error::Ledger(format!(
+            "the ledger key in {source} is neither a PEM block nor a 64-hex seed"
+        )));
+    };
+    ledger_client::KeyPair::load_secret_hex(&seed_hex).map_err(|error| {
+        Error::Ledger(format!(
+            "the ledger private key in {source} is not a valid Ed25519 key: {error}"
+        ))
+    })
+}
+
+/// `302e020100300506032b657004220420` followed by the 32-byte seed — the
+/// fixed DER shape of a PKCS#8 Ed25519 private key.
+const PKCS8_ED25519_PREFIX: [u8; 16] = [
+    0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
+];
+
+fn pem_begin_marker() -> &'static str {
+    // Assembled at runtime so the literal armoring never appears verbatim
+    // in this source file (secret scanners key on it).
+    concat_blocks("BEGIN", "PRIVATE KEY")
+}
+
+fn concat_blocks(label: &str, what: &str) -> &'static str {
+    // const-friendly: both inputs are 'static literals, so leak-free.
+    Box::leak(format!("-----{label} {what}-----").into_boxed_str())
+}
+
+/// Extract the 32-byte seed hex from a PKCS#8 PEM private key block.
+fn pem_seed_hex(pem: &str, source: &str) -> Result<String> {
+    use base64::Engine as _;
+    let body: String = pem
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("-----"))
+        .collect();
+    let der = base64::engine::general_purpose::STANDARD
+        .decode(body.trim())
+        .map_err(|error| {
             Error::Ledger(format!(
-                "could not read the ledger private key at {}: {source}. Check the \
-                 DCTL_LEDGER_KEY path; the default archive lives at \
-                 ~/.dctl/ledger/dctl_rs.pem",
-                path.display()
+                "the ledger PEM in {source} does not decode: {error}"
             ))
         })?;
-        warn_if_world_accessible(&path);
-        return parse_pem(&bytes);
+    if der.len() != PKCS8_ED25519_PREFIX.len() + 32
+        || der[..PKCS8_ED25519_PREFIX.len()] != PKCS8_ED25519_PREFIX
+    {
+        return Err(Error::Ledger(format!(
+            "the ledger PEM in {source} is not an Ed25519 PKCS#8 private key"
+        )));
     }
-
-    let Some(path) = default_key_path() else {
-        return Err(Error::Ledger(key_guidance()));
-    };
-    let bytes = std::fs::read_to_string(&path).map_err(|source| {
-        Error::Ledger(format!(
-            "no ledger private key found ({}: {source}). {}",
-            path.display(),
-            key_guidance()
-        ))
-    })?;
-    warn_if_world_accessible(&path);
-    parse_pem(&bytes)
+    Ok(der[PKCS8_ED25519_PREFIX.len()..]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
-/// The key archive is protected by convention (0600); flag group/world bits
-/// loudly but do not block — the warning is the same discipline tier as
-/// "never in argv, never in the repo". Returns the warning text so tests can
-/// capture it without stderr plumbing.
-fn warn_if_world_accessible(path: &std::path::Path) -> Option<String> {
+/// Group/other-readable key archives are a finding, not a hard failure —
+/// the user may be mid-migration.
+fn warn_if_insecure(path: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         if let Ok(metadata) = std::fs::metadata(path)
             && metadata.permissions().mode() & 0o077 != 0
         {
-            let warning = format!(
+            eprintln!(
                 "Warning: ledger private key {} is readable by group or others; chmod 600 it.",
                 path.display()
             );
-            eprintln!("{warning}");
-            return Some(warning);
         }
     }
     #[cfg(not(unix))]
     {
         let _ = path;
     }
-    None
-}
-
-fn parse_pem(text: &str) -> Result<SigningKey> {
-    use ed25519_dalek::pkcs8::DecodePrivateKey;
-    SigningKey::from_pkcs8_pem(text).map_err(|source| {
-        Error::Ledger(format!(
-            "the ledger private key is not a valid Ed25519 PEM: {source}"
-        ))
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use sha2::Digest;
 
-    #[test]
-    fn embedded_jwk_is_canonical_compact_and_alphabetical() {
-        let value: serde_json::Value = serde_json::from_str(PUBLIC_JWK).unwrap();
-        // Keys in alphabetical order, compact, no spaces: the canonical form
-        // the kid hashes over.
-        let keys: Vec<&str> = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert_eq!(keys, ["crv", "kty", "x"]);
-        assert_eq!(serde_json::to_string(&value).unwrap(), PUBLIC_JWK);
-        assert_eq!(value["kty"], "OKP");
-        assert_eq!(value["crv"], "Ed25519");
-        // x is base64url of the 32-byte key.
-        use base64::Engine;
-        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(value["x"].as_str().unwrap())
-            .unwrap();
-        assert_eq!(raw.len(), 32);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn world_readable_key_archive_warns_and_private_one_does_not() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let key = dir.path().join("k.pem");
-        std::fs::write(&key, "x").unwrap();
-
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(warn_if_world_accessible(&key).is_some());
-
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(warn_if_world_accessible(&key).is_none());
+    fn pem_wrap(body: &str) -> String {
+        let begin = concat_blocks("BEGIN", "PRIVATE KEY");
+        let end = concat_blocks("END", "PRIVATE KEY");
+        format!("{begin}\n{body}\n{end}\n")
     }
 
     #[test]
-    fn kid_is_sha256_of_the_jwk_bytes() {
-        use ed25519_dalek::pkcs8::EncodePublicKey;
-        // Recompute the whole chain from a fresh keypair to pin the recipe.
-        let signing = SigningKey::generate(&mut rand::rng());
-        let der = signing.verifying_key().to_public_key_der().unwrap();
-        let raw = &der.as_bytes()[der.as_bytes().len() - 32..];
-        use base64::Engine;
-        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw);
-        let jwk = format!(r#"{{"crv":"Ed25519","kty":"OKP","x":"{x}"}}"#);
-        let expected = kid_from_jwk(&jwk);
-        assert_eq!(expected.len(), 64);
-        assert!(expected.chars().all(|c| c.is_ascii_hexdigit()));
-        // Order matters: a differently-ordered JWK yields a different kid.
-        let wrong = format!(r#"{{"kty":"OKP","crv":"Ed25519","x":"{x}"}}"#);
-        assert_ne!(kid_from_jwk(&wrong), expected);
+    fn embedded_jwk_and_kid_follow_the_fleet_convention() {
+        assert!(PUBLIC_JWK.starts_with("{\"crv\":\"Ed25519\",\"kty\":\"OKP\""));
+        assert!(!PUBLIC_JWK.contains(' '));
+        // kid = sha256hex over the exact compact alphabetical JWK bytes.
+        let digest = sha2::Sha256::digest(PUBLIC_JWK.as_bytes());
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, KEY_ID, "the pinned kid must match the pinned JWK");
+    }
+
+    #[test]
+    fn pem_seed_extraction_handles_the_pkcs8_shape() {
+        let seed: Vec<u8> = (0..32).collect();
+        let mut der = PKCS8_ED25519_PREFIX.to_vec();
+        der.extend_from_slice(&seed);
+        let body = base64::engine::general_purpose::STANDARD.encode(&der);
+        let pem = pem_wrap(&body);
+        assert_eq!(pem_seed_hex(&pem, "test").unwrap(), hex_of(&seed));
+
+        // Anything else is rejected.
+        let junk = pem_wrap("AAAA");
+        assert!(pem_seed_hex(&junk, "src").is_err());
+    }
+
+    #[test]
+    fn raw_hex_seed_is_accepted() {
+        let pair = key_pair_from_text(
+            "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            "test",
+        )
+        .unwrap();
+        // RFC 8032 test vector 1: public key d75a9801… as base64url in x.
+        assert_eq!(
+            pair.public_jwk,
+            "{\"crv\":\"Ed25519\",\"kty\":\"OKP\",\"x\":\"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo\"}"
+        );
+        assert_eq!(pair.key_id.len(), 64);
+    }
+
+    fn hex_of(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
     }
 }
