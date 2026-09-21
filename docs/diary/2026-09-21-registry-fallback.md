@@ -46,6 +46,7 @@ lan-linux(Docker 29.8.1,containerd 镜像存储)真 registry:2 + 真 daemon 端�
 - 专测轮:三引擎生产面匿名拉取全过,postgres:18 digest 与 Hub 侧逐字节一致(0377e72c),两个 latest(bc33a0f4/13197149)属移动 tag 上游漂移,拉取与运行正常;回落链第二级实测(断 hosts 断 Hub)教科书级通过:Hub 失败原因通报、R2 回落、install 成功、链灌镜像 --pull=never 可运行。
 - 契约文档轮评审 F1(评审方抓的深坑):oci-client 挑战门控仅在 /v2/ 探测点触发,匿名 200 面下凭据永不随库请求携带,catalog 走库必 401,落密档也不解,「枚举须携凭据」高估了库能力。处置选代码侧:catalog 保留一处自建预带 Basic 的显式请求(换轨令边界本为拉 manifest 加 blob,枚举不在列,例外记档 ADR-0008);无凭据时报边界错且零外发请求(结构判别负例钉住)。真面枚举验证待密档落位。
 - 用户注记收录(oci-client 实操语义,registry.rs 结构体上有同文注释):真裸访问须自建无鉴权仓(Anonymous 直行不带 Authorization,公网 Hub/GHCR 通常 401);`store_auth_if_needed` 只存第一次凭据,同 Client 二次 store 被丢,升级鉴权须新建 Client;按仓分流(公开 Anonymous、GHCR 私有 Basic 空用户名加 token 或 Bearer,同进程不同仓用不同 Client);匿名不等于无 token,bearer 域匿名 token 仍随后续请求。本仓四条皆结构性安全:单端点单凭据构造时定格、Hub 腿走守护进程不经此 Client、面为 Basic/无挑战。
+- 契约第四跳(深夜用户令 7741e5e7):枚举面同开匿名,终态 = 读面全匿名(拉取加清单)、写恒 405、错凭据仍 401 加挑战。挂起的真面枚举验证随之解除(匿名即通)。处置:catalog 自建面保留但改为两态稳,即有凭据预带 Basic(两面都被接受),无凭据匿名直行;不走纯库原生(挑战门控在枚举再收口时会静默 401)。无凭据负例翻转为匿名直行正例(前条 F1 的「无凭据报边界错零外发」已随本跳翻转为匿名直行);ADR 契约段按终态重写,README 去「需凭据」注。评审 G1 采纳:预带凭据遇 401 时匿名重打一次,陈旧密档不挡开放面的枚举。
 
 ## 流式化批(pull-streaming,同日第二批)
 

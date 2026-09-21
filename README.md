@@ -78,7 +78,7 @@ $ dctl local install falkordb@4.20.6  # 或 falkordb:latest
 
 ```console
 $ dctl local registry pull postgres:18   # 强制私仓拉取并刷新缓存;亦接受 name@sha256:<digest>
-$ dctl local registry catalog            # 列私仓 repos;枚举面收口,需 ~/.dctl/registry/auth 或 DCTL_REGISTRY_AUTH
+$ dctl local registry catalog            # 列私仓 repos;读面匿名开放,有本地凭据则随行携带
 ```
 
 私仓凭据从 `~/.dctl/registry/auth` 读取(`user:password` 一行,或 `Basic <token>`),或经 `DCTL_REGISTRY_AUTH` 环境变量注入(金库/CI 携带者,同 ledger 密钥约定);零入仓、零 argv、零日志。端点可由 `DCTL_REGISTRY_URL` 覆盖(运维/测试旋钮)。缓存即文件管理:删除 `~/.dctl/registry/cache/<slug>.tar` 即清理对应镜像。

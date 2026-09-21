@@ -233,13 +233,33 @@ fn respond(stream: &mut TcpStream, fixtures: &Fixtures, request: &HttpRequest, c
         }
         return;
     }
-    let (status, content_type, body) = if request.path == "/v2/_catalog" {
-        (
-            200,
-            "application/json",
-            serde_json::to_vec(&fixtures.catalog).unwrap(),
-        )
-    } else if let Some((_, media_type, manifest)) = fixtures
+    // Enumeration accepts anonymous access and the valid carrier; any
+    // other credentials challenge, exercising the stale-credential retry.
+    if request.path == "/v2/_catalog" {
+        use base64::Engine as _;
+        let valid = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("fleet-user:secret-pass")
+        );
+        let accepted = match request.authorization.as_deref() {
+            None => true,
+            Some(header) => header == valid,
+        };
+        if accepted {
+            let body = serde_json::to_vec(&fixtures.catalog).unwrap();
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body);
+        } else {
+            let head = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"stub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(head.as_bytes());
+        }
+        return;
+    }
+    let (status, content_type, body) = if let Some((_, media_type, manifest)) = fixtures
         .manifests
         .iter()
         .find(|(path, _, _)| request.path == format!("/v2{path}"))
@@ -524,19 +544,68 @@ fn catalog_lists_repositories() {
 }
 
 #[test]
-fn catalog_without_credentials_reports_the_boundary() {
+fn catalog_lists_anonymously_without_credentials() {
     let fixtures = Arc::new(Fixtures::image("db/tools", "1.0", b"x"));
     let registry = StubRegistry::start(fixtures, false);
     let sandbox = Sandbox::new();
 
-    let output = sandbox.run(&registry.url(), &["local", "registry", "catalog"]);
-    assert!(!output.status.success());
-    // Structural discriminators: the failure is local and preemptive — no
-    // catalog request ever left the process.
+    // Terminal contract: reads are fully anonymous; enumeration works
+    // without credentials (the preemptive-Basic path only fires when a
+    // local archive or carrier exists).
+    let output = sandbox.run(&registry.url(), &["local", "--json", "registry", "catalog"]);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["repositories"], json!(["db/tools"]));
     let requests = registry.requests();
     assert!(
-        !requests.iter().any(|line| line.contains("_catalog")),
+        requests
+            .iter()
+            .any(|line| line.contains("_catalog") && line.starts_with("GET")),
         "{requests:?}"
+    );
+}
+
+#[test]
+fn catalog_with_stale_credentials_falls_back_to_anonymous() {
+    let fixtures = Arc::new(Fixtures::image("db/tools", "1.0", b"x"));
+    let registry = StubRegistry::start(fixtures, false);
+    let sandbox = Sandbox::new();
+
+    // A rotten local archive must not block enumeration on an open face:
+    // the credentialed GET challenges, one anonymous retry succeeds.
+    let output = Command::new(dctl_binary())
+        .env_clear()
+        .env("HOME", sandbox.home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("DCTL_REGISTRY_URL", registry.url())
+        .env("DCTL_REGISTRY_AUTH", "stale-user:rotten-pass")
+        .env(
+            "DOCKER_HOST",
+            format!("unix://{}", sandbox.docker.socket.display()),
+        )
+        .current_dir(sandbox.home.path())
+        .args(["local", "--json", "registry", "catalog"])
+        .output()
+        .expect("run dctl");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(body["repositories"], json!(["db/tools"]));
+    let requests = registry.requests();
+    let catalog_calls = requests
+        .iter()
+        .filter(|line| line.contains("_catalog"))
+        .count();
+    assert_eq!(
+        catalog_calls, 2,
+        "credentialed then anonymous: {requests:?}"
     );
 }
 

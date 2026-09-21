@@ -208,31 +208,33 @@ impl RegistryClient {
     /// Repository names from `/v2/_catalog`.
     ///
     /// Deliberately NOT the library call: oci-client's auth is
-    /// challenge-gated and only probes `/v2/`, which answers 200
-    /// anonymously under the R2 read contract, so its credentials never
-    /// ride and catalog would 401 forever regardless of the local
-    /// archive. Enumeration therefore stays a small self-built request
-    /// with a preemptive Basic header (the one self-built surface the
-    /// oci-client switch keeps; pulls stay fully on the library).
+    /// challenge-gated and only probes `/v2/`, so under a read face that
+    /// answers anonymously its credentials never ride — which breaks
+    /// enumeration whenever the face closes anonymous listing (the
+    /// contract has moved both ways). This small self-built request is
+    /// contract-stable instead: preemptive Basic when credentials exist
+    /// (accepted on both open and closed faces), plain anonymous
+    /// otherwise (terminal contract: reads fully anonymous, writes 405);
+    /// stale credentials fall back to one anonymous retry so a rotten
+    /// local archive cannot block enumeration on an open face.
     pub(crate) async fn catalog(&self) -> Result<Vec<String>> {
         use base64::Engine as _;
-        let Credentials::Basic(user, password) = &self.credentials else {
-            return Err(Error::Registry(
-                "registry catalog requires credentials (this face closes anonymous \
-                 enumeration); provide ~/.dctl/registry/auth or DCTL_REGISTRY_AUTH"
-                    .into(),
-            ));
-        };
-        let token = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
-        let response = self
-            .http
-            .get(format!("{}://{}/v2/_catalog", self.scheme, self.registry))
-            .header("Authorization", format!("Basic {token}"))
-            .send()
-            .await
-            .map_err(|error| {
+        let url = format!("{}://{}/v2/_catalog", self.scheme, self.registry);
+        let mut request = self.http.get(&url);
+        let credentialed = matches!(self.credentials, Credentials::Basic(_, _));
+        if let Credentials::Basic(user, password) = &self.credentials {
+            let token =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            request = request.header("Authorization", format!("Basic {token}"));
+        }
+        let mut response = request.send().await.map_err(|error| {
+            Error::Registry(format!("registry catalog request failed: {error}"))
+        })?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && credentialed {
+            response = self.http.get(&url).send().await.map_err(|error| {
                 Error::Registry(format!("registry catalog request failed: {error}"))
             })?;
+        }
         let status = response.status();
         if !status.is_success() {
             return Err(Error::Registry(format!(
