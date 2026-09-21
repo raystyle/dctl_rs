@@ -8,6 +8,9 @@
 
 三引擎的镜像拉取今天全部走 Docker 守护进程对 Docker Hub 的直连(bollard `/images/create`)。总台运行 registry.ohmygh.com(registry:2,v2 协议,凭据制);离线与受限网络场景下,Hub 不可达时 dctl 无路可走。REQ-005 要求:dctl 以原生 Rust HTTP 客户端直连私仓拉取常用数据库镜像,并定义离线回落序;准则 4 要求接入面与凭据边界先立本 ADR。
 
+
+> 追注(2026-09-22):决策 1 的回落序条款由 ADR-0010 取代为私仓优先(私仓、Hub、缓存依次);其余决策不变。
+
 ## Decision
 
 1. **回落序(透明接入,不改命令面)**:引擎 `install`/`start` 的镜像获取统一走一条链:
