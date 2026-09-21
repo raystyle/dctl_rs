@@ -262,7 +262,14 @@ impl RegistryClient {
 
     /// Download a blob by digest, verifying sha256 against the path it lands
     /// at in the layout (content addressing doubles as integrity check).
+    /// Layers reach GB scale, so the body streams: hash and write chunk by
+    /// chunk, then compare the digest; a mismatch leaves the partial file
+    /// behind only inside the pull's staging tempdir, which is dropped.
     async fn blob_to(&self, name: &str, digest: &str, dest: &Path) -> Result<()> {
+        use futures_util::StreamExt;
+        use sha2::Digest;
+        use tokio::io::AsyncWriteExt;
+
         let Some(hex) = digest.strip_prefix("sha256:") else {
             return Err(Error::Registry(format!(
                 "unsupported blob digest '{digest}' (only sha256)"
@@ -282,20 +289,28 @@ impl RegistryClient {
         if !status.is_success() {
             return Err(Error::Registry(format!("registry blob {digest} {status}")));
         }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| registry_error("registry blob download failed", error))?;
-        let actual = sha256_hex(&bytes);
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = tokio::fs::File::create(dest).await?;
+        let mut hasher = sha2::Sha256::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk =
+                chunk.map_err(|error| registry_error("registry blob download failed", error))?;
+            hasher.update(&chunk);
+            file.write_all(&chunk).await?;
+        }
+        let actual: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
         if actual != hex {
             return Err(Error::Registry(format!(
                 "blob digest mismatch for {digest}: downloaded content hashes to sha256:{actual}"
             )));
         }
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::write(dest, &bytes)?;
         Ok(())
     }
 
@@ -456,27 +471,39 @@ fn walk(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Load a tar into the daemon via POST /images/load.
+/// Load a tar into the daemon via POST /images/load. The tar streams in
+/// bounded chunks: database images reach GB scale and must not sit whole
+/// in memory.
 pub(crate) async fn docker_load(docker: &bollard::Docker, tar_path: &Path) -> Result<()> {
     use bollard::query_parameters::ImportImageOptionsBuilder;
     use futures_util::StreamExt;
-    use tokio::io::AsyncReadExt;
 
-    let mut file = tokio::fs::File::open(tar_path).await.map_err(|error| {
+    let file = tokio::fs::File::open(tar_path).await.map_err(|error| {
         Error::Registry(format!(
             "cannot open image tar {}: {error}",
             tar_path.display()
         ))
     })?;
-    let mut buffer = Vec::new();
-    file.read_to_end(&mut buffer).await.map_err(|error| {
-        Error::Registry(format!(
-            "cannot read image tar {}: {error}",
-            tar_path.display()
-        ))
-    })?;
+    let chunks = futures_util::stream::unfold(Some(file), |file| async move {
+        // A poisoned state (None after a read error) ends the stream on the
+        // next poll instead of relying on the body consumer to stop asking.
+        let mut file = file?;
+        let mut buffer = vec![0_u8; 512 * 1024];
+        loop {
+            match tokio::io::AsyncReadExt::read(&mut file, &mut buffer).await {
+                Ok(0) => return None,
+                Ok(read) => {
+                    buffer.truncate(read);
+                    return Some((Ok(bytes::Bytes::from(buffer)), Some(file)));
+                }
+                // read_to_end used to absorb EINTR internally; keep that.
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Some((Err(error), None)),
+            }
+        }
+    });
     let options = ImportImageOptionsBuilder::default().build();
-    let mut stream = docker.import_image(options, bollard::body_full(buffer.into()), None);
+    let mut stream = docker.import_image(options, bollard::body_try_stream(chunks), None);
     while let Some(item) = stream.next().await {
         item.map_err(|error| Error::Registry(format!("docker load failed: {error}")))?;
     }

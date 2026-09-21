@@ -30,6 +30,15 @@ lan-linux(Docker 29.8.1,containerd 镜像存储)真 registry:2 + 真 daemon 端�
 
 ## 遗留(记档不做或后续)
 
-- docker_load 整 tar 入内存 Vec:GB 级镜像需流式化,后续批。
+- docker_load 整 tar 入内存 Vec:GB 级镜像需流式化,后续批。(已随同日 pull-streaming 批完成,见下节)
 - 私仓 repo 命名(Hub 原名还是别名托管)与 latest 锚清单:归总台裁定,REQ-005 追注在册。
-- lan-linux 上本轮残留:dctl-registry-test 容器(含播种数据)、三个已灌镜像与裸名别名、/tmp/dctl_cargo 与 /tmp/dctl_target 缓存卷;复验后按需清理。
+- lan-linux 上本轮残留:dctl-registry-test 容器(含播种数据)、三个已灌镜像与裸名别名、/tmp/dctl_cargo 与 /tmp/dctl_target 缓存卷;复验后按需清理。(终审后已全清)
+
+## 流式化批(pull-streaming,同日第二批)
+
+registry-fallback 批 G5 记档的内存面收口,行为零变化:
+
+- blob_to:层 blob 从 response.bytes() 整层缓冲改为 bytes_stream 分块,边下载边 sha256 边落盘,收尾比对 digest;不匹配时 partial 文件只存在于 staging tempdir 内随拉取失败回收。
+- docker_load:tar 从整包 read_to_end 内存 Vec 改为 tokio File 按块(512KiB)futures unfold 流式读,bollard::body_try_stream 喂 /images/load;内存峰值与镜像尺寸脱钩。
+- 依赖面:bytes 提为直依赖(仅为命名 Bytes 类型,传递树里本来就有,零新增编译面)。
+- 验证:本地全量 309 例全绿(单测 215 加集成 94,退出码实证);lan-linux 真 registry:2 三引擎复验与峰值 RSS 实测见当轮评审请求。

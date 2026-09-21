@@ -467,6 +467,7 @@ version = "0.6.0"
 dependencies = [
  "base64",
  "bollard",
+ "bytes",
  "chrono",
  "clap",
  "crossterm",
