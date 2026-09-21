@@ -128,6 +128,7 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                     "crates/databasectl/tests/local_postgres_readiness_test.rs",
                     "crates/databasectl/tests/local_postgres_start_validation_test.rs",
                     "crates/databasectl/tests/local_registry_test.rs",
+                    "crates/databasectl/tests/local_falkor_client_usage_test.rs",
                     "crates/databasectl/tests/ledger_request_test.rs",
                     "crates/databasectl/tests/local_clickhouse_client_test.rs",
                     "crates/databasectl/tests/local_clickhouse_docker_test.rs",
