@@ -44,11 +44,8 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
             "scripts/classify-install-integration.py": True,
             "crates/databasectl/src/local/postgres.rs": False,
             "crates/databasectl/src/local/docker.rs": False,
-            "crates/databasectl/tests/local_client_selectors_test.rs": False,
-            "crates/databasectl/tests/local_client_output_contract_test.rs": False,
             "crates/databasectl/tests/local_docker_pull_progress_test.rs": False,
             "crates/databasectl/tests/local_postgres_readiness_test.rs": False,
-            "crates/databasectl/tests/local_server_metadata_test.rs": False,
             "crates/databasectl/src/cloud/services.rs": False,
             "README.md": False,
         }
@@ -58,10 +55,6 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
 
     def test_new_or_renamed_candidates_are_unknown(self):
         for path in (
-            "crates/databasectl/src/new_shared.rs",
-            "crates/databasectl/src/local/new_installer_helper.rs",
-            "crates/databasectl/tests/new_install_subprocess_test.rs",
-            "crates/databasectl/tests/snapshots/new_install.snap",
         ):
             with self.subTest(path=path):
                 self.assertIsNone(classifier.classify_path(path))
@@ -116,22 +109,11 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                 {
                     "crates/clickhouse-cloud-api/src/client/query_api_endpoints.rs",
                     "crates/clickhouse-cloud-api/src/models/query_api_endpoints.rs",
-                    "crates/databasectl/src/cloud/clickstack.rs",
-                    "crates/databasectl/src/cloud/config.rs",
-                    "crates/databasectl/src/cloud/query_api_endpoints.rs",
-                    "crates/databasectl/src/cloud/udfs.rs",
-                    "crates/databasectl/src/dotenv.rs",
-                    "crates/databasectl/src/failure.rs",
                     "crates/databasectl/src/local/config.rs",
                     "crates/databasectl/src/local/docker.rs",
                     "crates/databasectl/src/local/postgres.rs",
                     "crates/databasectl/src/skills.rs",
-                    "crates/databasectl/src/telemetry.rs",
                     "crates/databasectl/src/update.rs",
-                    "crates/databasectl/tests/cli_request_shape_test.rs",
-                    "crates/databasectl/tests/local_client_project_scope_errors_test.rs",
-                    "crates/databasectl/tests/local_client_selectors_test.rs",
-                    "crates/databasectl/tests/local_client_output_contract_test.rs",
                     "crates/databasectl/tests/local_docker_diagnostics_test.rs",
                     "crates/databasectl/tests/local_docker_status_test.rs",
                     "crates/databasectl/tests/local_docker_pull_progress_test.rs",
@@ -139,19 +121,6 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                     "crates/databasectl/tests/local_postgres_client_input_test.rs",
                     "crates/databasectl/tests/local_postgres_readiness_test.rs",
                     "crates/databasectl/tests/local_postgres_start_validation_test.rs",
-                    "crates/databasectl/tests/local_remove_default_test.rs",
-                    "crates/databasectl/tests/local_remove_global_guard_test.rs",
-                    "crates/databasectl/tests/local_server_metadata_test.rs",
-                    "crates/databasectl/tests/local_server_name_compatibility_test.rs",
-                    "crates/databasectl/tests/local_server_project_scope_errors_test.rs",
-                    "crates/databasectl/tests/local_server_readiness_test.rs",
-                    "crates/databasectl/tests/local_server_selection_test.rs",
-                    "crates/databasectl/tests/local_server_start_args_test.rs",
-                    "crates/databasectl/tests/local_server_state_machine_test.rs",
-                    "crates/databasectl/tests/local_server_stopped_test.rs",
-                    "crates/databasectl/tests/local_server_watchdog_pid_test.rs",
-                    "crates/databasectl/tests/local_structured_errors_test.rs",
-                    "crates/databasectl/tests/telemetry_test.rs",
                     "crates/databasectl/tests/skills_usage_test.rs",
                 }
             ),

@@ -17,7 +17,7 @@ dctl 移除自研 src/ledger/ 客户端代码,以 Cargo 依赖引入全舰队唯
 ## Criteria
 
 - [x] Cargo.toml 引入 `ledger-client = { git = "https://github.com/raystyle/ledger-rs", tag = "v0.1.1" }`(总台追注:v0.1.0 有舰队级缺陷,URL 拼接缺斜杠致 GET 假空与 POST 路径分叉;v0.1.1 已修加 decode 硬化,hst 实弹报)
-- [x] 删除 src/ledger/{sign,client}.rs(keys.rs 瘦身为密钥解析适配层:PEM/64-hex → KeyPair,签名道全在 crate) 的自研签名道与 HTTP 客户端(保留 cli.rs 命令定义与 output.rs 渲染,底层调 ledger-client)
+- [x] 删除 src/ledger/{sign,client}.rs(keys.rs 瘦身为密钥解析适配层:PEM/64-hex 解析为 KeyPair,签名道全在 crate) 的自研签名道与 HTTP 客户端(保留 cli.rs 命令定义与 output.rs 渲染,底层调 ledger-client)
 - [x] 公钥 JWK 常量与 kid 约定不变(舰队一致:sha256hex 字母键序紧凑 JSON {crv,kty,x})
 - [x] 权限收口:保留 issue new/list/show + artifact publish/attest(attest_dev/attest_prod/verification_failed)/list;移除 issue close、artifact promote/demote/supersede
 - [x] 帮助与 README 同步:注明关闭与删除走 omc 工位(`omc ledger issue status <repo> <n> <to>` / `omc ledger issue delete`)
