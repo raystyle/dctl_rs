@@ -8,7 +8,7 @@
 //! Containers we create are tagged with these labels so we can later discover
 //! them even if the local metadata file is missing:
 //!
-//!  * `dctl.engine=postgres|falkordb`
+//!  * `dctl.engine=postgres|falkordb|clickhouse`
 //!  * `dctl.name=<server-name>`
 //!  * `dctl.major=<major-or-full-version>`
 //!  * `dctl.project=<canonical project cwd>`
@@ -944,9 +944,10 @@ pub struct DiscoveredContainer {
     pub image: String,
     pub host_port: Option<u16>,
     /// Host port mapped to the engine's secondary container port when it has
-    /// one (FalkorDB's browser on 3000); None for Postgres and for stopped
-    /// containers (the list API omits published ports when not running).
-    pub browser_port: Option<u16>,
+    /// one (FalkorDB's browser on 3000; ClickHouse's native TCP on 9000);
+    /// None for Postgres and for stopped containers (the list API omits
+    /// published ports when not running).
+    pub secondary_port: Option<u16>,
 }
 
 /// Find Postgres containers we created in `project_cwd`. Filtered on the
@@ -1028,15 +1029,20 @@ async fn list_project_engine(
                 .find(|p| p.private_port == protocol_port)
                 .and_then(|p| p.public_port)
         });
-        let browser_port = if engine == ENGINE_FALKORDB {
+        let secondary_private = match engine {
+            ENGINE_FALKORDB => 3000,
+            ENGINE_CLICKHOUSE => 9000,
+            _ => 0,
+        };
+        let secondary_port = if secondary_private == 0 {
+            None
+        } else {
             c.ports.as_ref().and_then(|ports| {
                 ports
                     .iter()
-                    .find(|p| p.private_port == 3000)
+                    .find(|p| p.private_port == secondary_private)
                     .and_then(|p| p.public_port)
             })
-        } else {
-            None
         };
         out.push(DiscoveredContainer {
             container_id: id,
@@ -1044,7 +1050,7 @@ async fn list_project_engine(
             major,
             image,
             host_port,
-            browser_port,
+            secondary_port,
         });
     }
     Ok(out)
@@ -1226,6 +1232,30 @@ pub async fn exec_psql_in_container(
 
 /// Run `redis-cli` inside a container with a full interactive TTY; same
 /// contract as the psql variant, with REDISCLI_AUTH carried in the exec env.
+/// Host port bound to `port_key` in the container's own HostConfig, read from
+/// an inspect response. Used by resume to refresh ports the metadata may
+/// carry as 0 or stale (recovered instances).
+pub(crate) fn host_port_from_inspect(
+    inspected: Option<&bollard::models::ContainerInspectResponse>,
+    port_key: &str,
+) -> Option<u16> {
+    inspected?
+        .host_config
+        .as_ref()?
+        .port_bindings
+        .as_ref()?
+        .get(port_key)?
+        .as_ref()?
+        .first()?
+        .host_port
+        .as_deref()?
+        .parse()
+        .ok()
+}
+
+/// Run `clickhouse-client` interactively inside the container (TTY + raw
+/// mode, same exec stream as the psql/redis-cli shells). Credentials are
+/// passed by the caller as regular `--user/--password` arguments.
 pub async fn exec_clickhouse_client_in_container(
     docker: &Docker,
     container_id: &str,
@@ -1623,8 +1653,8 @@ pub fn recover_project_clickhouse_blocking(
                 name: key,
                 pid: 0,
                 version: format!("clickhouse:{}", c.major),
-                http_port: 0,
-                tcp_port: c.host_port.unwrap_or(0),
+                http_port: c.host_port.unwrap_or(0),
+                tcp_port: c.secondary_port.unwrap_or(0),
                 started_at: "recovered".to_string(),
                 cwd: cwd_owned.clone(),
                 engine: Engine::Clickhouse,
@@ -1673,7 +1703,7 @@ pub fn recover_project_falkor_blocking(
                 // published ports for running containers; a stopped container
                 // recovers 0 here and the next resume refreshes both ports
                 // from the container's port bindings.
-                http_port: c.browser_port.unwrap_or(0),
+                http_port: c.secondary_port.unwrap_or(0),
                 tcp_port: c.host_port.unwrap_or(0),
                 started_at: "recovered".to_string(),
                 cwd: cwd_owned.clone(),

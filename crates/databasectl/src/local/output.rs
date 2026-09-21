@@ -314,6 +314,12 @@ impl LocalErrorOutput {
             // ── falkordb ────────────────────────────────────────────────────
             Error::FalkorUsage(_) => Mapping::parity(LocalErrorCode::FalkorError),
             Error::ClickhouseUsage(_) => Mapping::parity(LocalErrorCode::ClickhouseError),
+            // The body is engine output (may interpolate SQL/paths); parity
+            // is reserved for text this crate composes itself.
+            Error::ClickhouseHttp { status, .. } => Mapping::redacted(
+                LocalErrorCode::ClickhouseError,
+                format!("ClickHouse HTTP query failed with status {status}"),
+            ),
             Error::SqlInputOpen { .. } => Mapping::redacted(
                 LocalErrorCode::SqlInputOpenFailed,
                 "Could not open SQL input file; check that --queries-file exists and is readable",
@@ -350,8 +356,8 @@ impl ServerMetadataParseErrorDetail {
                     command: None,
                 },
                 LocalGuidance {
-                    message: "For ClickHouse, if repair is not possible, confirm that the running server is discoverable before moving the metadata file aside",
-                    command: Some("dctl local server list --global"),
+                    message: "For ClickHouse, if repair is not possible, confirm that the container is discoverable before moving the metadata file aside",
+                    command: Some("docker ps --filter label=dctl.engine=clickhouse"),
                 },
                 LocalGuidance {
                     message: "For Postgres, verify the container state separately before moving the metadata file aside",
@@ -590,7 +596,7 @@ impl fmt::Display for ServerListOutput {
                 )?;
                 return write!(
                     f,
-                    "Return to the local project root where the server was started and run `dctl local server list`, or use `dctl local server list --global` to locate running servers in other projects."
+                    "Return to the local project root where the server was started and run `dctl local server list`; containers can also be located with `docker ps --filter label=created_by`."
                 );
             }
             write!(f, "No servers")?;

@@ -36,10 +36,10 @@ def pull_request_paths(workflow: Path) -> set[str]:
 class InstallIntegrationClassifierTests(unittest.TestCase):
     def test_positive_and_negative_paths(self):
         cases = {
-            "crates/databasectl/src/version_manager/future.rs": True,
             "crates/databasectl/src/local/mod.rs": True,
+            "crates/databasectl/src/local/clickhouse.rs": True,
+            "crates/databasectl/tests/local_clickhouse_docker_test.rs": True,
             "crates/databasectl/src/http.rs": True,
-            "crates/databasectl/tests/local_install_local_first_test.rs": True,
             "Cargo.lock": True,
             "scripts/classify-install-integration.py": True,
             "crates/databasectl/src/local/postgres.rs": False,
@@ -97,16 +97,14 @@ class InstallIntegrationClassifierTests(unittest.TestCase):
                     "crates/databasectl/src/http.rs",
                     "crates/databasectl/src/init.rs",
                     "crates/databasectl/src/local/cli.rs",
-                    "crates/databasectl/src/local/discovery.rs",
+                    "crates/databasectl/src/local/clickhouse.rs",
                     "crates/databasectl/src/local/mod.rs",
                     "crates/databasectl/src/local/output.rs",
                     "crates/databasectl/src/local/server.rs",
-                    "crates/databasectl/src/local/symlink.rs",
                     "crates/databasectl/src/main.rs",
                     "crates/databasectl/src/paths.rs",
                     "crates/databasectl/src/user_agent.rs",
-                    "crates/databasectl/tests/local_install_local_first_test.rs",
-                    "crates/databasectl/tests/local_version_error_test.rs",
+                    "crates/databasectl/tests/local_clickhouse_docker_test.rs",
                     "scripts/classify-install-integration.py",
                     "scripts/tests/test_classify_install_integration.py",
                 }

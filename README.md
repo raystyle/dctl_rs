@@ -65,7 +65,7 @@ dctl 的状态分两处存放:
 
 ## 使用
 
-顶层命令面:`dctl local`、`dctl skills`、`dctl update`。处处接受 `--json`,agent 自动获得;退出码:0 成功、1 错误、2 usage 错误、3 取消。
+顶层命令面:`dctl local`、`dctl skills`、`dctl update`。处处接受 `--json`,agent 自动获得;退出码:0 成功、1 错误、2 usage 错误;3 不再由 dctl 自身产生(取消路径已随二进制引擎退役),仅作为容器内子进程的透传码出现。
 
 ### 镜像预拉取
 
@@ -87,7 +87,8 @@ $ dctl local server stop [NAME]         # 幂等;stop-all 停本项目所有引�
 $ dctl local server remove NAME         # 须先停止;删除容器与数据
 $ dctl local client [-q 'SELECT 1']     # 内置 HTTP 客户端;-q/--queries-file 走 HTTP
 $ dctl local client                     # 交互式,docker exec 进容器内 clickhouse-client
-$ dctl local client --host H --port P -q 'SELECT 1'   # 直连任意 ClickHouse
+$ dctl local client --host H --port P -q 'SELECT 1'   # 直连任意 ClickHouse(要认证时加 --user/--password)
+$ dctl local client --queries-file seed/init.sql      # 一次一条语句(HTTP 接口限制;多语句文件请拆分或走交互)
 $ dctl local server dotenv              # 写 CLICKHOUSE_* 连接变量
 ```
 

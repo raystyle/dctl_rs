@@ -47,6 +47,14 @@ struct ChScenario {
     /// the fresh/resume flows must see it stopped while resolving the
     /// server name and prior state.
     live_before_start: bool,
+    /// Serve this container in `GET /containers/json` for clickhouse-filtered
+    /// listing (label recovery). Ports are omitted (a stopped container does
+    /// not publish them) so recovery stores 0/0 — the F1 regression state.
+    discovered_stopped: bool,
+    /// Port bindings the inspect response reports for the container
+    /// (AtomicU16 so a test can reserve ports after the daemon starts).
+    inspect_http_port: u16,
+    inspect_native_port: u16,
 }
 
 impl Default for ChScenario {
@@ -58,6 +66,9 @@ impl Default for ChScenario {
             start_status: 204,
             logs: Vec::new(),
             live_before_start: true,
+            discovered_stopped: false,
+            inspect_http_port: 0,
+            inspect_native_port: 0,
         }
     }
 }
@@ -65,6 +76,7 @@ impl Default for ChScenario {
 struct FakeDocker {
     stop: Arc<AtomicBool>,
     requests: Arc<Mutex<Vec<DockerRequest>>>,
+    inspect_ports: Arc<Mutex<(u16, u16)>>,
     /// Set once the fake container has been started; readiness listeners
     /// bind their port only after this, so `--http-port` availability
     /// probing sees the port free.
@@ -81,10 +93,15 @@ impl FakeDocker {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let container_started = Arc::new(AtomicBool::new(false));
+        let inspect_ports = Arc::new(Mutex::new((
+            scenario.inspect_http_port,
+            scenario.inspect_native_port,
+        )));
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
         let thread_started = Arc::clone(&container_started);
-        let _project = project_path.to_path_buf();
+        let thread_inspect_ports = Arc::clone(&inspect_ports);
+        let project = project_path.to_path_buf();
         let thread = thread::spawn(move || {
             let ChScenario {
                 image_status,
@@ -93,8 +110,21 @@ impl FakeDocker {
                 start_status,
                 logs,
                 live_before_start,
+                discovered_stopped,
+                inspect_http_port,
+                inspect_native_port,
             } = scenario;
+            thread_inspect_ports.lock().unwrap().0 = inspect_http_port; // seeded; tests may override later
+            thread_inspect_ports.lock().unwrap().1 = inspect_native_port;
             let mut started = false;
+            let inspect_ports = Arc::clone(&thread_inspect_ports);
+            let discovered_body = format!(
+                r#"[{{"Id":"{CONTAINER}","Labels":{{"dctl.engine":"clickhouse","dctl.name":"default","dctl.major":"{TAG}","dctl.project":"{}"}},"Image":"{IMAGE}","Ports":[]}}]"#,
+                project
+                    .canonicalize()
+                    .unwrap_or_else(|_| project.clone())
+                    .display(),
+            );
             while !thread_stop.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
@@ -111,7 +141,6 @@ impl FakeDocker {
                     .set_read_timeout(Some(Duration::from_secs(2)))
                     .expect("set fake Docker read timeout");
                 let request = read_request(&mut stream);
-                eprintln!("SERVE {} {}", request.method, request.path);
                 thread_requests.lock().unwrap().push(request.clone());
 
                 match (request.method.as_str(), request.path.as_str()) {
@@ -127,7 +156,13 @@ impl FakeDocker {
                         write_json(&mut stream, 200, r#"{"status":"Download complete"}"#);
                     }
                     ("GET", path) if path.starts_with("/containers/json") => {
-                        write_json(&mut stream, 200, "[]");
+                        // Only the clickhouse-engine listing sees the
+                        // discovered container; pg/fk listings stay empty.
+                        if discovered_stopped && path.contains("clickhouse") {
+                            write_json(&mut stream, 200, &discovered_body);
+                        } else {
+                            write_json(&mut stream, 200, "[]");
+                        }
                     }
                     ("GET", path) if path.starts_with("/containers/dctl-ch-") => {
                         // Inspect by container name during ensure_name_free.
@@ -173,8 +208,10 @@ impl FakeDocker {
                         } else {
                             r#""Status":"exited","Running":false,"Paused":false,"ExitCode":0,"OOMKilled":false"#
                         };
+                        let (inspect_http_port, inspect_native_port) =
+                            *inspect_ports.lock().unwrap();
                         let body = format!(
-                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":["CLICKHOUSE_USER=app","CLICKHOUSE_PASSWORD=stored-secret","CLICKHOUSE_DB=events"]}}}}"#
+                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":["CLICKHOUSE_USER=app","CLICKHOUSE_PASSWORD=stored-secret","CLICKHOUSE_DB=events"]}},"HostConfig":{{"PortBindings":{{"8123/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_http_port}"}}],"9000/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_native_port}"}}]}}}}}}"#
                         );
                         write_json(&mut stream, 200, &body);
                     }
@@ -230,9 +267,16 @@ impl FakeDocker {
         Self {
             stop,
             requests,
+            inspect_ports,
             container_started,
             thread: Option::Some(thread),
         }
+    }
+
+    /// Point the container's reported port bindings at freshly reserved
+    /// ports (tests reserve them only after the daemon is running).
+    fn set_inspect_ports(&self, http_port: u16, native_port: u16) {
+        *self.inspect_ports.lock().unwrap() = (http_port, native_port);
     }
 
     fn requests(&self) -> Vec<DockerRequest> {
@@ -325,10 +369,15 @@ impl FakeClickhouseHttp {
     /// Serve on `port` as soon as `after` is set (the container has started),
     /// so the port is free while dctl probes its availability.
     fn start_after(port: u16, after: Arc<AtomicBool>) -> Self {
+        Self::start_after_with(port, after, false)
+    }
+
+    fn start_after_with(port: u16, after: Arc<AtomicBool>, reject_auth: bool) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
+        let thread_reject_auth = reject_auth;
         let thread = thread::spawn(move || {
             // The port must stay free until dctl has probe-checked it, so the
             // bind waits for the container-start signal from the fake daemon.
@@ -402,8 +451,13 @@ impl FakeClickhouseHttp {
                     .unwrap()
                     .push((format!("{method} {path}"), body.clone()));
 
+                let has_auth = headers
+                    .lines()
+                    .any(|line| line.to_ascii_lowercase().starts_with("authorization:"));
                 if path.starts_with("/ping") {
                     respond_tcp(&mut stream, 200, "Ok.\n");
+                } else if thread_reject_auth && has_auth {
+                    respond_tcp(&mut stream, 516, "Code: 516 Authentication failed");
                 } else {
                     respond_tcp(&mut stream, 200, &format!("query-ack:{body}"));
                 }
@@ -442,6 +496,16 @@ fn respond_tcp(stream: &mut std::net::TcpStream, status: u16, body: &str) {
         .expect("write fake ClickHouse HTTP response");
 }
 
+/// Like `start_after`, but POSTs with an Authorization header get a 516 —
+/// the server is up and healthy yet rejects these credentials.
+fn http_listener_rejecting_auth(port: u16, after: Arc<AtomicBool>) -> (FakeClickhouseHttp, u16) {
+    let ready = after;
+    (
+        FakeClickhouseHttp::start_after_with(port, ready, true),
+        port,
+    )
+}
+
 /// Eagerly bound query listener for tests that never run `server start`
 /// (the managed client posts straight to the recorded port).
 fn http_listener_now() -> (FakeClickhouseHttp, u16) {
@@ -456,6 +520,18 @@ fn reserve_port() -> u16 {
         .local_addr()
         .expect("reserved address")
         .port()
+}
+
+/// Two distinct ephemeral ports: the kernel can hand the same port back out
+/// once the first probe socket drops, and the engine rejects equal ports.
+fn reserve_port_pair() -> (u16, u16) {
+    loop {
+        let first = reserve_port();
+        let second = reserve_port();
+        if first != second {
+            return (first, second);
+        }
+    }
 }
 
 fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
@@ -516,9 +592,8 @@ fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
             ..Default::default()
         },
     );
-    let http_port = reserve_port();
+    let (http_port, native_port) = reserve_port_pair();
     let http = FakeClickhouseHttp::start_after(http_port, docker.started_flag());
-    let native_port = reserve_port();
 
     let output = run(
         project.path(),
@@ -695,6 +770,7 @@ fn resume_starts_existing_container_without_creating() {
             ..Default::default()
         },
     );
+    docker.set_inspect_ports(http_port, native_port);
     let http = FakeClickhouseHttp::start_after(http_port, docker.started_flag());
 
     let output = run(
@@ -714,10 +790,10 @@ fn resume_starts_existing_container_without_creating() {
         result["password"].is_null(),
         "resume never reprints a password it cannot know: {result}"
     );
-    assert!(
-        result["user"] == "default",
-        "resume cannot know the provisioned user either: {result}"
-    );
+    // user/database are read back from the container env — the same source
+    // dotenv/client use — so resume reports the provisioned identity.
+    assert_eq!(result["user"], "app", "{result}");
+    assert_eq!(result["database"], "events", "{result}");
 
     let requests = docker.requests();
     assert!(
@@ -833,6 +909,281 @@ fn readiness_timeout_rolls_back_fresh_container_and_data() {
         !project.path().join(".dctl/servers/default-ch26.8").exists(),
         "fresh data directory is rolled back"
     );
+    drop(docker);
+}
+
+#[test]
+fn recovery_from_deleted_metadata_resumes_with_correct_ports() {
+    // The F1 regression chain: metadata gone (git clean -xdf clears
+    // .dctl/), a stopped labelled container remains. Recovery via labels
+    // stores 0/0 ports (a stopped container publishes none); the resume
+    // must refresh BOTH ports from the container's own bindings before
+    // probing readiness — http://127.0.0.1:0/ping never becomes ready.
+    let _guard = START_COMMAND_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario {
+            existing_metadata: true, // a create after recovery is a bug
+            running: true,
+            live_before_start: false,
+            discovered_stopped: true,
+            inspect_http_port: 0, // filled after reserving, see below
+            inspect_native_port: 0,
+            ..Default::default()
+        },
+    );
+    let http_port = reserve_port();
+    let native_port = reserve_port();
+    // Point the fake inspect at the reserved ports (bindings live in the
+    // scenario thread; set them through the shared request log is not
+    // possible, so re-bind via a dedicated scenario field setter).
+    docker.set_inspect_ports(http_port, native_port);
+    let http = FakeClickhouseHttp::start_after(http_port, docker.started_flag());
+
+    // 1) `server list` triggers label recovery and writes metadata.
+    let listed = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "list"],
+    );
+    assert!(
+        listed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let recovered_path = project.path().join(".dctl/servers/default-ch26.8.json");
+    assert!(recovered_path.exists(), "recovery writes the metadata file");
+    let recovered: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&recovered_path).unwrap()).unwrap();
+    assert_eq!(recovered["container_id"], CONTAINER);
+    // A stopped container publishes no ports: recovery stores 0/0 and the
+    // resume is on the hook to refresh them (the F1 bug stored the HTTP
+    // port in tcp_port and left http_port at 0 forever).
+    assert_eq!(recovered["http_port"], 0, "{recovered}");
+    assert_eq!(recovered["tcp_port"], 0, "{recovered}");
+
+    // 2) `server start` resumes the discovered container.
+    let output = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "start"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("resume JSON");
+    assert_eq!(result["http_port"], http_port, "{result}");
+    assert_eq!(result["native_port"], native_port, "{result}");
+    assert!(
+        http.requests().iter().any(|(line, _)| line == "GET /ping"),
+        "readiness probed the refreshed HTTP port"
+    );
+
+    // 3) The metadata now carries the refreshed ports.
+    let refreshed: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&recovered_path).unwrap()).unwrap();
+    assert_eq!(refreshed["http_port"], http_port);
+
+    // 4) The recovered instance is queryable.
+    let queried = run(
+        project.path(),
+        home.path(),
+        &["local", "client", "--query", "SELECT 1"],
+    );
+    assert!(
+        queried.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&queried.stdout),
+        "query-ack:SELECT 1"
+    );
+    drop(docker);
+}
+
+#[test]
+fn stop_when_already_stopped_is_idempotent_success() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let http_port = reserve_port();
+    write_ch_metadata(project.path(), http_port, reserve_port());
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario::default(), // container reports stopped
+    );
+
+    let output = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "stop"],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("stop JSON");
+    assert_eq!(result["name"], "default");
+    assert_eq!(result["already_stopped"], true);
+    drop(docker);
+}
+
+#[test]
+fn legacy_binary_era_metadata_can_be_stopped_and_removed() {
+    // F2: a pid-only entry (binary era, no container_id) must be disposable —
+    // stop reports already-stopped, remove clears metadata and data dir.
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let servers = project.path().join(".dctl/servers");
+    std::fs::create_dir_all(servers.join("dev/data")).unwrap();
+    let metadata = serde_json::json!({
+        "name": "dev",
+        "pid": 4242,
+        "version": "25.12.9.61",
+        "http_port": 8123,
+        "tcp_port": 9000,
+        "started_at": "binary-era",
+        "cwd": project.path().canonicalize().unwrap(),
+        "engine": "clickhouse"
+    });
+    std::fs::write(
+        servers.join("dev.json"),
+        serde_json::to_vec_pretty(&metadata).unwrap(),
+    )
+    .unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario::default(),
+    );
+
+    // A read-only list must NOT wipe the version any more.
+    let listed = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "list"],
+    );
+    assert!(listed.status.success());
+    let after_list: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(servers.join("dev.json")).unwrap()).unwrap();
+    assert_eq!(
+        after_list["version"], "25.12.9.61",
+        "list preserved the identity"
+    );
+
+    let stopped = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "stop", "dev"],
+    );
+    assert!(
+        stopped.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    let stop_json: serde_json::Value = serde_json::from_slice(&stopped.stdout).unwrap();
+    assert_eq!(stop_json["already_stopped"], true);
+
+    let removed = run(
+        project.path(),
+        home.path(),
+        &["local", "--json", "server", "remove", "dev"],
+    );
+    assert!(
+        removed.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    assert!(!servers.join("dev.json").exists(), "metadata cleared");
+    assert!(!servers.join("dev").exists(), "data dir cleared");
+    drop(docker);
+}
+
+#[test]
+fn list_without_docker_degrades_to_stopped_with_a_warning() {
+    // G6: the read-only entry point stays usable when the daemon is gone.
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let http_port = reserve_port();
+    write_ch_metadata(project.path(), http_port, reserve_port());
+
+    // DOCKER_HOST points at a socket nobody serves: connect fails fast.
+    let output = std::process::Command::new(dctl_binary())
+        .env_clear()
+        .env("DO_NOT_TRACK", "1")
+        .env("HOME", home.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "DOCKER_HOST",
+            format!("unix://{}/missing.sock", home.path().display()),
+        )
+        .current_dir(project.path())
+        .args(["local", "--json", "server", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "list must not fail without Docker: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["servers"][0]["name"], "default");
+    assert_eq!(result["servers"][0]["running"], false);
+    assert_eq!(result["servers"][0]["version"], "clickhouse:26.8");
+}
+
+#[test]
+fn start_warns_when_existing_data_rejects_the_printed_credentials() {
+    // G5: /ping is unauthenticated; one SELECT 1 turns a silently-wrong
+    // password (existing data dir keeps its first-init password) into a
+    // warning. Start still succeeds — the server itself is healthy.
+    let _guard = START_COMMAND_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario {
+            running: true,
+            live_before_start: false,
+            ..Default::default()
+        },
+    );
+    let http_port = reserve_port();
+    let native_port = reserve_port();
+    let (http, _bound) = http_listener_rejecting_auth(http_port, docker.started_flag());
+
+    let output = run(
+        project.path(),
+        home.path(),
+        &[
+            "local",
+            "server",
+            "start",
+            "--http-port",
+            &http_port.to_string(),
+            "--native-port",
+            &native_port.to_string(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "an auth mismatch is a warning, not a failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rejected the printed credentials"),
+        "warning surfaces in stderr: {stderr}"
+    );
+    drop(http);
     drop(docker);
 }
 

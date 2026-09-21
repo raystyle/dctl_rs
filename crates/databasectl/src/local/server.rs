@@ -19,8 +19,9 @@ const NOUNS: &[&str] = &[
     "lynx", "moth", "newt", "orca", "puma", "seal", "swan", "wolf",
 ];
 
-/// Engine driving a server instance. ClickHouse is a managed binary process;
-/// Postgres and FalkorDB are managed Docker containers.
+/// Engine driving a server instance. All three engines are managed as Docker
+/// containers; the enum only names which container family an instance
+/// belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Engine {
@@ -50,17 +51,21 @@ fn default_engine() -> Engine {
 /// deserializing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerInfo {
+    /// Disk key: `<name>`, `<name>-pg<major>`, `<name>-fk<version>` or
+    /// `<name>-ch<tag>` (also the metadata file stem).
     pub name: String,
-    /// Active ClickHouse process PID; 0 when stopped or for Postgres.
+    /// Always 0 for Docker engines; retained for binary-era metadata files.
     pub pid: u32,
-    /// Running ClickHouse version like "25.12.5.44", empty when stopped,
-    /// "postgres:<tag>" for Postgres, or "falkordb:v<X.Y.Z>" / "falkordb:latest"
-    /// for FalkorDB — a logical display form, not a directly pullable image
-    /// reference (build refs via `falkordb::fk_image_ref`).
+    /// "clickhouse:<tag>", "postgres:<tag>" or "falkordb:<version>" — the
+    /// instance identity, kept while stopped (a resume needs it). Legacy
+    /// binary-era files may carry a bare "25.12.5.44" or an empty string.
     pub version: String,
-    /// Running ClickHouse HTTP port; 0 when stopped or for Postgres.
+    /// Mapped host HTTP port (ClickHouse 8123; FalkorDB's browser 3000 rides
+    /// here). 0 while stopped or unknown (recovery of a stopped container
+    /// cannot read published ports).
     pub http_port: u16,
-    /// Running ClickHouse TCP port, 0 when stopped, or mapped host port for Postgres.
+    /// Mapped host TCP port (ClickHouse native 9000, Postgres 5432,
+    /// FalkorDB 6379). 0 while stopped or unknown.
     pub tcp_port: u16,
     pub started_at: String,
     pub cwd: String,
@@ -445,10 +450,10 @@ pub(crate) fn mark_server_stopped_locked(name: &str, pid: u32, lock: &MetadataLo
         return Ok(());
     };
     if info.engine == Engine::Clickhouse && info.pid == pid {
+        // Zero only the pid: the version and ports stay so the stopped
+        // entry remains identifiable and resumable (they describe the
+        // container, which still exists while stopped).
         info.pid = 0;
-        info.version.clear();
-        info.http_port = 0;
-        info.tcp_port = 0;
         save_server_info_locked(&info, lock)?;
     }
     Ok(())
@@ -565,12 +570,12 @@ pub fn list_all_servers() -> Result<Vec<ServerEntry>> {
 }
 
 pub(crate) fn list_all_servers_locked(lock: &MetadataLock) -> Result<Vec<ServerEntry>> {
-    list_all_servers_locked_inner(lock, false)
+    list_all_servers_locked_inner(lock, true)
 }
 
 fn list_all_servers_locked_inner(
     lock: &MetadataLock,
-    skip_entry_errors: bool,
+    lenient_docker: bool,
 ) -> Result<Vec<ServerEntry>> {
     let dir = &lock.dir;
     let mut entries = Vec::new();
@@ -594,9 +599,23 @@ fn list_all_servers_locked_inner(
             Some(s) => s,
             None => continue,
         };
-        let entry = match server_entry_locked(stem, lock) {
+        let entry = match server_entry_locked_policy(stem, lock, || {}, lenient_docker) {
             Ok(entry) => entry,
-            Err(_) if skip_entry_errors => continue,
+            // One unreadable metadata file must not blank the whole list;
+            // Docker-level failures (inspect 5xx/4xx) still propagate so a
+            // flaky daemon can never make instances silently vanish.
+            Err(error)
+                if matches!(
+                    error,
+                    Error::ServerMetadataRead { .. }
+                        | Error::ServerMetadataPermission { .. }
+                        | Error::ServerMetadataUtf8 { .. }
+                        | Error::ServerMetadataParse { .. }
+                ) =>
+            {
+                eprintln!("Warning: skipping unreadable server entry '{stem}': {error}");
+                continue;
+            }
             Err(error) => return Err(error),
         };
         let Some(entry) = entry else {
@@ -611,19 +630,37 @@ fn list_all_servers_locked_inner(
     Ok(entries)
 }
 
-pub(crate) fn server_entry_locked(name: &str, lock: &MetadataLock) -> Result<Option<ServerEntry>> {
-    server_entry_locked_with(name, lock, || {})
-}
-
-fn server_entry_locked_with(
+#[cfg(test)]
+fn server_entry_locked_for_test(
     name: &str,
     lock: &MetadataLock,
     before_stale_write: impl FnOnce(),
 ) -> Result<Option<ServerEntry>> {
+    server_entry_locked_policy(name, lock, before_stale_write, false)
+}
+
+fn server_entry_locked_policy(
+    name: &str,
+    lock: &MetadataLock,
+    before_stale_write: impl FnOnce(),
+    lenient_docker: bool,
+) -> Result<Option<ServerEntry>> {
     let Some(mut info) = load_info_locked(name, lock)? else {
         return Ok(None);
     };
-    let mut running = is_alive(&info)?;
+    let mut running = match is_alive(&info) {
+        Ok(running) => running,
+        Err(Error::DockerNotAvailable(details)) if lenient_docker => {
+            // A read-only listing stays usable without the daemon; strict
+            // callers (stop-all) still see the error.
+            eprintln!(
+                "Warning: Docker is unavailable ({details}); showing '{}' as stopped.",
+                name
+            );
+            false
+        }
+        Err(error) => return Err(error),
+    };
 
     // Keep the lock across liveness, comparison, and replacement. A restart
     // either commits before this read or waits and commits after normalization.
@@ -643,7 +680,9 @@ fn server_entry_locked_with(
 }
 
 pub(crate) fn list_running_servers_locked(lock: &MetadataLock) -> Result<Vec<ServerInfo>> {
-    Ok(list_all_servers_locked(lock)?
+    // Strict: a stop driven by this list must fail loudly when the daemon is
+    // unreachable, rather than conclude "nothing is running".
+    Ok(list_all_servers_locked_inner(lock, false)?
         .into_iter()
         .filter(|entry| entry.running)
         .filter_map(|entry| entry.info)
@@ -654,10 +693,8 @@ pub(crate) fn is_server_running_locked(name: &str, lock: &MetadataLock) -> Resul
     Ok(load_running_info_locked(name, lock)?.is_some())
 }
 
-/// Stop a running server by name.
-///
-/// * ClickHouse: SIGTERM (then SIGKILL on timeout); metadata is retained with
-///   PID 0 so the stopped instance remains discoverable.
+/// Stop a running server's container by name. The container and metadata are
+/// kept so `start` resumes with the same credentials, ports and data.
 pub(crate) fn kill_server_locked(name: &str, lock: &MetadataLock) -> Result<()> {
     let info = load_running_info_locked(name, lock)?
         .ok_or_else(|| Error::ServerNotRunning(name.to_string()))?;
@@ -685,14 +722,18 @@ pub(crate) fn generate_random_name_locked(lock: &MetadataLock) -> Result<String>
 }
 
 fn unique_generated_name_locked(tag: &str, lock: &MetadataLock) -> Result<String> {
-    if load_info_locked(tag, lock)?.is_none() && find_pg_instances_locked(tag, lock)?.is_empty() {
+    let name_is_free = |key: &str| -> Result<bool> {
+        Ok(load_info_locked(key, lock)?.is_none()
+            && find_pg_instances_locked(key, lock)?.is_empty()
+            && find_fk_instances_locked(key, lock)?.is_empty()
+            && find_ch_instances_locked(key, lock)?.is_empty())
+    };
+    if name_is_free(tag)? {
         return Ok(tag.to_string());
     }
     for i in 2_u64.. {
         let candidate = format!("{}-{}", tag, i);
-        if load_info_locked(&candidate, lock)?.is_none()
-            && find_pg_instances_locked(&candidate, lock)?.is_empty()
-        {
+        if name_is_free(&candidate)? {
             return Ok(candidate);
         }
     }
@@ -1045,11 +1086,15 @@ mod tests {
         let lock = MetadataLock::acquire_at(directory.path()).unwrap();
         save_server_info_locked(&test_info(u32::MAX, "25.12.1.1"), &lock).unwrap();
 
-        let entry = server_entry_locked("default", &lock).unwrap().unwrap();
+        let entry = server_entry_locked_policy("default", &lock, || {}, false)
+            .unwrap()
+            .unwrap();
         let normalized = entry.info.unwrap();
         assert!(!entry.running);
+        // Only the pid is cleared; the version and ports are persistent
+        // instance identity a resume (and list) still needs.
         assert_eq!(normalized.pid, 0);
-        assert!(normalized.version.is_empty());
+        assert_eq!(normalized.version, "25.12.1.1");
         assert_eq!(load_info_locked("default", &lock).unwrap().unwrap().pid, 0);
     }
 
@@ -1061,7 +1106,7 @@ mod tests {
         let restart_dir = directory.path().to_path_buf();
         let mut restart = None;
 
-        let normalized = server_entry_locked_with("default", &lock, || {
+        let normalized = server_entry_locked_for_test("default", &lock, || {
             restart = Some(std::thread::spawn(move || {
                 let restart_lock = MetadataLock::acquire_at(&restart_dir).unwrap();
                 save_server_info_locked(&test_info(std::process::id(), "restarted"), &restart_lock)

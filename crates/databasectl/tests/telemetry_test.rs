@@ -21,9 +21,6 @@ use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use serde_json::Value;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -176,7 +173,7 @@ async fn sandbox_ignores_requests_for_another_endpoint_path() {
 async fn first_run_sends_nothing_then_second_run_sends_event() {
     let sandbox = Sandbox::new().await;
 
-    let output = sandbox.run(&["local", "list"]);
+    let output = sandbox.run(&["local", "server", "list"]);
     assert!(output.status.success());
 
     let stderr = stderr_of(&output);
@@ -191,11 +188,11 @@ async fn first_run_sends_nothing_then_second_run_sends_event() {
     sandbox.assert_no_requests().await;
 
     // Second run: the notice appears exactly once, ever.
-    let output = sandbox.run(&["local", "list"]);
+    let output = sandbox.run(&["local", "server", "list"]);
     assert!(output.status.success());
     assert!(!stderr_of(&output).contains("anonymous usage data"));
     let payloads = sandbox.wait_for_requests(1).await;
-    assert_eq!(payloads[0]["command"], "local list");
+    assert_eq!(payloads[0]["command"], "local server list");
 }
 
 #[tokio::test]
@@ -203,12 +200,12 @@ async fn enabled_run_sends_payload_with_expected_shape() {
     let sandbox = Sandbox::new().await;
     sandbox.write_state(false);
 
-    let output = sandbox.run(&["local", "list"]);
+    let output = sandbox.run(&["local", "server", "list"]);
     assert!(output.status.success());
 
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
-    assert_eq!(event["command"], "local list");
+    assert_eq!(event["command"], "local server list");
     assert!(event["flags"].as_array().unwrap().is_empty());
     assert!(event["positionals"].as_array().unwrap().is_empty());
     assert_eq!(event["exit_code"], 0);
@@ -256,7 +253,7 @@ async fn no_agent_correlation_headers_on_the_wire() {
     // anonymous event would be fingerprinting. The agent facts travel in the
     // payload (`is_agent`/`agent`) instead, by design.
     let output = sandbox
-        .command(&["local", "list"])
+        .command(&["local", "server", "list"])
         .env_remove("AGENT")
         .env("CLAUDECODE", "1")
         .env("CLAUDE_CODE_SESSION_ID", "sess-should-never-hit-the-wire")
@@ -292,14 +289,14 @@ async fn failure_reported_and_positional_value_never_leaks() {
     let sandbox = Sandbox::new().await;
     sandbox.write_state(false);
 
-    let output = sandbox.run(&["local", "remove", "no-such-version-xyz"]);
+    let output = sandbox.run(&["local", "server", "stop", "no-such-name-xyz"]);
     assert!(!output.status.success());
 
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
-    assert_eq!(event["command"], "local remove");
-    // The slot the version went into is recorded; the version is not (#480).
-    assert_eq!(event["positionals"], serde_json::json!(["version"]));
+    assert_eq!(event["command"], "local server stop");
+    // The slot the name went into is recorded; the name is not (#480).
+    assert_eq!(event["positionals"], serde_json::json!(["name"]));
     // The event carries the exit code the process exited with, and
     // the outcome derived from it — a failed handler is "error", not "ok".
     assert_eq!(event["exit_code"], 1);
@@ -307,65 +304,9 @@ async fn failure_reported_and_positional_value_never_leaks() {
     assert_eq!(event["outcome"], "error");
     let raw = serde_json::to_string(event).unwrap();
     assert!(
-        !raw.contains("no-such-version-xyz"),
+        !raw.contains("no-such-name-xyz"),
         "positional argument leaked into the payload: {raw}"
     );
-}
-
-#[tokio::test]
-async fn managed_client_failure_details_never_reach_telemetry() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let root = tempfile::tempdir().unwrap();
-    let project = root.path().join("project-private-token");
-    let server_name = "server-private-token";
-    let version = "99.99.1-version-private-token";
-    let servers = project.join(".dctl/servers");
-    std::fs::create_dir_all(&servers).unwrap();
-    std::fs::write(
-        servers.join(format!("{server_name}.json")),
-        serde_json::to_vec(&serde_json::json!({
-            "name": server_name,
-            "pid": std::process::id(),
-            "version": version,
-            "http_port": 8123,
-            "tcp_port": 9000,
-            "started_at": "test",
-            "cwd": project,
-            "engine": "clickhouse"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
-
-    let output = sandbox
-        .command(&["local", "client", "--name", server_name])
-        .current_dir(&project)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    let raw_message = stderr_of(&output);
-    assert!(raw_message.contains(server_name));
-    assert!(raw_message.contains(version));
-
-    let payloads = sandbox.wait_for_requests(1).await;
-    let event = &payloads[0];
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["flags"], serde_json::json!(["name"]));
-    assert_eq!(event["positionals"], serde_json::json!([]));
-    assert_eq!(event["exit_code"], 1);
-    let raw_payload = serde_json::to_string(event).unwrap();
-    for sensitive in [
-        server_name,
-        version,
-        "project-private-token",
-        raw_message.as_str(),
-    ] {
-        assert!(
-            !raw_payload.contains(sensitive),
-            "managed client detail leaked into telemetry: {raw_payload}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -384,8 +325,10 @@ async fn server_scope_failure_paths_never_reach_telemetry() {
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
     let raw_message = stderr_of(&output);
+    // The name is in the human error; the project path stopped riding along
+    // when the binary-era project-scope error family retired, but both must
+    // stay out of the telemetry payload either way.
     assert!(raw_message.contains(server_name));
-    assert!(raw_message.contains("server-project-private-token"));
 
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
@@ -405,65 +348,6 @@ async fn server_scope_failure_paths_never_reach_telemetry() {
     }
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn child_exit_code_reaches_the_telemetry_tail_unchanged() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-
-    let binary = sandbox
-        .home
-        .path()
-        .join(".dctl/versions/25.12.9.61/clickhouse");
-    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    // 3 is dctl's own cancellation code, so this also verifies that
-    // a child status cannot be mistaken for a CLI cancellation.
-    std::fs::write(&binary, "#!/bin/sh\nexit 3\n").unwrap();
-    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&binary, permissions).unwrap();
-
-    let cache = sandbox.home.path().join(".dctl/last_update_check");
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    std::fs::write(cache, format!("{now}\n999.0.0")).unwrap();
-
-    let output = sandbox
-        .command(&[
-            "local",
-            "server",
-            "start",
-            "--version",
-            "25.12.9.61",
-            "--foreground",
-        ])
-        .env_clear()
-        .env("HOME", sandbox.home.path())
-        .env("DCTL_TELEMETRY_URL", sandbox.telemetry_url())
-        .current_dir(project.path())
-        .output()
-        .unwrap();
-
-    assert_eq!(output.status.code(), Some(3));
-    assert!(
-        !stderr_of(&output).contains("Error: child process exited"),
-        "child stderr should not gain a wrapper error: {}",
-        stderr_of(&output)
-    );
-    assert!(
-        stderr_of(&output).contains("There is a new version of dctl"),
-        "child failure should still reach the update-notice tail: {}",
-        stderr_of(&output)
-    );
-    let payloads = sandbox.wait_for_requests(1).await;
-    assert_eq!(payloads[0]["command"], "local server start");
-    assert_eq!(payloads[0]["exit_code"], 3);
-    assert_eq!(payloads[0]["outcome"], "error");
-}
-
 // ---------------------------------------------------------------------------
 // `exec()` handoffs (#471). `local client` replaces the process image, so its
 // event is emitted by the pre-exec hook and is *censored*: `exec_attempt`
@@ -473,54 +357,6 @@ async fn child_exit_code_reaches_the_telemetry_tail_unchanged() {
 // and either way exactly one event is emitted and the shell keeps the real
 // status.
 // ---------------------------------------------------------------------------
-
-const FAKE_VERSION: &str = "25.12.9.61";
-
-/// Install a fake native client at `~/.dctl/versions/<version>/clickhouse`
-/// in the sandboxed home, with the given contents and mode.
-#[cfg(unix)]
-fn install_fake_clickhouse(sandbox: &Sandbox, version: &str, contents: &str, mode: u32) -> PathBuf {
-    let binary = sandbox
-        .home
-        .path()
-        .join(".dctl/versions")
-        .join(version)
-        .join("clickhouse");
-    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    std::fs::write(&binary, contents).unwrap();
-    let mut permissions = std::fs::metadata(&binary).unwrap().permissions();
-    permissions.set_mode(mode);
-    std::fs::set_permissions(&binary, permissions).unwrap();
-    binary
-}
-
-/// `local client` on the direct-connect path (no server metadata needed),
-/// selecting the fake binary by exact version.
-///
-/// The environment is cleared down to `HOME` and the ingest URL — as in
-/// `child_exit_code_reaches_the_telemetry_tail_unchanged` — so agent detection
-/// cannot flip the assertions from human text to the JSON envelope depending on
-/// where the suite runs.
-#[cfg(unix)]
-fn run_local_client(sandbox: &Sandbox, project: &std::path::Path) -> Output {
-    sandbox
-        .command(&[
-            "local",
-            "client",
-            "--version",
-            FAKE_VERSION,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9000",
-        ])
-        .env_clear()
-        .env("HOME", sandbox.home.path())
-        .env("DCTL_TELEMETRY_URL", sandbox.telemetry_url())
-        .current_dir(project)
-        .output()
-        .expect("run dctl")
-}
 
 /// Wait for the event, then give a hypothetical second one time to arrive and
 /// fail if it does: exactly one event per invocation is the contract, and the
@@ -539,281 +375,6 @@ async fn exactly_one_event(sandbox: &Sandbox) -> Value {
             .collect::<Vec<_>>()
     );
     payloads.into_iter().next().unwrap()
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn successful_handoff_is_one_censored_exec_attempt() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    install_fake_clickhouse(
-        &sandbox,
-        FAKE_VERSION,
-        "#!/bin/sh\nprintf 'child ran\\n'\nexit 0\n",
-        0o755,
-    );
-
-    let output = run_local_client(&sandbox, project.path());
-
-    // The child inherited stdout and its status is the process status: the
-    // image really was replaced.
-    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
-    assert!(stdout_of(&output).contains("child ran"), "{output:?}");
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "exec_attempt");
-    // Fixed 0: censored, not "the native client succeeded".
-    assert_eq!(event["exit_code"], 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn child_exit_status_is_preserved_and_the_event_stays_censored() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    install_fake_clickhouse(
-        &sandbox,
-        FAKE_VERSION,
-        "#!/bin/sh\nprintf 'child ran\\n'\nexit 23\n",
-        0o755,
-    );
-
-    let output = run_local_client(&sandbox, project.path());
-
-    // The shell sees the native client's own status, unmodified.
-    assert_eq!(output.status.code(), Some(23), "{}", stderr_of(&output));
-    assert!(stdout_of(&output).contains("child ran"), "{output:?}");
-
-    // And the event does not claim to know it: `exec_attempt` with a fixed 0
-    // is the documented censored reading, never `ok` and never the child's 23.
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "exec_attempt");
-    assert_eq!(event["exit_code"], 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn the_native_client_keeps_this_process_and_its_stdio() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    // `$$` is the exec'd shell's PID. It equalling the PID the harness spawned
-    // is the whole reason the handoff stays an `exec()` and its telemetry stays
-    // censored: same process means same process group, same session and the
-    // same controlling TTY, so job control, Ctrl-C and window resizes reach the
-    // native client exactly as if the shell had launched it. Reading a line
-    // back off stdin pins that stdin/stdout are inherited, not rewired.
-    install_fake_clickhouse(
-        &sandbox,
-        FAKE_VERSION,
-        "#!/bin/sh\nread line\nprintf 'pid:%s\\nstdin:%s\\n' \"$$\" \"$line\"\nexit 0\n",
-        0o755,
-    );
-
-    let mut child = sandbox
-        .command(&[
-            "local",
-            "client",
-            "--version",
-            FAKE_VERSION,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            "9000",
-        ])
-        .env_clear()
-        .env("HOME", sandbox.home.path())
-        .env("DCTL_TELEMETRY_URL", sandbox.telemetry_url())
-        .current_dir(project.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn dctl");
-    let pid = child.id();
-    {
-        use std::io::Write;
-        let mut stdin = child.stdin.take().expect("piped stdin");
-        stdin
-            .write_all(b"hello\n")
-            .expect("write to inherited stdin");
-    }
-    let output = child.wait_with_output().expect("wait for dctl");
-
-    assert_eq!(output.status.code(), Some(0), "{}", stderr_of(&output));
-    let stdout = stdout_of(&output);
-    assert!(
-        stdout.contains(&format!("pid:{pid}")),
-        "the native client must run as this very process: {stdout}"
-    );
-    assert!(stdout.contains("stdin:hello"), "{stdout}");
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["outcome"], "exec_attempt");
-    assert_eq!(event["exit_code"], 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn signal_terminated_child_reaches_the_shell_as_a_signal() {
-    use std::os::unix::process::ExitStatusExt;
-
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    install_fake_clickhouse(&sandbox, FAKE_VERSION, "#!/bin/sh\nkill -TERM $$\n", 0o755);
-
-    let output = run_local_client(&sandbox, project.path());
-
-    // Killed by a signal, so there is no exit code at all — the shell sees the
-    // native client's death, not a wrapper's translation of it.
-    assert_eq!(output.status.code(), None);
-    assert_eq!(output.status.signal(), Some(15));
-
-    // And telemetry says only that the handoff was reached.
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "exec_attempt");
-    assert_eq!(event["exit_code"], 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn non_executable_binary_is_an_error_event_not_a_handoff() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    install_fake_clickhouse(&sandbox, FAKE_VERSION, "#!/bin/sh\nexit 0\n", 0o644);
-
-    let output = run_local_client(&sandbox, project.path());
-
-    let stderr = stderr_of(&output);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("not executable"), "{stderr}");
-    assert!(
-        stderr.contains("dctl local install"),
-        "the error should say how to repair the install: {stderr}"
-    );
-
-    // A launch that never happened is a failure, not an accepted handoff.
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "error");
-    assert_eq!(event["exit_code"], 1);
-    assert_eq!(event["exit_code"], output.status.code().unwrap());
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn directory_in_place_of_the_binary_is_an_error_event() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    // A directory named `clickhouse` satisfies the `exists()` resolution
-    // checks, so this reaches the launch pre-flight.
-    let binary = sandbox
-        .home
-        .path()
-        .join(".dctl/versions")
-        .join(FAKE_VERSION)
-        .join("clickhouse");
-    std::fs::create_dir_all(&binary).unwrap();
-
-    let output = run_local_client(&sandbox, project.path());
-
-    let stderr = stderr_of(&output);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(stderr.contains("not a regular file"), "{stderr}");
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["outcome"], "error");
-    assert_eq!(event["exit_code"], 1);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn binary_removed_before_the_pre_flight_is_an_error_event() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    let binary = install_fake_clickhouse(&sandbox, FAKE_VERSION, "#!/bin/sh\nexit 0\n", 0o755);
-    // Version resolution lists the directory, but nothing is left to launch:
-    // removal is detected by the pre-flight, so it is an ordinary error.
-    std::fs::remove_file(&binary).unwrap();
-    std::fs::write(binary.parent().unwrap().join("clickhouse.bak"), "stub").unwrap();
-
-    let output = run_local_client(&sandbox, project.path());
-
-    let stderr = stderr_of(&output);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "error");
-    assert_eq!(event["exit_code"], 1);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn launch_failure_after_the_pre_flight_is_censored_never_successful() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    // A regular file with an execute bit — the pre-flight passes — whose
-    // shebang interpreter does not exist, so `execve` fails with the very
-    // ENOENT a binary unlinked between the pre-flight and the launch would
-    // produce. That race is not closable, so this is the deterministic stand-in
-    // for it: the residue lands on the censored outcome, never on `ok`.
-    install_fake_clickhouse(
-        &sandbox,
-        FAKE_VERSION,
-        "#!/no/such/interpreter\nexit 0\n",
-        0o755,
-    );
-
-    let output = run_local_client(&sandbox, project.path());
-
-    let stderr = stderr_of(&output);
-    assert_eq!(output.status.code(), Some(1), "{stderr}");
-    assert!(
-        stderr.contains("Failed to execute ClickHouse"),
-        "the OS launch failure must still reach the shell: {stderr}"
-    );
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["command"], "local client");
-    assert_eq!(event["outcome"], "exec_attempt");
-    assert_eq!(event["exit_code"], 0);
-}
-
-#[cfg(unix)]
-#[tokio::test]
-async fn bad_executable_format_is_censored_never_successful() {
-    let sandbox = Sandbox::new().await;
-    sandbox.write_state(false);
-    let project = tempfile::tempdir().unwrap();
-    // Executable, but not an executable format. The pre-flight passes, and
-    // `execvp` gets ENOEXEC — which POSIX has it answer by re-execing the file
-    // through `/bin/sh`, so the image *is* replaced and the shell reports the
-    // failure with its own non-zero status. Either way dctl is gone by
-    // then: the outcome the event can honestly carry is the censored attempt,
-    // and the status the user sees is not dctl's to choose.
-    install_fake_clickhouse(&sandbox, FAKE_VERSION, "\u{0}\u{1}not a binary\n", 0o755);
-
-    let output = run_local_client(&sandbox, project.path());
-
-    let stderr = stderr_of(&output);
-    assert!(
-        !output.status.success(),
-        "a file that is not an executable format must fail: {stderr}"
-    );
-
-    let event = exactly_one_event(&sandbox).await;
-    assert_eq!(event["outcome"], "exec_attempt");
-    assert_eq!(event["exit_code"], 0);
 }
 
 #[cfg(unix)]
@@ -855,12 +416,12 @@ async fn flag_names_sent_but_values_never_leak() {
     // --json is a real flag; its name may appear but the CI-style value
     // asserts cover named flags with values via the unit tests. Here we pin
     // the end-to-end shape: flags is an array of known names only.
-    let output = sandbox.run(&["local", "--json", "list"]);
+    let output = sandbox.run(&["local", "--json", "server", "list"]);
     assert!(output.status.success());
 
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
-    assert_eq!(event["command"], "local list");
+    assert_eq!(event["command"], "local server list");
     assert_eq!(event["flags"], serde_json::json!(["json"]));
 }
 
@@ -923,28 +484,28 @@ async fn missing_required_positional_is_distinguishable_from_a_supplied_one() {
     let project = tempfile::tempdir().unwrap();
 
     let output = sandbox
-        .command(&["local", "use"])
+        .command(&["local", "install"])
         .current_dir(project.path())
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(2), "{}", stderr_of(&output));
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
-    assert_eq!(event["command"], "local use");
+    assert_eq!(event["command"], "local install");
     assert_eq!(event["outcome"], "missing_required");
     assert_eq!(event["positionals"], serde_json::json!([]));
 
     // Supplied but not installed: the parse succeeded, so the slot is present
     // and the failure is a handler failure, not a usage error.
     let output = sandbox
-        .command(&["local", "remove", "25.12.9.61"])
+        .command(&["local", "install", "25.12.9.61"])
         .current_dir(project.path())
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1), "{}", stderr_of(&output));
     let payloads = sandbox.wait_for_requests(2).await;
     let event = &payloads[1];
-    assert_eq!(event["command"], "local remove");
+    assert_eq!(event["command"], "local install");
     assert_eq!(event["outcome"], "error");
     assert_eq!(event["positionals"], serde_json::json!(["version"]));
     let raw = serde_json::to_string(event).unwrap();
@@ -968,8 +529,8 @@ async fn hostile_positionals_never_appear_on_the_wire() {
         ),
         // Forwarded to clickhouse-client after `--`: not this CLI's shape.
         (
-            &["local", "client", "--", HOSTILE],
-            "local client",
+            &["local", "postgres", "client", "--", HOSTILE],
+            "local postgres client",
             serde_json::json!([]),
         ),
     ];
@@ -1081,8 +642,8 @@ async fn failed_parse_after_positional_captures_later_flags_without_values() {
         "server",
         "start",
         "SECRET-NAME",
-        "--tcp-port",
-        "SECRET-TCP-PORT",
+        "--native-port",
+        "SECRET-NATIVE-PORT",
         "--http-port",
         "SECRET-HTTP-PORT",
     ]);
@@ -1091,7 +652,10 @@ async fn failed_parse_after_positional_captures_later_flags_without_values() {
     let payloads = sandbox.wait_for_requests(1).await;
     let event = &payloads[0];
     assert_eq!(event["command"], "local server start");
-    assert_eq!(event["flags"], serde_json::json!(["http-port", "tcp-port"]));
+    assert_eq!(
+        event["flags"],
+        serde_json::json!(["http-port", "native-port"])
+    );
     // Only the positional definition is recorded; the name stays off the wire.
     assert_eq!(event["positionals"], serde_json::json!(["name"]));
     assert_eq!(event["exit_code"], 2);
@@ -1111,13 +675,17 @@ async fn invalid_local_versions_report_invalid_value_without_dispatch_side_effec
             "local install",
             "not.a.version",
         ),
-        (&["local", "use", "25.12.9"], "local use", "25.12.9"),
+        (&["local", "install", "25"], "local install", "25"),
         (
             &["local", "server", "start", "--version", "25.12.9.61.2"],
             "local server start",
             "25.12.9.61.2",
         ),
-        (&["local", "use", "postgres@18"], "local use", "postgres@18"),
+        (
+            &["local", "server", "start", "--version", "falkordb@4.20.6"],
+            "local server start",
+            "falkordb@4.20.6",
+        ),
     ];
 
     for (index, (args, command, operand)) in cases.iter().enumerate() {
@@ -1173,7 +741,7 @@ async fn do_not_track_is_fully_silent() {
     let sandbox = Sandbox::new().await;
 
     let output = sandbox
-        .command(&["local", "list"])
+        .command(&["local", "server", "list"])
         .env("DO_NOT_TRACK", "1")
         .output()
         .unwrap();
@@ -1199,7 +767,7 @@ async fn non_utf8_do_not_track_is_fully_silent() {
     let sandbox = Sandbox::new().await;
 
     let output = sandbox
-        .command(&["local", "list"])
+        .command(&["local", "server", "list"])
         .env(
             "DO_NOT_TRACK",
             std::ffi::OsString::from_vec(vec![0xff, 0xfe]),
@@ -1229,7 +797,7 @@ async fn disable_persists_and_silences() {
         r#"{"disabled":true}"#
     );
 
-    let output = sandbox.run(&["local", "list"]);
+    let output = sandbox.run(&["local", "server", "list"]);
     assert!(output.status.success());
     assert!(!stderr_of(&output).contains("anonymous usage data"));
 
@@ -1395,7 +963,7 @@ async fn debug_mode_prints_payload_without_sending() {
     sandbox.write_state(false);
 
     let output = sandbox
-        .command(&["local", "list"])
+        .command(&["local", "server", "list"])
         .env("DCTL_TELEMETRY_DEBUG", "1")
         .output()
         .unwrap();
@@ -1403,7 +971,7 @@ async fn debug_mode_prints_payload_without_sending() {
 
     let stderr = stderr_of(&output);
     assert!(
-        stderr.contains(r#""command":"local list""#),
+        stderr.contains(r#""command":"local server list""#),
         "debug mode must print the payload to stderr, got: {stderr}"
     );
     sandbox.assert_no_requests().await;
@@ -1447,7 +1015,7 @@ async fn parent_never_waits_for_a_slow_endpoint() {
 
     let started = Instant::now();
     let output = sandbox
-        .command(&["local", "list"])
+        .command(&["local", "server", "list"])
         .env(
             "DCTL_TELEMETRY_URL",
             format!("{}{}", mock.uri(), sandbox.endpoint_path),
@@ -1491,7 +1059,7 @@ async fn parent_never_waits_for_a_slow_endpoint() {
 #[tokio::test]
 async fn marker_lives_in_dot_clickhouse_telemetry_json() {
     let sandbox = Sandbox::new().await;
-    let output = sandbox.run(&["local", "list"]);
+    let output = sandbox.run(&["local", "server", "list"]);
     assert!(output.status.success());
     assert!(sandbox.state_path().exists());
     let entries: Vec<_> = std::fs::read_dir(sandbox.home.path().join(".dctl"))
@@ -1531,7 +1099,7 @@ async fn closed_stderr_never_panics_or_bypasses_telemetry() {
     // A failing command: the `Error: ...` line and the update notice both hit
     // the closed stderr; the handler's exit code 1 survives (not panic's 101)
     // and the failure event still goes out.
-    let output = sandbox.run_with_closed_stderr(&["local", "remove", "no-such-version-xyz"]);
+    let output = sandbox.run_with_closed_stderr(&["local", "server", "stop", "no-such-name-xyz"]);
     assert_eq!(output.status.code(), Some(1), "failure must keep exit 1");
     let payloads = sandbox.wait_for_requests(2).await;
     assert_eq!(payloads[1]["exit_code"], 1);

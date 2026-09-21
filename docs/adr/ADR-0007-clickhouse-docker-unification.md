@@ -21,6 +21,8 @@ ClickHouse 走与 Postgres/FalkorDB 完全同构的容器生命周期(Clickhouse
 
 ## Consequences
 
+- 退出码 3(Cancelled)随取消路径退役:dctl 自身不再产生 3;`ChildExit` 透传的 3 是容器内子进程退出码,既有消费者应按此重读(ADR-0007 变更交代)。
+
 - 好面:三引擎一套生命周期模式(蓝本复用度极高),代码量净减约 4900 行源码 + 6500 行测试;不再需要 builds.clickhouse.com 二进制下载;进程信号管理(watchdog/SIGKILL 父子对)整体消失
 - 好面:client 零宿主依赖(HTTP 内置 + docker exec 回退),-q 模式比 exec 二进制更快(无进程创建开销)
 - 坏面:ClickHouse 用户必须装 Docker(原二进制模式可裸跑);local use/which/remove 等版本管理命令消失(镜像由 Docker 管理,无 default 概念);--foreground 交互模式失去对应物(降级为 docker attach 或删除)

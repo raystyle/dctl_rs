@@ -57,14 +57,53 @@ pub(crate) fn parse_ch_tag_arg(tag: &str) -> std::result::Result<String, String>
         .map_err(|error| error.to_string())
 }
 
-pub(crate) fn parse_ch_port_arg(value: &str) -> std::result::Result<u16, String> {
-    let port = value
-        .parse::<u16>()
-        .map_err(|_| format!("invalid port '{value}': expected an integer from 1 to 65535"))?;
+pub(crate) fn parse_ch_http_port_arg(value: &str) -> std::result::Result<u16, String> {
+    let port = parse_ch_port_value(value)?;
     if port == 0 {
-        return Err("--port 0 is not allowed; pick a specific port or omit the flag".into());
+        return Err("--http-port 0 is not allowed; pick a specific port or omit the flag".into());
     }
     Ok(port)
+}
+
+pub(crate) fn parse_ch_native_port_arg(value: &str) -> std::result::Result<u16, String> {
+    let port = parse_ch_port_value(value)?;
+    if port == 0 {
+        return Err("--native-port 0 is not allowed; pick a specific port or omit the flag".into());
+    }
+    Ok(port)
+}
+
+fn parse_ch_port_value(value: &str) -> std::result::Result<u16, String> {
+    value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port '{value}': expected an integer from 1 to 65535"))
+}
+
+/// `-e KEY=VALUE` for `server start`: shape plus the managed-key guard, the
+/// same contract pg/fk enforce at clap time.
+pub(crate) fn parse_ch_env_arg(assignment: &str) -> std::result::Result<String, String> {
+    let (key, _) = assignment
+        .split_once('=')
+        .ok_or_else(|| format!("expected KEY=VALUE, got '{assignment}'"))?;
+    if key.is_empty() || key.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "invalid env key '{key}': must not be empty or start with a digit"
+        ));
+    }
+    if !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return Err(format!(
+            "invalid env key '{key}': only [A-Za-z0-9_] allowed"
+        ));
+    }
+    if matches!(
+        key,
+        "CLICKHOUSE_USER" | "CLICKHOUSE_PASSWORD" | "CLICKHOUSE_DB"
+    ) {
+        return Err(format!(
+            "{key} is managed by dctl; use the corresponding flag instead of --env"
+        ));
+    }
+    Ok(assignment.to_string())
 }
 
 /// Tag stored in `ServerInfo.version` back to bare form.
@@ -333,6 +372,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             .await);
         }
 
+        warn_if_credentials_rejected(http_port, &user, &password, &database).await;
         let out = output::ClickhouseStartOutput {
             name: user_name,
             container_id,
@@ -480,6 +520,17 @@ fn resolve_ch_start_version_locked(
     }
 }
 
+/// A binary-era ClickHouse entry (no container): dctl can no longer manage
+/// the process itself, but stop/remove must still be able to clear its
+/// metadata and data directory (the promise in server.rs's is_alive docs).
+fn legacy_ch_info_locked(
+    user_name: &str,
+    lock: &server::MetadataLock,
+) -> Result<Option<ServerInfo>> {
+    Ok(server::load_info_locked(user_name, lock)?
+        .filter(|info| info.engine == Engine::Clickhouse && info.container_id.is_none()))
+}
+
 /// Resolve `[NAME] [--version <V>]` to a single Docker-managed ClickHouse instance.
 fn resolve_ch_target_locked(
     user_name: &str,
@@ -518,10 +569,39 @@ async fn resume_existing(
     let container_id = prior.container_id.clone().expect("checked by caller");
     let display_name = ch_user_name_from_key(&prior.name).to_string();
 
+    // The identity comes from the container's effective env — the same source
+    // dotenv and client read — so a resume reports what is actually
+    // provisioned, not the defaults. The password is intentionally not
+    // reprinted (it is recoverable via `dotenv`).
+    let (user, _password, database) = read_ch_env(docker, &container_id).await;
+
     docker::start_existing(docker, &container_id).await?;
 
+    // Refresh both host ports from the container's own bindings: a recovered
+    // instance (or metadata predating a port change) can carry 0 or stale
+    // values, and every later client/dotenv call trusts them.
+    let inspected = docker::inspect_container(docker, &container_id)
+        .await
+        .ok()
+        .flatten();
+    // A HostPort of "0" means "not bound here"; keep the prior value
+    // rather than probing an invalid port.
+    let http_port = docker::host_port_from_inspect(inspected.as_ref(), "8123/tcp")
+        .filter(|port| *port != 0)
+        .unwrap_or(prior.http_port);
+    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), "9000/tcp")
+        .filter(|port| *port != 0)
+        .unwrap_or(prior.tcp_port);
+    if http_port == 0 {
+        return Err(Error::ClickhouseUsage(format!(
+            "cannot determine the HTTP port of container '{container_id}'; \
+             run `dctl local server remove {display_name}` and start fresh"
+        )));
+    }
     let info = ServerInfo {
         started_at: server::now_timestamp(),
+        http_port,
+        tcp_port,
         ..prior
     };
     if let Err(primary) = server::save_server_info_locked(&info, &metadata_lock) {
@@ -546,16 +626,17 @@ async fn resume_existing(
         let _ = docker::stop_container(docker, &container_id).await;
         return Err(error);
     }
+    warn_if_credentials_rejected(info.http_port, &user, &_password, &database).await;
 
     let out = output::ClickhouseStartOutput {
-        name: display_name,
+        name: display_name.clone(),
         container_id,
-        image: info.version,
+        image: info.version.clone(),
         http_port: info.http_port,
         native_port: info.tcp_port,
-        user: DEFAULT_USER.to_string(),
+        user,
         password: String::new(),
-        database: DEFAULT_DATABASE.to_string(),
+        database,
     };
     output::print_output(&out, json);
     Ok(())
@@ -568,6 +649,28 @@ pub(crate) fn ch_user_name_from_key(key: &str) -> &str {
         return &key[..idx];
     }
     key
+}
+
+/// `/ping` answers without authentication, so a server whose data directory
+/// predates this start may be "ready" with credentials the printed env does
+/// not match (the image only applies CLICKHOUSE_PASSWORD on first init).
+/// One authenticated SELECT 1 turns that silent mismatch into a warning.
+async fn warn_if_credentials_rejected(http_port: u16, user: &str, password: &str, database: &str) {
+    if let Err(error) = http_query(
+        "127.0.0.1",
+        http_port,
+        Some(user),
+        Some(password),
+        Some(database),
+        "SELECT 1",
+    )
+    .await
+    {
+        eprintln!(
+            "Warning: the server is up but rejected the printed credentials ({error}). \
+             An existing data directory keeps the password from its first initialization."
+        );
+    }
 }
 
 // ── readiness: host-side GET /ping ─────────────────────────────────────────
@@ -836,10 +939,17 @@ pub(crate) async fn http_query(
         .map_err(|e| Error::ClickhouseUsage(format!("ClickHouse HTTP query failed: {e}")))?;
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(Error::ClickhouseUsage(format!(
-            "ClickHouse HTTP {status}: {body}"
-        )));
+        let mut body = response.text().await.unwrap_or_default();
+        if body.contains("Multi-statements are not allowed") {
+            body.push_str(
+                "\n(The HTTP interface executes one statement per request; \
+                 split the file or query, or use interactive mode.)",
+            );
+        }
+        return Err(Error::ClickhouseHttp {
+            status: status.as_u16(),
+            body,
+        });
     }
     Ok(response.text().await.unwrap_or_default())
 }
@@ -862,21 +972,51 @@ async fn read_ch_env(docker: &bollard::Docker, id: &str) -> (String, String, Str
     )
 }
 
-pub(crate) async fn client(
-    name: Option<String>,
-    version: Option<String>,
-    host: Option<String>,
-    port: Option<u16>,
-    query: Option<String>,
-    queries_file: Option<String>,
-    database: Option<String>,
-) -> Result<()> {
-    // Direct mode: HTTP to the given host/port.
+/// Direct-mode (`--host/--port`) credentials; managed mode reads them from
+/// the container env instead.
+pub(crate) struct DirectCreds {
+    pub user: Option<String>,
+    pub password: Option<String>,
+}
+
+/// `dctl local client` flags, verbatim from clap.
+pub(crate) struct ClientCmd {
+    pub name: Option<String>,
+    pub version: Option<String>,
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub query: Option<String>,
+    pub queries_file: Option<String>,
+    pub database: Option<String>,
+    pub direct: DirectCreds,
+}
+
+pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
+    let ClientCmd {
+        name,
+        version,
+        host,
+        port,
+        query,
+        queries_file,
+        database,
+        direct,
+    } = cmd;
+    // Direct mode: HTTP to the given host/port, with optional credentials
+    // (dctl-managed instances always require them).
     if host.is_some() || port.is_some() {
         let h = host.unwrap_or_else(|| "127.0.0.1".to_string());
         let p = port.unwrap_or(DEFAULT_CH_HTTP_PORT);
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
-        let result = http_query(&h, p, None, None, database.as_deref(), &sql).await?;
+        let result = http_query(
+            &h,
+            p,
+            direct.user.as_deref(),
+            direct.password.as_deref(),
+            database.as_deref(),
+            &sql,
+        )
+        .await?;
         print!("{result}");
         return Ok(());
     }
@@ -952,19 +1092,47 @@ pub(crate) async fn stop(name: &str, version: Option<&str>, json: bool) -> Resul
     server::validate_server_name(name)?;
     let metadata_lock = server::lock_metadata()?;
     server::recover_current_project_servers_locked(&metadata_lock)?;
-    let target = resolve_ch_target_locked(name, version, &metadata_lock)?;
-    if !json {
-        let display = format!(
-            "{} ({})",
-            ch_user_name_from_key(&target.name),
-            target.version
-        );
-        println!("Stopping ClickHouse {display}...");
-    }
-    server::kill_server_locked(&target.name, &metadata_lock)?;
+    let target = match resolve_ch_target_locked(name, version, &metadata_lock) {
+        Ok(target) => Some(target),
+        Err(Error::ServerNotFound(_)) => None,
+        Err(error) => return Err(error),
+    };
+    let already_stopped = match &target {
+        Some(target) if server::is_server_running_locked(&target.name, &metadata_lock)? => {
+            if !json {
+                println!(
+                    "Stopping ClickHouse {} ({})...",
+                    ch_user_name_from_key(&target.name),
+                    target.version
+                );
+            }
+            server::kill_server_locked(&target.name, &metadata_lock)?;
+            false
+        }
+        // Stopped Docker instance: idempotent success (README promises it).
+        Some(_) => true,
+        None => {
+            // Binary-era entry: the process itself is beyond dctl's reach;
+            // zero the stale pid so the entry reads cleanly as stopped.
+            let legacy = legacy_ch_info_locked(name, &metadata_lock)?
+                .ok_or_else(|| Error::ServerNotFound(name.to_string()))?;
+            server::mark_server_stopped_locked(name, legacy.pid, &metadata_lock)?;
+            if !json {
+                println!(
+                    "Note: '{}' is a binary-era instance without a container; \
+                     stop the old process manually if it still runs.",
+                    name
+                );
+            }
+            true
+        }
+    };
     let out = output::ServerStopOutput {
-        name: ch_user_name_from_key(&target.name).to_string(),
-        already_stopped: false,
+        name: target
+            .as_ref()
+            .map(|info| ch_user_name_from_key(&info.name).to_string())
+            .unwrap_or_else(|| name.to_string()),
+        already_stopped,
         selection: None,
     };
     output::print_output(&out, json);
@@ -976,7 +1144,32 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
     let metadata_lock = server::lock_metadata()?;
     server::recover_current_project_servers_locked(&metadata_lock)?;
 
-    let target = resolve_ch_target_locked(name, version, &metadata_lock)?;
+    let target = match resolve_ch_target_locked(name, version, &metadata_lock) {
+        Ok(target) => target,
+        Err(Error::ServerNotFound(_)) => {
+            // Binary-era entry: clear the metadata and data directory; the
+            // old process (if any) has to be stopped by hand.
+            let legacy = legacy_ch_info_locked(name, &metadata_lock)?
+                .ok_or_else(|| Error::ServerNotFound(name.to_string()))?;
+            let legacy_dir = server::servers_dir_join(&legacy.name);
+            server::try_remove_server_info_locked(&legacy.name, &metadata_lock)?;
+            docker::remove_host_dir_blocking(&legacy_dir)?;
+            if !json {
+                println!(
+                    "Note: removed binary-era metadata for '{}' (no container); \
+                     stop the old process manually if it still runs.",
+                    name
+                );
+            }
+            let out = output::ServerRemoveOutput {
+                name: name.to_string(),
+                selection: None,
+            };
+            output::print_output(&out, json);
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     let key = target.name.clone();
     if server::is_server_running_locked(&key, &metadata_lock)? {
         let tag = tag_from_stored_version(&target.version);

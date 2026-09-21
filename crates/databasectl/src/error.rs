@@ -17,10 +17,10 @@ pub enum PortKind {
 impl PortKind {
     fn human_guidance(self) -> &'static str {
         match self {
-            Self::Postgres | Self::Falkordb | Self::FalkordbBrowser | Self::Clickhouse => {
-                "; choose another --port or omit --port to auto-select a free port"
+            Self::Postgres => "; choose another --port or omit --port to auto-select a free port",
+            Self::Falkordb | Self::FalkordbBrowser | Self::Clickhouse | Self::Http => {
+                "; choose another port or omit it to auto-select a free port"
             }
-            Self::Http => "",
         }
     }
 }
@@ -131,6 +131,13 @@ pub enum Error {
     /// A Docker-managed ClickHouse validation or state error.
     #[error("ClickHouse error: {0}")]
     ClickhouseUsage(String),
+
+    /// A ClickHouse HTTP query failed with a non-success status. The body is
+    /// the engine's own error text — kept for human output, summarized in
+    /// structured output (the redacted arm in local::output), like the
+    /// Docker daemon text in [`Error::DockerError`].
+    #[error("ClickHouse HTTP {status}: {body}")]
+    ClickhouseHttp { status: u16, body: String },
 
     /// A child process whose status must be returned unchanged. This is
     /// intentionally not printed as a dctl error by `run_parsed`.
@@ -265,8 +272,9 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
-    /// Process exit code: `0` success, `1` error, `3` cancelled.
-    /// Clap reserves `2` for usage errors.
+    /// Process exit code: `0` success, `1` error. Clap reserves `2` for
+    /// usage errors; `ChildExit` passes a child's status through unchanged
+    /// (so a 3 is a child exit code, not a dctl cancellation).
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::ChildExit(code) => *code,

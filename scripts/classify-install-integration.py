@@ -21,22 +21,20 @@ INSTALL_EXACT_PATHS = frozenset(
         "crates/databasectl/src/http.rs",
         "crates/databasectl/src/init.rs",
         "crates/databasectl/src/local/cli.rs",
-        "crates/databasectl/src/local/discovery.rs",
+        "crates/databasectl/src/local/clickhouse.rs",
         "crates/databasectl/src/local/mod.rs",
         "crates/databasectl/src/local/output.rs",
         "crates/databasectl/src/local/server.rs",
-        "crates/databasectl/src/local/symlink.rs",
         "crates/databasectl/src/main.rs",
         "crates/databasectl/src/paths.rs",
         "crates/databasectl/src/user_agent.rs",
-        "crates/databasectl/tests/local_install_local_first_test.rs",
-        "crates/databasectl/tests/local_version_error_test.rs",
+        "crates/databasectl/tests/local_clickhouse_docker_test.rs",
         "scripts/classify-install-integration.py",
         "scripts/tests/test_classify_install_integration.py",
     }
 )
 
-INSTALL_PREFIXES = ("crates/databasectl/src/version_manager/",)
+INSTALL_PREFIXES = ()
 
 # Explicit non-install mappings make the scope reviewable while allowing the
 # inventory test to reject an unclassified new shared/local source or test.

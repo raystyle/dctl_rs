@@ -32,7 +32,7 @@ pub enum Commands {
 CONTEXT FOR AGENTS:
   Project-scoped commands use `.dctl` under the exact current directory; parent directories
   are not searched. Run them from the project root.
-  `dctl local server start` bootstraps from zero — installs `latest` if nothing is set up.
+  `dctl local server start` pulls `clickhouse/clickhouse-server:26.8` if the image is missing.
   Typical flow: `local server start` -> `local client -q 'SELECT 1'`")]
     Local(LocalArgs),
 
@@ -436,6 +436,8 @@ mod tests {
             for long in [false, true] {
                 // The ClickHouse client adds --database after the query
                 // inputs; Postgres keeps its args passthrough instead.
+                // The ClickHouse client also owns the direct-mode
+                // credential flags after the passthrough args retired.
                 let expected: &[&str] = if has_database {
                     &[
                         "host",
@@ -444,6 +446,8 @@ mod tests {
                         "query",
                         "queries-file",
                         "database",
+                        "user",
+                        "password",
                         "json",
                         "help",
                     ]

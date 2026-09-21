@@ -65,6 +65,27 @@ impl LocalArgs {
         crate::local::postgres::validate_pg_start_env_args(password.as_deref(), env).err()
     }
 
+    /// Duplicate `-e KEY=...` assignments would silently let Docker pick the
+    /// last one; reject them at parse time like pg does.
+    pub(crate) fn clickhouse_start_validation_error(&self) -> Option<String> {
+        let LocalCommands::Server {
+            command: ServerCommands::Start { env, .. },
+        } = &self.command
+        else {
+            return None;
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        for assignment in env {
+            let key = assignment.split('=').next().unwrap_or_default();
+            if !seen.insert(key.to_string()) {
+                return Some(format!(
+                    "--env key '{key}' is passed more than once; keep one assignment per key"
+                ));
+            }
+        }
+        None
+    }
+
     pub(crate) fn falkor_start_validation_error(&self) -> Option<String> {
         let LocalCommands::Falkordb {
             command: FalkorCommands::Start { env, .. },
@@ -103,7 +124,10 @@ CONTEXT FOR AGENTS:
 CONTEXT FOR AGENTS:
   Default mode looks up a Docker-managed server; queries run via the HTTP interface
   (no clickhouse-client binary needed). Interactive mode uses docker exec.
-  Direct mode (--host/--port) connects via HTTP to any ClickHouse server.
+  Direct mode (--host/--port) connects via HTTP to any ClickHouse server; pass
+  --user/--password when that server requires auth (dctl-managed instances do).
+  The HTTP interface executes ONE statement per --query/--queries-file; split
+  multi-statement files or use interactive mode for them.
   `--query` output stays native even with --json or a coding agent.")]
     Client {
         /// Server name to connect to (default: "default")
@@ -155,6 +179,16 @@ CONTEXT FOR AGENTS:
         #[arg(long)]
         #[arg(display_order = 6)]
         database: Option<String>,
+
+        /// User for direct mode (--host/--port) authentication
+        #[arg(long, conflicts_with_all = ["name", "name_flag"])]
+        #[arg(display_order = 7)]
+        user: Option<String>,
+
+        /// Password for direct mode (--host/--port) authentication
+        #[arg(long, conflicts_with_all = ["name", "name_flag"])]
+        #[arg(display_order = 8)]
+        password: Option<String>,
     },
 
     /// Manage local server instances
@@ -405,6 +439,8 @@ CONTEXT FOR AGENTS:
   Docker-managed: same container lifecycle as Postgres and FalkorDB.
   Ports: 8123 (HTTP) and 9000 (native); auto-picked when busy, never the same.
   The generated password is printed once by start; query later with `local client -q`.
+  An existing stopped instance is resumed; --user/--password/--database/--config/--env and
+  the port flags are ignored on a resume (the container keeps its settings).
   A failed fresh start rolls back container and data; pre-existing data is kept.")]
     Start {
         /// Server name (default: "default", or random if default is already running)
@@ -425,11 +461,11 @@ CONTEXT FOR AGENTS:
         version: Option<String>,
 
         /// HTTP port; when omitted, 8123 if free else auto-selected
-        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_port_arg)]
+        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_http_port_arg)]
         http_port: Option<u16>,
 
         /// Native TCP port; when omitted, 9000 if free else auto-selected
-        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_port_arg)]
+        #[arg(long, value_parser = crate::local::clickhouse::parse_ch_native_port_arg)]
         native_port: Option<u16>,
 
         /// CLICKHOUSE_USER (default: default)
@@ -451,7 +487,12 @@ CONTEXT FOR AGENTS:
         /// Extra container env vars; repeatable, each key at most once
         ///
         /// CLICKHOUSE_USER/PASSWORD/DB are managed; use the corresponding flags.
-        #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
+        #[arg(
+            short = 'e',
+            long = "env",
+            value_name = "KEY=VALUE",
+            value_parser = crate::local::clickhouse::parse_ch_env_arg
+        )]
         env: Vec<String>,
 
         /// Seconds to wait for readiness (maximum: 600)
@@ -957,8 +998,8 @@ mod tests {
                 vec!["--version", "25"],
                 "invalid or unsupported ClickHouse version",
             ),
-            (vec!["--http-port", "0"], "--port 0 is not allowed"),
-            (vec!["--native-port", "0"], "--port 0 is not allowed"),
+            (vec!["--http-port", "0"], "--http-port 0 is not allowed"),
+            (vec!["--native-port", "0"], "--native-port 0 is not allowed"),
             (vec!["--http-port", "not-a-port"], "expected an integer"),
             (vec!["--wait-timeout", "0"], "1..=600"),
             (vec!["--wait-timeout", "601"], "1..=600"),
@@ -996,6 +1037,79 @@ mod tests {
             };
             assert_eq!(config_file.as_deref(), Some("analytics"));
         }
+    }
+
+    #[test]
+    fn server_start_rejects_bad_env_at_clap_time() {
+        for (args, expected) in [
+            (vec!["-e", "NO_EQUALS"], "expected KEY=VALUE"),
+            (
+                vec!["-e", "1KEY=value"],
+                "must not be empty or start with a digit",
+            ),
+            (vec!["-e", "BAD-KEY=value"], "only [A-Za-z0-9_] allowed"),
+            (
+                vec!["-e", "CLICKHOUSE_PASSWORD=secret"],
+                "CLICKHOUSE_PASSWORD is managed by dctl",
+            ),
+            (
+                vec!["-e", "CLICKHOUSE_USER=admin"],
+                "CLICKHOUSE_USER is managed by dctl",
+            ),
+        ] {
+            let argv: Vec<&str> = ["server", "start"]
+                .iter()
+                .chain(args.iter())
+                .copied()
+                .collect();
+            let error = local_parse_error(&argv);
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{args:?}"
+            );
+            assert!(error.to_string().contains(expected), "{args:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn server_start_rejects_duplicate_env_keys_after_parse() {
+        // Duplicates pass clap (each assignment is well-formed) and are
+        // rejected by the post-parse validation, like pg's password/env rule.
+        let args = local_args(&["server", "start", "-e", "FOO=1", "--env", "FOO=2"]);
+        let message = args
+            .clickhouse_start_validation_error()
+            .expect("duplicate keys must be rejected");
+        assert!(
+            message.contains("'FOO' is passed more than once"),
+            "{message}"
+        );
+
+        let single = local_args(&["server", "start", "-e", "FOO=1", "-e", "BAR=2"]);
+        assert_eq!(single.clickhouse_start_validation_error(), None);
+    }
+
+    #[test]
+    fn client_direct_mode_accepts_user_and_password() {
+        let LocalCommands::Client { user, password, .. } = local_command(&[
+            "client",
+            "--host",
+            "db.example",
+            "--user",
+            "app",
+            "--password",
+            "secret",
+        ]) else {
+            panic!("expected client");
+        };
+        assert_eq!(user.as_deref(), Some("app"));
+        assert_eq!(password.as_deref(), Some("secret"));
+
+        // Credentials are direct-mode-only: they conflict with a NAME.
+        assert_eq!(
+            local_parse_error(&["client", "dev", "--user", "app"]).kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
     }
 
     #[test]

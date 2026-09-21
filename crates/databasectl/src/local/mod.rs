@@ -49,16 +49,19 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
             query,
             queries_file,
             database,
+            user,
+            password,
         } => {
-            clickhouse::client(
-                name.or(name_flag),
+            clickhouse::client(clickhouse::ClientCmd {
+                name: name.or(name_flag),
                 version,
                 host,
                 port,
                 query,
                 queries_file,
                 database,
-            )
+                direct: clickhouse::DirectCreds { user, password },
+            })
             .await
         }
         LocalCommands::Server { command } => run_server_commands(command, json).await,
@@ -324,23 +327,14 @@ fn list_servers_local(json: bool) -> Result<()> {
                             } else {
                                 None
                             };
-                            // ClickHouse resolves its version and ports on each
-                            // start, so stopped entries expose identity only.
-                            let version = if !is_ch || running {
-                                Some(info.version)
-                            } else {
-                                None
-                            };
-                            let http_port = if is_ch && running {
-                                Some(info.http_port)
-                            } else {
-                                None
-                            };
-                            let tcp_port = if !is_ch || running {
-                                Some(info.tcp_port)
-                            } else {
-                                None
-                            };
+                            // The version is persistent instance identity
+                            // (needed to pick --version among same-name
+                            // instances), so it shows while stopped; ports
+                            // may be 0 for a stopped container and stay
+                            // hidden until the next start refreshes them.
+                            let version = Some(info.version);
+                            let http_port = if running { Some(info.http_port) } else { None };
+                            let tcp_port = if running { Some(info.tcp_port) } else { None };
                             // For the Docker engines the disk key carries a
                             // version suffix; show users the friendly name.
                             let display = match info.engine {

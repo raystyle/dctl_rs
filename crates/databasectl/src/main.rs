@@ -145,7 +145,10 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
     }
 
     if let Commands::Local(args) = &cli.command {
-        let Some(message) = args.postgres_start_validation_error() else {
+        let Some(message) = args
+            .postgres_start_validation_error()
+            .or_else(|| args.clickhouse_start_validation_error())
+        else {
             if let Some(message) = args.falkor_start_validation_error() {
                 let start = cmd
                     .find_subcommand_mut("local")

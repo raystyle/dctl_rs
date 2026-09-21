@@ -325,6 +325,43 @@ fn direct_database_is_passed_as_a_query_parameter() {
 }
 
 #[test]
+fn direct_credentials_ride_as_basic_auth() {
+    let project = tempfile::tempdir().unwrap();
+    let http = FakeClickhouseHttp::start(None);
+    let output = run(
+        project.path(),
+        &[
+            "local",
+            "client",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &http.port.to_string(),
+            "--user",
+            "app",
+            "--password",
+            "secret",
+            "--query",
+            "SELECT 1",
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let exchange = &http.exchanges()[0];
+    let auth = exchange
+        .headers
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+        .map(|(_, value)| value.trim().to_string())
+        .expect("Authorization header present");
+    assert!(auth.starts_with("Basic "), "basic auth scheme: {auth}");
+}
+
+#[test]
 fn direct_http_error_maps_to_clickhouse_error_envelope() {
     let project = tempfile::tempdir().unwrap();
     let http = FakeClickhouseHttp::start(Some(
@@ -345,15 +382,32 @@ fn direct_http_error_maps_to_clickhouse_error_envelope() {
         ],
     );
     assert!(!output.status.success());
+    // The engine's error body is foreign output: the machine envelope carries
+    // a curated summary, the human stderr keeps the full text.
     let result: serde_json::Value = serde_json::from_slice(&output.stderr).expect("error JSON");
     assert_eq!(result["error"]["code"], "clickhouse_error");
+    assert_eq!(
+        result["error"]["message"], "ClickHouse HTTP query failed with status 500",
+        "{result}"
+    );
+
+    let human = run(
+        project.path(),
+        &[
+            "local",
+            "client",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &http.port.to_string(),
+            "--query",
+            "SELECT * FROM events",
+        ],
+    );
+    assert!(!human.status.success());
     assert!(
-        result["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("Table default.events does not exist"),
-        "{}",
-        result
+        String::from_utf8_lossy(&human.stderr).contains("Table default.events does not exist"),
+        "human output keeps the engine's own error text"
     );
 }
 
