@@ -652,10 +652,18 @@ fn server_entry_locked_policy(
         Ok(running) => running,
         Err(Error::DockerNotAvailable(details)) if lenient_docker => {
             // A read-only listing stays usable without the daemon; strict
-            // callers (stop-all) still see the error.
+            // callers (stop-all) still see the error. Show the friendly
+            // name — the same one the listing itself renders.
+            let friendly = match info.engine {
+                Engine::Clickhouse => {
+                    crate::local::clickhouse::ch_user_name_from_key(name).to_string()
+                }
+                Engine::Postgres => crate::local::postgres::user_name_from_key(name).to_string(),
+                Engine::Falkordb => crate::local::falkordb::user_name_from_key(name).to_string(),
+            };
             eprintln!(
                 "Warning: Docker is unavailable ({details}); showing '{}' as stopped.",
-                name
+                friendly
             );
             false
         }

@@ -16,6 +16,9 @@ trace: null
 
 ## Criteria
 
+- 契约注记(评审轮 1 F4):client 的 HTTP 查询面一次只执行一条语句(-q/--queries-file 各一条);多语句文件(如 init 生成的 seed)走交互模式或自行拆分。这是当前契约,非缺陷。
+
+
 - [ ] `server start` 创建 ClickHouse 容器(双端口 8123+9000、数据 bind mount、配置 overlay ro 挂载、随机密码、ulimit 262144);`server stop/remove` 走容器生命周期
 - [ ] 就绪探测:宿主侧 GET /ping 等 Ok.(三引擎中唯一可宿主探测)
 - [ ] `local client -q 'SELECT 1'` 走 HTTP POST(body = SQL);`--queries-file` 同;交互走 docker exec TTY;直连(--host/--port)走 HTTP
