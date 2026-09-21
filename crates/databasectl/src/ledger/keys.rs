@@ -64,14 +64,13 @@ fn key_pair_from_text(text: &str, source: &str) -> Result<ledger_client::KeyPair
         pem_seed_hex(trimmed, source)?
     } else if trimmed.len() == 64 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
         trimmed.to_ascii_lowercase()
-    } else if let Ok(from_path) = std::fs::read_to_string(trimmed)
-        .map_err(|_| ())
-        .and_then(|content| key_pair_from_text(&content, trimmed).map_err(|_| ()))
-    {
+    } else if let Ok(content) = std::fs::read_to_string(trimmed) {
         // The env form may carry a PATH to the PEM (vault/CI injection) —
-        // same material, resolved one hop away. Recursion is bounded by the
-        // filesystem: a path whose target is itself a path fails here.
-        return Ok(from_path);
+        // same material, resolved one hop away. The inner error names the
+        // file, so "unreadable path" and "readable but invalid content"
+        // stay distinguishable. Recursion is bounded by the filesystem: a
+        // path whose target is itself a path fails the material checks.
+        return key_pair_from_text(&content, trimmed);
     } else {
         return Err(Error::Ledger(format!(
             "the ledger key in {source} is neither a PEM block, a 64-hex seed, \
