@@ -16,7 +16,11 @@ use std::io::Write;
 
 pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
     match cmd {
-        LocalCommands::Install { version, force } => install(version, force, json).await,
+        LocalCommands::Install {
+            version,
+            force,
+            registry,
+        } => install(version, force, registry.as_deref(), json).await,
         LocalCommands::Init => {
             let result = init::init()?;
             let mut paths = Vec::new();
@@ -72,7 +76,12 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
     }
 }
 
-async fn install_postgres(tag: &str, force: bool, json: bool) -> Result<()> {
+async fn install_postgres(
+    tag: &str,
+    force: bool,
+    registry_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
     postgres::validate_pg_tag(tag)?;
     let docker = docker::connect().await?;
     let image_ref = format!("postgres:{tag}");
@@ -88,7 +97,7 @@ async fn install_postgres(tag: &str, force: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    docker::pull_image(&docker, &image_ref, json).await?;
+    docker::pull_image(&docker, &image_ref, json, registry_override).await?;
 
     let out = output::InstallOutput {
         version: format!("postgres@{tag}"),
@@ -98,7 +107,12 @@ async fn install_postgres(tag: &str, force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn install_falkordb(tag: &str, force: bool, json: bool) -> Result<()> {
+async fn install_falkordb(
+    tag: &str,
+    force: bool,
+    registry_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
     falkordb::validate_fk_tag(tag)?;
     let docker = docker::connect().await?;
     let image_ref = falkordb::fk_image_ref(tag);
@@ -114,7 +128,7 @@ async fn install_falkordb(tag: &str, force: bool, json: bool) -> Result<()> {
         return Ok(());
     }
 
-    docker::pull_image(&docker, &image_ref, json).await?;
+    docker::pull_image(&docker, &image_ref, json, registry_override).await?;
 
     let out = output::InstallOutput {
         version: format!("falkordb@{tag}"),
@@ -124,15 +138,31 @@ async fn install_falkordb(tag: &str, force: bool, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn install(version: InstallVersionArg, force: bool, json: bool) -> Result<()> {
+async fn install(
+    version: InstallVersionArg,
+    force: bool,
+    registry_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
     match version {
-        InstallVersionArg::ClickHouse(tag) => install_clickhouse(&tag, force, json).await,
-        InstallVersionArg::Postgres(tag) => install_postgres(&tag, force, json).await,
-        InstallVersionArg::Falkordb(version) => install_falkordb(&version, force, json).await,
+        InstallVersionArg::ClickHouse(tag) => {
+            install_clickhouse(&tag, force, registry_override, json).await
+        }
+        InstallVersionArg::Postgres(tag) => {
+            install_postgres(&tag, force, registry_override, json).await
+        }
+        InstallVersionArg::Falkordb(version) => {
+            install_falkordb(&version, force, registry_override, json).await
+        }
     }
 }
 
-async fn install_clickhouse(tag: &str, force: bool, json: bool) -> Result<()> {
+async fn install_clickhouse(
+    tag: &str,
+    force: bool,
+    registry_override: Option<&str>,
+    json: bool,
+) -> Result<()> {
     clickhouse::validate_ch_tag(tag)?;
     let docker = docker::connect().await?;
     let image_ref = clickhouse::ch_image_ref(tag);
@@ -147,7 +177,7 @@ async fn install_clickhouse(tag: &str, force: bool, json: bool) -> Result<()> {
         output::print_output(&out, json);
         return Ok(());
     }
-    docker::pull_image(&docker, &image_ref, json).await?;
+    docker::pull_image(&docker, &image_ref, json, registry_override).await?;
     let out = output::InstallOutput {
         version: format!("clickhouse@{tag}"),
         set_as_default: false,

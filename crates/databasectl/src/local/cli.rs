@@ -11,7 +11,9 @@ const INSTALL_AFTER_HELP: &str = "\
 CONTEXT FOR AGENTS:
   Every selector pulls a Docker image (needs Docker running); nothing is set as a default.
   ClickHouse accepts an image tag (26.8, 26.8.9.10, latest); `postgres@<tag>` and
-  `falkordb@<version>` select the other engines.";
+  `falkordb@<version>` select the other engines.
+  Pulls go private-registry first (ADR-0010); --registry <url> targets a specific
+  v2 source for this invocation instead.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallVersionArg {
@@ -161,6 +163,10 @@ pub enum LocalCommands {
         /// Re-install even if already installed
         #[arg(long)]
         force: bool,
+
+        /// Pull from this v2 registry instead of the default chain (ADR-0010)
+        #[arg(long)]
+        registry: Option<String>,
     },
 
     /// Initialize a project directory for ClickHouse, Postgres and FalkorDB
@@ -313,6 +319,10 @@ CONTEXT FOR AGENTS:
     Pull {
         /// Image reference against the private registry (default tag: latest)
         reference: String,
+
+        /// Pull from this v2 registry instead of the default endpoint (ADR-0010)
+        #[arg(long)]
+        registry: Option<String>,
     },
 
     /// List repositories in the private registry
@@ -1000,7 +1010,7 @@ mod tests {
     #[test]
     fn registry_pull_accepts_tagged_and_digest_references() {
         let LocalCommands::Registry {
-            command: RegistryCommands::Pull { reference },
+            command: RegistryCommands::Pull { reference, .. },
         } = local_command(&["registry", "pull", "db/tools:1.0"])
         else {
             panic!("expected registry pull");
@@ -1008,7 +1018,7 @@ mod tests {
         assert_eq!(reference, "db/tools:1.0");
 
         let LocalCommands::Registry {
-            command: RegistryCommands::Pull { reference },
+            command: RegistryCommands::Pull { reference, .. },
         } = local_command(&["registry", "pull", "db/tools@sha256:aaaaaaaaaaaaaaaa"])
         else {
             panic!("expected registry pull");
@@ -1058,6 +1068,46 @@ mod tests {
         assert_eq!(query.as_deref(), Some("MATCH (n) RETURN n"));
         assert_eq!(graph.as_deref(), Some("social"));
         assert_eq!(password.as_deref(), Some("sekret"));
+    }
+
+    #[test]
+    fn install_parses_the_registry_override() {
+        let LocalCommands::Install {
+            registry, force, ..
+        } = local_command(&[
+            "install",
+            "postgres@18",
+            "--registry",
+            "https://mirror.example.com",
+        ])
+        else {
+            panic!("expected install");
+        };
+        assert_eq!(registry.as_deref(), Some("https://mirror.example.com"));
+        assert!(!force);
+    }
+
+    #[test]
+    fn registry_pull_parses_the_registry_override() {
+        let LocalCommands::Registry {
+            command:
+                RegistryCommands::Pull {
+                    reference,
+                    registry,
+                    ..
+                },
+        } = local_command(&[
+            "registry",
+            "pull",
+            "postgres:18",
+            "--registry",
+            "https://mirror.example.com",
+        ])
+        else {
+            panic!("expected registry pull");
+        };
+        assert_eq!(reference, "postgres:18");
+        assert_eq!(registry.as_deref(), Some("https://mirror.example.com"));
     }
 
     #[test]

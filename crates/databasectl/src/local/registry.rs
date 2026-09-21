@@ -171,7 +171,14 @@ pub(crate) struct RegistryClient {
 
 impl RegistryClient {
     pub(crate) fn new() -> Result<Self> {
-        let base = registry_base();
+        Self::with_endpoint(None)
+    }
+
+    /// Construct with an explicit endpoint override (ADR-0010 --registry):
+    /// the CLI threads the per-invocation flag here instead of mutating
+    /// process env.
+    pub(crate) fn with_endpoint(endpoint: Option<&str>) -> Result<Self> {
+        let base = endpoint.map(strip_userinfo).unwrap_or_else(registry_base);
         let (scheme, host) = match base.strip_prefix("https://") {
             Some(host) => ("https", host),
             None => match base.strip_prefix("http://") {
@@ -530,10 +537,14 @@ pub(crate) async fn docker_load(docker: &bollard::Docker, tar_path: &Path) -> Re
 pub(crate) async fn run(cmd: crate::local::cli::RegistryCommands, json: bool) -> Result<()> {
     use crate::local::cli::RegistryCommands;
     match cmd {
-        RegistryCommands::Pull { reference } => {
+        RegistryCommands::Pull {
+            reference,
+            registry,
+        } => {
             let docker = crate::local::docker::connect().await?;
             let (name, tag) = split_reference(&reference);
-            let digest = pull_named_to_layout(&docker, &name, &tag, true).await?;
+            let digest =
+                pull_named_to_layout_with(&docker, &name, &tag, true, registry.as_deref()).await?;
             if json {
                 println!(
                     "{}",
@@ -630,13 +641,36 @@ pub(crate) async fn pull_via_registry(docker: &bollard::Docker, image_ref: &str)
         .map(|_| ())
 }
 
+/// Pull from an explicitly given v2 endpoint (ADR-0010 `--registry`):
+/// constructs a one-shot client for that endpoint, same layout pipeline.
+pub(crate) async fn pull_via_registry_from(
+    docker: &bollard::Docker,
+    image_ref: &str,
+    endpoint: &str,
+) -> Result<()> {
+    let (name, tag) = split_reference(image_ref);
+    pull_named_to_layout_with(docker, &name, &tag, true, Some(endpoint))
+        .await
+        .map(|_| ())
+}
+
 async fn pull_named_to_layout(
     docker: &bollard::Docker,
     name: &str,
     tag: &str,
     refresh_cache: bool,
 ) -> Result<String> {
-    let client = RegistryClient::new()?;
+    pull_named_to_layout_with(docker, name, tag, refresh_cache, None).await
+}
+
+async fn pull_named_to_layout_with(
+    docker: &bollard::Docker,
+    name: &str,
+    tag: &str,
+    refresh_cache: bool,
+    endpoint: Option<&str>,
+) -> Result<String> {
+    let client = RegistryClient::with_endpoint(endpoint)?;
     let staging = tempfile::tempdir()
         .map_err(|error| Error::Registry(format!("cannot create a staging directory: {error}")))?;
     let digest = client.pull_to_layout(name, tag, staging.path()).await?;

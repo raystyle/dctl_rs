@@ -74,7 +74,7 @@ $ dctl local install falkordb@4.20.6  # 或 falkordb:latest
 
 ### 私仓直连与离线回落
 
-引擎 `install`/`start` 的镜像获取走透明回落链(ADR-0008):Docker Hub 优先,失败转私仓 registry.ohmygh.com(dctl 原生 v2 客户端拉取 OCI layout 并 `docker load`),再失败用本地缓存 tar;私仓拉取成功后自动刷新缓存。显式走私仓道:
+引擎 `install`/`start` 的镜像获取走透明回落链(ADR-0010):私仓 registry.ohmygh.com 优先(dctl 原生 v2 客户端拉取 OCI layout 并 `docker load`),失败转 Docker Hub(守护进程道),再失败用本地缓存 tar;私仓拉取成功后自动刷新缓存。`install` 与 `registry pull` 可用 `--registry <url>` 按次指定自定义 v2 源。显式走私仓道:
 
 ```console
 $ dctl local registry pull postgres:18   # 强制私仓拉取并刷新缓存;亦接受 name@sha256:<digest>

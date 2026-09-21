@@ -312,22 +312,49 @@ impl PullReporter {
     }
 }
 
-/// Pull an image through the ADR-0008 fallback chain: daemon pull from
-/// Docker Hub, then the private registry over native v2 (OCI layout +
-/// docker load), then the local cache tar. The Hub error is what surfaces;
-/// every fallback step announces itself and its failure reason on stderr
-/// so the chain stays observable end to end.
-pub async fn pull_image(docker: &Docker, image_ref: &str, structured_output: bool) -> Result<()> {
-    match hub_pull(docker, image_ref, structured_output).await {
+/// Pull an image through the ADR-0010 chain: the private registry first
+/// (native v2, OCI layout + docker load), then the daemon's Docker Hub
+/// pull, then the local cache tar. The private-registry error is what
+/// surfaces; every fallback step announces itself and its failure reason
+/// on stderr so the chain stays observable end to end.
+pub async fn pull_image(
+    docker: &Docker,
+    image_ref: &str,
+    structured_output: bool,
+    registry_override: Option<&str>,
+) -> Result<()> {
+    // An explicit --registry bypasses the chain: that source, then cache.
+    if let Some(endpoint) = registry_override {
+        eprintln!("pulling {image_ref} from {endpoint}");
+        return match crate::local::registry::pull_via_registry_from(docker, image_ref, endpoint)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(reason) => {
+                eprintln!("registry pull from {endpoint} failed: {reason}");
+                match crate::local::registry::load_from_cache(docker, image_ref).await {
+                    Ok(true) => {
+                        eprintln!("loaded {image_ref} from the local registry cache");
+                        Ok(())
+                    }
+                    Ok(false) => Err(reason),
+                    Err(cache_reason) => {
+                        eprintln!("local cache load failed: {cache_reason}");
+                        Err(reason)
+                    }
+                }
+            }
+        };
+    }
+    match crate::local::registry::pull_via_registry(docker, image_ref).await {
         Ok(()) => Ok(()),
         Err(primary) => {
             eprintln!(
-                "Docker Hub pull failed ({primary}); trying {} then the local cache",
-                crate::local::registry::registry_base()
+                "private registry pull failed ({primary}); trying Docker Hub then the local cache"
             );
-            match crate::local::registry::pull_via_registry(docker, image_ref).await {
+            match hub_pull(docker, image_ref, structured_output).await {
                 Ok(()) => return Ok(()),
-                Err(reason) => eprintln!("private registry pull failed: {reason}"),
+                Err(reason) => eprintln!("Docker Hub pull failed: {reason}"),
             }
             match crate::local::registry::load_from_cache(docker, image_ref).await {
                 Ok(true) => {

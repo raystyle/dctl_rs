@@ -84,6 +84,7 @@ fn run_install(tag: &str, pull_response: &str) -> Output {
     command
         .env_clear()
         .env("HOME", tempdir.path())
+        .env("DCTL_REGISTRY_URL", "http://127.0.0.1:1")
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .args(["local", "install", &format!("postgres@{tag}"), "--force"])
         .stdout(Stdio::piped())
@@ -125,9 +126,16 @@ fn non_tty_pull_collapses_repeated_layer_events() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(
-        String::from_utf8(output.stderr).unwrap(),
-        "Pulling postgres:18... done\n"
+    // Private-first chain: the registry attempt fails fast (dead
+    // endpoint) and announces itself, then the Hub pull proceeds.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.starts_with("private registry pull failed"),
+        "registry preamble missing: {stderr}"
+    );
+    assert!(
+        stderr.ends_with("Pulling postgres:18... done\n"),
+        "unexpected tail: {stderr}"
     );
 }
 
@@ -141,7 +149,7 @@ fn non_tty_pull_reports_failure_once_and_preserves_diagnostics() {
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
     assert!(
-        stderr.starts_with("Pulling postgres:18-missing... failed\n"),
+        stderr.contains("Pulling postgres:18-missing... failed\n"),
         "unexpected stderr: {stderr}"
     );
     assert!(

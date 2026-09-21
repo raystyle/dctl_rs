@@ -310,7 +310,7 @@ async fn start(
         if prior.is_none() {
             let image_ref = format!("postgres:{tag}");
             if !docker::image_exists(&docker, &image_ref).await? {
-                docker::pull_image(&docker, &image_ref, json).await?;
+                docker::pull_image(&docker, &image_ref, json, None).await?;
             }
             docker::ensure_name_free(
                 &docker,
