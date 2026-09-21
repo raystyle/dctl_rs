@@ -9,7 +9,6 @@ on:
 permissions:
   contents: read
 
-env:
 jobs:
   build:
     name: Build ${{ matrix.target }}
