@@ -17,9 +17,24 @@ use error::{Error, Result};
 
 #[tokio::main]
 async fn main() {
+    // REQ-011: `local` is the default mode — engine subcommands promote to
+    // the top level via argv preprocessing (both `dctl server start` and
+    // `dctl local server start` parse identically). A full tree restructure
+    // can follow later; this is the zero-breakage transition.
+    const ENGINE_COMMANDS: &[&str] = &[
+        "server", "postgres", "falkordb", "registry", "install", "init", "client",
+    ];
+    let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    if raw_args.len() > 1 {
+        let second = raw_args[1].to_string_lossy().to_string();
+        if ENGINE_COMMANDS.contains(&second.as_str()) {
+            raw_args.insert(1, "local".into());
+        }
+    }
+
     // Parse via ArgMatches (rather than `Cli::try_parse()`) so post-parse
     // validation can attach errors to the right subcommand in the tree.
-    let argv: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    let argv: Vec<std::ffi::OsString> = raw_args;
     let mut cmd = Cli::command();
 
     // Single-exit invariant (#320): every invocation — bare, help, version,

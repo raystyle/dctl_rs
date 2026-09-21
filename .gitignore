@@ -28,3 +28,4 @@
 /.kiro/
 __pycache__/
 /crates/databasectl/.dctl/
+.dctl/

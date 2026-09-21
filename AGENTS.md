@@ -1,6 +1,6 @@
 # dctl_rs
 
-dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容器生命周期管理 CLI,宿主免装数据库客户端(三引擎程序化查询全原生:ClickHouse 内置 HTTP、Postgres 内置 tokio-postgres、FalkorDB 内置官方 falkordb;交互式 REPL 走容器内 psql/redis-cli),是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
+dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容器生命周期管理 CLI,宿主免装数据库客户端(三引擎程序化查询全原生:ClickHouse 内置 HTTP、Postgres 内置 tokio-postgres、FalkorDB 内置官方 falkordb;交互式 REPL 走容器内 psql/redis-cli),是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`(`local` 前缀可省,引擎命令直出顶层)。
 
 `CLAUDE.md` 是一行 `@AGENTS.md` 桥接;只编辑 `AGENTS.md`,不另写第二份。
 
@@ -29,7 +29,7 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 
 ## Read first
 
-- 命令面:`dctl --help`;用户行为:README.md
+- 命令面:`dctl --help`(`local` 前缀可省,引擎命令直出顶层);用户行为:README.md
 - 决策与 why:`docs/adr/`(改对应决策时才读);需求:`docs/requirements/`
 - 协作流程:`docs/guides/`;过程与踩坑:`docs/diary/` 与 `docs/research/`
 - 源码检索:先 `crates/databasectl/src/local/cli.rs`(命令定义)到 `crates/databasectl/src/local/mod.rs`(分发)到专属模块

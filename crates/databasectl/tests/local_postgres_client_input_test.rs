@@ -92,3 +92,14 @@ fn missing_queries_file_fails_before_any_connection() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("no-such-file.sql"), "{stderr}");
 }
+
+#[test]
+fn engine_commands_work_without_the_local_prefix() {
+    // REQ-011: `dctl server list` and `dctl local server list` are
+    // equivalent (argv preprocessing in main).
+    let home = tempfile::tempdir().unwrap();
+    let bare = run_dctl(home.path(), &["server", "list", "--json"]);
+    let prefixed = run_dctl(home.path(), &["local", "server", "list", "--json"]);
+    assert_eq!(bare.status.code(), prefixed.status.code());
+    assert_eq!(bare.stdout, prefixed.stdout);
+}
