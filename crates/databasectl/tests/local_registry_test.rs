@@ -218,9 +218,22 @@ fn read_request(stream: &mut TcpStream) -> Option<HttpRequest> {
 }
 
 fn respond(stream: &mut TcpStream, fixtures: &Fixtures, request: &HttpRequest, corrupt: bool) {
-    let (status, content_type, body) = if request.path == "/v2/" {
-        (200_u16, "application/json", b"{}".to_vec())
-    } else if request.path == "/v2/_catalog" {
+    // registry:2-style handshake on the API root: anonymous pings get a
+    // Basic challenge, credentialed pings pass. The client library answers
+    // the challenge and rides credentials on the real requests after.
+    if request.path == "/v2/" {
+        let head = if request.authorization.is_none() {
+            "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"stub\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}"
+        };
+        let _ = stream.write_all(head.as_bytes());
+        if request.authorization.is_some() {
+            let _ = stream.write_all(b"{}");
+        }
+        return;
+    }
+    let (status, content_type, body) = if request.path == "/v2/_catalog" {
         (
             200,
             "application/json",

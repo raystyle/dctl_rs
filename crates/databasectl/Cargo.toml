@@ -21,7 +21,6 @@ bin-dir = "dctl-{ target }-v{ version }/{ bin }{ binary-ext }"
 
 [dependencies]
 bytes = "1"
-sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "query", "rustls"] }
@@ -49,8 +48,10 @@ rand = "0.10.1"
 tempfile = "3.27.0"
 serde_ignored = "0.1.14"
 ledger-client = { git = "https://github.com/raystyle/ledger-rs", tag = "v0.1.1" }
+oci-client = "0.18.0"
 
 [dev-dependencies]
 serde_json = "1"
+sha2 = "0.10"
 tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6.5"

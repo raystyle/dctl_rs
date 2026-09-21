@@ -1,16 +1,20 @@
 //! Private-registry fallback for image pulls (ADR-0008, REQ-005).
 //!
-//! A native registry v2 client: manifests (with manifest-list platform
-//! selection), blob downloads verified by digest, and assembly of an OCI
-//! image layout that `docker load` accepts. Credentials come from the local
-//! archive (`~/.dctl/registry/auth`) or the `DCTL_REGISTRY_AUTH` carrier —
-//! never from argv, never logged.
+//! The direct leg wraps the official oci-client library (user ruling
+//! 2026-09-21): manifests with manifest-list platform selection, blob
+//! downloads verified by digest, and assembly of an OCI image layout that
+//! `docker load` accepts. Credentials come from the local archive
+//! (`~/.dctl/registry/auth`) or the `DCTL_REGISTRY_AUTH` carrier — never
+//! from argv, never logged.
 //!
 //! Pulls flow through the fallback chain decided in the ADR: daemon pull
 //! from Docker Hub first, then this client against registry.ohmygh.com,
 //! then the local cache tar. Successful private pulls refresh the cache.
 
 use crate::error::{Error, Result};
+use oci_client::client::{ClientConfig, ClientProtocol};
+use oci_client::secrets::RegistryAuth as OciRegistryAuth;
+use oci_client::{Client as OciClient, Reference};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -21,71 +25,63 @@ const URL_ENV: &str = "DCTL_REGISTRY_URL";
 
 /// Manifest media types we accept and can consume, across the OCI and
 /// Docker-registry families.
-const MANIFEST_TYPES: &str = "application/vnd.oci.image.index.v1+json, \
-     application/vnd.oci.image.manifest.v1+json, \
-     application/vnd.docker.distribution.manifest.list.v2+json, \
-     application/vnd.docker.distribution.manifest.v2+json";
-
-fn registry_error(context: &str, source: reqwest::Error) -> Error {
-    Error::Registry(format!("{context}: {source}"))
-}
-
-fn sha256_hex(data: &[u8]) -> String {
-    use sha2::Digest;
-    let sum = sha2::Sha256::digest(data);
-    sum.iter().map(|b| format!("{b:02x}")).collect()
-}
+const MANIFEST_TYPES: [&str; 4] = [
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+];
 
 /// Basic credentials for the private registry, resolved from the carrier
 /// env or the local archive. Absent credentials are fine — the registry
 /// decides what needs auth.
-pub(crate) struct RegistryAuth(String);
-
-impl RegistryAuth {
-    pub(crate) fn load() -> Result<Self> {
-        if let Some(text) = std::env::var(AUTH_ENV).ok().filter(|s| !s.is_empty()) {
-            return Ok(Self(Self::normalize(&text)?));
-        }
-        let path = crate::paths::base_dir()
-            .map(|base| base.join("registry").join("auth"))
-            .map_err(|error| {
-                Error::Registry(format!(
-                    "no home directory for the registry archive: {error}"
-                ))
-            })?;
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            return Ok(Self(String::new()));
-        };
-        warn_if_insecure(&path);
-        Ok(Self(Self::normalize(text.trim())?))
+fn registry_credentials() -> Result<OciRegistryAuth> {
+    if let Some(text) = std::env::var(AUTH_ENV).ok().filter(|s| !s.is_empty()) {
+        return parse_credentials(&text);
     }
+    let path = crate::paths::base_dir()
+        .map(|base| base.join("registry").join("auth"))
+        .map_err(|error| {
+            Error::Registry(format!(
+                "no home directory for the registry archive: {error}"
+            ))
+        })?;
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Ok(OciRegistryAuth::Anonymous);
+    };
+    warn_if_insecure(&path);
+    parse_credentials(text.trim())
+}
 
-    /// Accept `user:password` or a ready basic token; anything else is an
-    /// explicit error naming the expected shape.
-    fn normalize(text: &str) -> Result<String> {
-        use base64::Engine as _;
-        if text.is_empty() {
-            return Ok(String::new());
-        }
-        if text.contains(':') {
-            let raw = base64::engine::general_purpose::STANDARD.encode(text);
-            return Ok(format!("Basic {raw}"));
-        }
-        if text.starts_with("Basic ") {
-            return Ok(text.to_string());
-        }
-        Err(Error::Registry(
-            "the registry credential must be 'user:password' or a 'Basic <token>' line".to_string(),
-        ))
+/// Accept `user:password` or a ready basic token; anything else is an
+/// explicit error naming the expected shape.
+fn parse_credentials(text: &str) -> Result<OciRegistryAuth> {
+    use base64::Engine as _;
+    if text.is_empty() {
+        return Ok(OciRegistryAuth::Anonymous);
     }
-
-    fn as_header(&self) -> Option<(&'static str, &str)> {
-        if self.0.is_empty() {
-            None
-        } else {
-            Some(("Authorization", self.0.as_str()))
+    if let Some((user, password)) = text.split_once(':') {
+        return Ok(OciRegistryAuth::Basic(
+            user.to_string(),
+            password.to_string(),
+        ));
+    }
+    if let Some(token) = text.strip_prefix("Basic ") {
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(token.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|pair| {
+                pair.split_once(':')
+                    .map(|(user, password)| (user.to_string(), password.to_string()))
+            });
+        if let Some((user, password)) = decoded {
+            return Ok(OciRegistryAuth::Basic(user, password));
         }
     }
+    Err(Error::Registry(
+        "the registry credential must be 'user:password' or a 'Basic <token>' line".to_string(),
+    ))
 }
 
 /// Group/other-readable archives warn (like the ledger key), not fail.
@@ -141,53 +137,52 @@ fn strip_userinfo(endpoint: &str) -> String {
 }
 
 pub(crate) struct RegistryClient {
-    base: String,
-    http: reqwest::Client,
-    auth: RegistryAuth,
+    client: OciClient,
+    auth: OciRegistryAuth,
+    /// host[:port] of the endpoint, scheme already resolved into the config
+    registry: String,
 }
 
 impl RegistryClient {
     pub(crate) fn new() -> Result<Self> {
-        let http = crate::http::client_builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .map_err(|error| Error::Registry(format!("http client: {error}")))?;
+        let base = registry_base();
+        let (scheme, host) = match base.strip_prefix("https://") {
+            Some(host) => ("https", host),
+            None => match base.strip_prefix("http://") {
+                Some(host) => ("http", host),
+                None => ("https", base.as_str()),
+            },
+        };
+        let protocol = if scheme == "http" {
+            ClientProtocol::Http
+        } else {
+            ClientProtocol::Https
+        };
+        let config = ClientConfig {
+            protocol,
+            read_timeout: Some(Duration::from_secs(300)),
+            connect_timeout: Some(Duration::from_secs(30)),
+            ..Default::default()
+        };
         Ok(Self {
-            base: registry_base().trim_end_matches('/').to_string(),
-            http,
-            auth: RegistryAuth::load()?,
+            client: OciClient::new(config),
+            auth: registry_credentials()?,
+            registry: host.trim_end_matches('/').to_string(),
         })
     }
 
     /// Repository names from `/v2/_catalog`.
     pub(crate) async fn catalog(&self) -> Result<Vec<String>> {
-        let mut request = self.http.get(format!("{}/v2/_catalog", self.base));
-        if let Some(header) = self.auth.as_header() {
-            request = request.header(header.0, header.1);
-        }
-        let response = request
-            .send()
+        let reference = Reference::with_tag(
+            self.registry.clone(),
+            "_catalog".to_string(),
+            "latest".to_string(),
+        );
+        self.client
+            .catalog(&reference, &self.auth, None, None)
             .await
-            .map_err(|error| registry_error("registry catalog request failed", error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Registry(format!(
-                "registry catalog {status}: {}",
-                response.text().await.unwrap_or_default()
-            )));
-        }
-        let body: Value = response
-            .json()
-            .await
-            .map_err(|error| registry_error("registry catalog decode failed", error))?;
-        Ok(body["repositories"]
-            .as_array()
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|value| value.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default())
+            .map(|response| response.repositories)
+            .map_err(|error| Error::Registry(format!("registry catalog request failed: {error}")))
     }
 
     /// Fetch a manifest by reference, selecting the platform image when the
@@ -228,89 +223,39 @@ impl RegistryClient {
         name: &str,
         reference: &str,
     ) -> Result<(Value, Vec<u8>, String)> {
-        let mut request = self
-            .http
-            .get(format!("{}/v2/{name}/manifests/{reference}", self.base))
-            .header("Accept", MANIFEST_TYPES);
-        if let Some(header) = self.auth.as_header() {
-            request = request.header(header.0, header.1);
-        }
-        let response = request
-            .send()
+        let image = reference_for(&self.registry, name, reference);
+        let (bytes, digest) = self
+            .client
+            .pull_manifest_raw(&image, &self.auth, &MANIFEST_TYPES)
             .await
-            .map_err(|error| registry_error("registry manifest request failed", error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Registry(format!(
-                "registry manifest {name}:{reference} {status}: {}",
-                response.text().await.unwrap_or_default()
-            )));
-        }
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|error| registry_error("registry manifest download failed", error))?
-            .to_vec();
+            .map_err(|error| {
+                Error::Registry(format!("registry manifest {name}:{reference}: {error}"))
+            })?;
         let body: Value = serde_json::from_slice(&bytes).map_err(|error| {
             Error::Registry(format!("registry manifest decode failed: {error}"))
         })?;
-        // Computed from the delivered bytes, so the layout's content
-        // addressing always holds even when the header is absent.
-        let digest = format!("sha256:{}", sha256_hex(&bytes));
-        Ok((body, bytes, digest))
+        // The library validates the digest against the delivered bytes (and
+        // the reference's own digest when pinned), so the layout's content
+        // addressing holds by construction.
+        Ok((body, bytes.to_vec(), digest))
     }
 
-    /// Download a blob by digest, verifying sha256 against the path it lands
-    /// at in the layout (content addressing doubles as integrity check).
-    /// Layers reach GB scale, so the body streams: hash and write chunk by
-    /// chunk, then compare the digest; a mismatch leaves the partial file
-    /// behind only inside the pull's staging tempdir, which is dropped.
+    /// Download a blob by digest straight into `dest`; the library streams
+    /// the body and verifies the digest against the content as it lands
+    /// (content addressing doubles as integrity check). A mismatch leaves
+    /// the partial file behind only inside the pull's staging tempdir,
+    /// which is dropped with the failed pull.
     async fn blob_to(&self, name: &str, digest: &str, dest: &Path) -> Result<()> {
-        use futures_util::StreamExt;
-        use sha2::Digest;
-        use tokio::io::AsyncWriteExt;
-
-        let Some(hex) = digest.strip_prefix("sha256:") else {
-            return Err(Error::Registry(format!(
-                "unsupported blob digest '{digest}' (only sha256)"
-            )));
-        };
-        let mut request = self
-            .http
-            .get(format!("{}/v2/{name}/blobs/{digest}", self.base));
-        if let Some(header) = self.auth.as_header() {
-            request = request.header(header.0, header.1);
-        }
-        let response = request
-            .send()
-            .await
-            .map_err(|error| registry_error("registry blob request failed", error))?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(Error::Registry(format!("registry blob {digest} {status}")));
-        }
+        let image =
+            Reference::with_digest(self.registry.clone(), name.to_string(), digest.to_string());
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let mut file = tokio::fs::File::create(dest).await?;
-        let mut hasher = sha2::Sha256::new();
-        let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk =
-                chunk.map_err(|error| registry_error("registry blob download failed", error))?;
-            hasher.update(&chunk);
-            file.write_all(&chunk).await?;
-        }
-        let actual: String = hasher
-            .finalize()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
-        if actual != hex {
-            return Err(Error::Registry(format!(
-                "blob digest mismatch for {digest}: downloaded content hashes to sha256:{actual}"
-            )));
-        }
+        let file = tokio::fs::File::create(dest).await?;
+        self.client
+            .pull_blob(&image, digest, file)
+            .await
+            .map_err(|error| Error::Registry(format!("registry blob {digest}: {error}")))?;
         Ok(())
     }
 
@@ -571,6 +516,23 @@ fn display_reference(name: &str, tag: &str) -> String {
         format!("{name}@{tag}")
     } else {
         format!("{name}:{tag}")
+    }
+}
+
+/// Build the library reference for a name plus tag-or-digest string.
+fn reference_for(registry: &str, name: &str, tag_or_digest: &str) -> Reference {
+    if tag_or_digest.starts_with("sha256:") {
+        Reference::with_digest(
+            registry.to_string(),
+            name.to_string(),
+            tag_or_digest.to_string(),
+        )
+    } else {
+        Reference::with_tag(
+            registry.to_string(),
+            name.to_string(),
+            tag_or_digest.to_string(),
+        )
     }
 }
 
