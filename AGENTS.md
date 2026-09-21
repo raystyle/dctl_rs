@@ -1,6 +1,6 @@
 # dctl_rs
 
-dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容器生命周期管理 CLI(client 内置集成),是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
+dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容器生命周期管理 CLI,宿主免装数据库客户端(ClickHouse 走 dctl 内置 HTTP 客户端,Postgres/FalkorDB 宿主客户端优先、回退容器内执行),是 ClickHouse/clickhousectl 的剪枝自维护 fork。公开契约以 `///` 契约注释与类型签名为准;命令面真相是 `dctl --help`。
 
 `CLAUDE.md` 是一行 `@AGENTS.md` 桥接;只编辑 `AGENTS.md`,不另写第二份。
 
