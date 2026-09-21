@@ -32,7 +32,7 @@ pub enum Commands {
 CONTEXT FOR AGENTS:
   Project-scoped commands use `.dctl` under the exact current directory; parent directories
   are not searched. Run them from the project root.
-  `dctl local server start` bootstraps from zero — installs `latest` if nothing is set up.
+  `dctl local server start` pulls `clickhouse/clickhouse-server:26.8` if the image is missing.
   Typical flow: `local server start` -> `local client -q 'SELECT 1'`")]
     Local(LocalArgs),
 
@@ -409,14 +409,17 @@ mod tests {
         tree.build();
         let local = tree.find_subcommand("local").unwrap();
         let clients = [
-            local.find_subcommand("client").unwrap(),
-            local
-                .find_subcommand("postgres")
-                .unwrap()
-                .find_subcommand("client")
-                .unwrap(),
+            (local.find_subcommand("client").unwrap(), true),
+            (
+                local
+                    .find_subcommand("postgres")
+                    .unwrap()
+                    .find_subcommand("client")
+                    .unwrap(),
+                false,
+            ),
         ];
-        for client in clients {
+        for (client, has_database) in clients {
             let name = client
                 .get_arguments()
                 .find(|arg| arg.get_id() == "name")
@@ -431,18 +434,35 @@ mod tests {
             assert_eq!(alias.get_long(), Some("name"));
             assert_eq!(alias.get_short(), Some('n'));
             for long in [false, true] {
-                assert_eq!(
-                    rendered_options(client, long),
-                    [
+                // The ClickHouse client adds --database after the query
+                // inputs; Postgres keeps its args passthrough instead.
+                // The ClickHouse client also owns the direct-mode
+                // credential flags after the passthrough args retired.
+                let expected: &[&str] = if has_database {
+                    &[
+                        "host",
+                        "port",
+                        "version",
+                        "query",
+                        "queries-file",
+                        "database",
+                        "user",
+                        "password",
+                        "json",
+                        "help",
+                    ]
+                } else {
+                    &[
                         "host",
                         "port",
                         "version",
                         "query",
                         "queries-file",
                         "json",
-                        "help"
+                        "help",
                     ]
-                );
+                };
+                assert_eq!(rendered_options(client, long), expected);
                 let help = if long {
                     client.clone().render_long_help()
                 } else {

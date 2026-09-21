@@ -180,37 +180,30 @@ EOF
 
 # ── 10. Engine-specific and unified stop-all scopes ──
 case_stop_all_engine_scopes() (
-    sleep 300 &
-    local ch_pid; ch_pid=$!
-    disown "$ch_pid"
-    trap 'kill "$ch_pid" 2>/dev/null || true; wait "$ch_pid" 2>/dev/null || true' EXIT
-
-    mkdir -p .dctl/servers/c/data
-    cat > .dctl/servers/c.json <<EOF
-{"name":"c","pid":$ch_pid,"version":"25.12.5.44","http_port":8123,"tcp_port":9000,"started_at":"0","cwd":"$PWD","engine":"clickhouse"}
-EOF
+    # Both engines are Docker-managed now; scoping is checked with a real
+    # ClickHouse container (the binary-era fake-pid fixture retired with
+    # version_manager — dctl can no longer signal foreign processes).
+    "$CTL" local server start --http-port 18123 --native-port 19000 >/dev/null 2>&1 || { die "start clickhouse"; return 1; }
     "$CTL" local postgres start --name p --version 18-alpine >/dev/null 2>&1 || { die "start postgres"; return 1; }
 
     "$CTL" local postgres stop-all >/dev/null 2>&1 || { die "postgres stop-all"; return 1; }
     local list; list=$("$CTL" local --json server list 2>&1) || { die "list after postgres stop-all: $list"; return 1; }
-    jq -e '.servers | any(.name == "c" and .engine == "clickhouse" and .running == true)' <<<"$list" >/dev/null \
+    jq -e '.servers | any(.name == "default" and .engine == "clickhouse" and .running == true)' <<<"$list" >/dev/null \
         || { die "postgres stop-all stopped ClickHouse: $list"; return 1; }
     jq -e '.servers | any(.name == "p" and .engine == "postgres" and .running == false)' <<<"$list" >/dev/null \
         || { die "postgres stop-all did not stop Postgres: $list"; return 1; }
 
     "$CTL" local postgres start --name p --version 18-alpine >/dev/null 2>&1 || { die "restart postgres"; return 1; }
     local out; out=$("$CTL" local --json server stop-all 2>&1) || { die "server stop-all: $out"; return 1; }
-    jq -e '.servers | any(.name == "c" and .engine == "clickhouse" and .stopped == true)' <<<"$out" >/dev/null \
+    jq -e '.servers | any(.engine == "clickhouse" and .stopped == true)' <<<"$out" >/dev/null \
         || { die "server stop-all did not report ClickHouse: $out"; return 1; }
     jq -e '.servers | any(.name == "p" and .engine == "postgres" and .version == "postgres:18-alpine" and .stopped == true)' <<<"$out" >/dev/null \
         || { die "server stop-all did not report Postgres: $out"; return 1; }
-    ! kill -0 "$ch_pid" 2>/dev/null || { die "server stop-all left ClickHouse process running"; return 1; }
-    trap - EXIT
-    wait "$ch_pid" 2>/dev/null || true
 
     list=$("$CTL" local --json server list 2>&1) || { die "list after server stop-all: $list"; return 1; }
-    jq -e '[.servers[] | select((.name == "c" or .name == "p") and .running == false)] | length == 2' <<<"$list" >/dev/null \
+    jq -e '[.servers[] | select(.running == false)] | length == 2' <<<"$list" >/dev/null \
         || { die "server stop-all left an engine running: $list"; return 1; }
+    "$CTL" local server remove >/dev/null 2>&1 || { die "remove clickhouse"; return 1; }
     "$CTL" local postgres remove p >/dev/null 2>&1 || { die "remove postgres"; return 1; }
 )
 

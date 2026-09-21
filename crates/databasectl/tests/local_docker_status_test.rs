@@ -86,14 +86,31 @@ fn assert_error(output: &Output, code: &str) {
 fn unreachable_docker_propagates_across_status_and_lifecycle() {
     let project = Project::new();
     let host = format!("unix://{}/missing.sock", project.directory.path().display());
-    for args in STATUS_COMMANDS {
+    // The read-only list degrades: entries show as stopped with a warning,
+    // because a listing must stay usable while the daemon is down.
+    let listed = project.run(&host, &["local", "server", "list"], true);
+    assert_eq!(listed.status.code(), Some(0), "{listed:?}");
+    let body: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(body["servers"][0]["running"], false);
+    assert!(
+        String::from_utf8_lossy(&listed.stderr).contains("Docker is unavailable"),
+        "{listed:?}"
+    );
+    project.assert_preserved();
+
+    // Every other status/lifecycle path still fails loudly: silently
+    // reporting stopped or mutating data would be lying.
+    for args in STATUS_COMMANDS
+        .iter()
+        .filter(|args| args.join(" ") != "local server list")
+    {
         assert_error(&project.run(&host, args, true), "docker_unavailable");
         project.assert_preserved();
     }
     let human = project.run(&host, &["local", "server", "list"], false);
-    assert_eq!(human.status.code(), Some(1));
-    assert!(human.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&human.stderr).contains("Docker is not available"));
+    assert_eq!(human.status.code(), Some(0));
+    assert!(!human.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&human.stderr).contains("Docker is unavailable"));
 }
 
 async fn docker_mock(inspect_status: u16, body: Value) -> MockServer {

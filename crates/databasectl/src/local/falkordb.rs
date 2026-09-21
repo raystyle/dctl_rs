@@ -682,8 +682,9 @@ async fn resume_existing(
         .flatten();
     let info = ServerInfo {
         started_at: server::now_timestamp(),
-        tcp_port: host_port_from_inspect(inspected.as_ref(), "6379/tcp").unwrap_or(prior.tcp_port),
-        http_port: host_port_from_inspect(inspected.as_ref(), "3000/tcp")
+        tcp_port: docker::host_port_from_inspect(inspected.as_ref(), "6379/tcp")
+            .unwrap_or(prior.tcp_port),
+        http_port: docker::host_port_from_inspect(inspected.as_ref(), "3000/tcp")
             .unwrap_or(prior.http_port),
         ..prior
     };
@@ -1051,26 +1052,6 @@ fn password_from_redis_args(value: &str) -> String {
         }
     }
     password
-}
-
-/// Read a container's published host port for one port key from an inspect
-/// response (HostConfig.PortBindings), when it is bound and parseable.
-fn host_port_from_inspect(
-    inspected: Option<&bollard::models::ContainerInspectResponse>,
-    port_key: &str,
-) -> Option<u16> {
-    inspected?
-        .host_config
-        .as_ref()?
-        .port_bindings
-        .as_ref()?
-        .get(port_key)?
-        .as_ref()?
-        .first()?
-        .host_port
-        .as_deref()?
-        .parse()
-        .ok()
 }
 
 /// Read the provisioned password from the container's effective env so a

@@ -1196,7 +1196,7 @@ mod tests {
 
     fn invocation() -> Invocation {
         Invocation {
-            command: "local list".into(),
+            command: "local server list".into(),
             flags: vec!["json".into()],
             positionals: vec![],
             outcome: "ok",
@@ -1286,7 +1286,7 @@ mod tests {
             panic!("expected Send");
         };
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(value["command"], "local list");
+        assert_eq!(value["command"], "local server list");
         assert_eq!(value["flags"], serde_json::json!(["json"]));
         assert_eq!(value["positionals"], serde_json::json!([]));
         assert_eq!(value["exit_code"], 4);
@@ -1775,8 +1775,8 @@ mod tests {
     #[test]
     fn capture_records_supplied_version_positional() {
         for command in [
-            ["dctl", "local", "use", "25.12.9.61"],
-            ["dctl", "local", "remove", "25.12.9.61"],
+            ["dctl", "local", "install", "26.8"],
+            ["dctl", "local", "install", "postgres@18"],
         ] {
             let inv = capture_from(&command);
             assert_eq!(inv.positionals, ["version"], "for {command:?}");
@@ -1792,32 +1792,22 @@ mod tests {
         let inv = capture_from(&[
             "dctl",
             "local",
+            "postgres",
             "client",
             "--",
             "--secret-passthrough-flag",
             "SECRET-VALUE",
         ]);
-        assert_eq!(inv.command, "local client");
+        assert_eq!(inv.command, "local postgres client");
         assert!(
             inv.positionals.is_empty(),
             "passthrough args were recorded: {:?}",
             inv.positionals
         );
 
-        // `server start` puts its passthrough behind `last = true`: the named
-        // server is still recorded, the forwarded arguments are not.
-        let inv = capture_from(&[
-            "dctl",
-            "local",
-            "server",
-            "start",
-            "SECRET-NAME",
-            "--",
-            "--logger.level=SECRET-LEVEL",
-        ]);
-        assert_eq!(inv.command, "local server start");
-        assert_eq!(inv.positionals, ["name"]);
-
+        // `postgres client` keeps the only `last = true` slot since the
+        // ClickHouse server/client passthroughs retired; forwarded
+        // arguments are never recorded.
         let inv = capture_from(&[
             "dctl",
             "local",
@@ -1877,8 +1867,8 @@ mod tests {
 
     #[test]
     fn capture_dedupes_propagated_global_flags() {
-        let inv = capture_from(&["dctl", "local", "--json", "list"]);
-        assert_eq!(inv.command, "local list");
+        let inv = capture_from(&["dctl", "local", "--json", "server", "list"]);
+        assert_eq!(inv.command, "local server list");
         assert_eq!(inv.flags, ["json"]);
     }
 
@@ -1929,8 +1919,8 @@ mod tests {
 
     #[test]
     fn capture_with_no_flags_is_empty() {
-        let inv = capture_from(&["dctl", "local", "list"]);
-        assert_eq!(inv.command, "local list");
+        let inv = capture_from(&["dctl", "local", "server", "list"]);
+        assert_eq!(inv.command, "local server list");
         assert!(inv.flags.is_empty());
         assert!(inv.positionals.is_empty());
     }
@@ -2027,7 +2017,7 @@ mod tests {
     fn lossy_flag_suggestion_records_the_bare_definition_name() {
         // Clap's SuggestedArg context carries `--json`; the recorded value is
         // the bare canonical name, cloned from the definition.
-        let inv = capture_lossy_from(&["dctl", "local", "list", "--jsn"]);
+        let inv = capture_lossy_from(&["dctl", "local", "server", "list", "--jsn"]);
         assert_eq!(inv.outcome, "unknown_argument");
         assert_eq!(inv.suggestion.as_deref(), Some("json"));
     }
@@ -2270,22 +2260,21 @@ mod tests {
 
     #[test]
     fn lossy_long_aliases_record_the_canonical_names() {
-        // `--fg` and `--config-file` are hidden aliases (local/cli.rs); the
-        // recorded names are the definitions' canonical longs. The parse
-        // fails only on the `--http-port` value.
+        // `--config-file` is a hidden alias of `--config` (local/cli.rs);
+        // the recorded name is the definition's canonical long. The parse
+        // fails only on the `--native-port` value.
         let inv = capture_lossy_from(&[
             "dctl",
             "local",
             "server",
             "start",
-            "--fg",
             "--config-file",
             "SECRET-CONFIG",
-            "--http-port",
+            "--native-port",
             "SECRET-PORT",
         ]);
         assert_eq!(inv.command, "local server start");
-        assert_eq!(inv.flags, ["config", "foreground", "http-port"]);
+        assert_eq!(inv.flags, ["config", "native-port"]);
         assert_eq!(inv.outcome, "invalid_value");
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
         assert!(!json.contains("SECRET"), "flag value leaked: {json}");
@@ -2347,8 +2336,16 @@ mod tests {
     fn lossy_unknown_short_stops_the_walk() {
         // Nothing after the unresolvable char is recorded, not even a flag
         // clap would have accepted.
-        let inv = capture_lossy_from(&["dctl", "local", "list", "-Z", "--json", "SECRET-TAIL"]);
-        assert_eq!(inv.command, "local list");
+        let inv = capture_lossy_from(&[
+            "dctl",
+            "local",
+            "server",
+            "list",
+            "-Z",
+            "--json",
+            "SECRET-TAIL",
+        ]);
+        assert_eq!(inv.command, "local server list");
         assert!(inv.flags.is_empty());
         assert_eq!(inv.outcome, "unknown_argument");
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
@@ -2422,15 +2419,16 @@ mod tests {
     /// `local use` is distinguishable from `local use <version>` (#480).
     #[test]
     fn lossy_missing_required_positional_is_absent() {
-        for args in [&["dctl", "local", "use"], &["dctl", "local", "remove"]] {
-            let inv = capture_lossy_from(args);
-            assert_eq!(inv.outcome, "missing_required", "for {args:?}");
-            assert!(
-                inv.positionals.is_empty(),
-                "a missing positional was recorded for {args:?}: {:?}",
-                inv.positionals
-            );
-        }
+        // `local install` is the one remaining required-positional command
+        // since the binary-era lifecycle retired.
+        let args = ["dctl", "local", "install"];
+        let inv = capture_lossy_from(&args);
+        assert_eq!(inv.outcome, "missing_required", "for {args:?}");
+        assert!(
+            inv.positionals.is_empty(),
+            "a missing positional was recorded for {args:?}: {:?}",
+            inv.positionals
+        );
     }
 
     /// A failed parse that *did* carry a positional records the slot id, so a
@@ -2439,8 +2437,8 @@ mod tests {
     #[test]
     fn lossy_supplied_positional_records_the_slot_id() {
         let inv =
-            capture_lossy_from(&["dctl", "local", "remove", "SECRET-VERSION", "--frobnicate"]);
-        assert_eq!(inv.command, "local remove");
+            capture_lossy_from(&["dctl", "local", "install", "SECRET-VERSION", "--frobnicate"]);
+        assert_eq!(inv.command, "local install");
         assert_eq!(inv.outcome, "unknown_argument");
         assert_eq!(inv.positionals, ["version"]);
         let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
@@ -2546,8 +2544,8 @@ mod tests {
             let json = serde_json::to_string(&build_payload(&inv, 2, &env_of(&[]), None)).unwrap();
             assert!(!json.contains(hostile), "leaked {hostile}: {json}");
 
-            // Passthrough (forwarded verbatim to clickhouse-client).
-            let inv = capture_from(&["dctl", "local", "client", "--", hostile]);
+            // Passthrough (forwarded verbatim to psql).
+            let inv = capture_from(&["dctl", "local", "postgres", "client", "--", hostile]);
             assert!(inv.positionals.is_empty());
             let json = serde_json::to_string(&build_payload(&inv, 0, &env_of(&[]), None)).unwrap();
             assert!(!json.contains(hostile), "leaked {hostile}: {json}");
