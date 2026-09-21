@@ -13,7 +13,6 @@ fn dctl_binary() -> PathBuf {
 fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home)
         .current_dir(project)
         .args(args)

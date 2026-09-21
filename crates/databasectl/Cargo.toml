@@ -19,13 +19,6 @@ pkg-url = "https://github.com/raystyle/dctl_rs/releases/download/v{ version }/dc
 pkg-fmt = "tgz"
 bin-dir = "dctl-{ target }-v{ version }/{ bin }{ binary-ext }"
 
-[features]
-default = []
-# Anonymous usage telemetry (first-run notice, `telemetry` subcommand, detached
-# send). Off by default in this fork: enabling it sends nothing unless
-# DCTL_TELEMETRY_URL points at a collector you own.
-telemetry = []
-
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }

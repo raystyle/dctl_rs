@@ -140,7 +140,6 @@ fn dctl_binary() -> PathBuf {
 fn run(project: &Path, args: &[&str]) -> Output {
     Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", project.join("home"))
         .env("PATH", "/usr/bin:/bin")
         .current_dir(project)
@@ -199,7 +198,6 @@ fn direct_query_with_agent_mode_still_prints_native_output() {
     let http = FakeClickhouseHttp::start(None);
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("AI_AGENT", "1")
         .env("HOME", project.path().join("home"))
         .env("PATH", "/usr/bin:/bin")
@@ -259,7 +257,6 @@ fn direct_queries_file_reads_files_and_stdin_dash() {
 
     let mut child = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", project.path().join("home"))
         .env("PATH", "/usr/bin:/bin")
         .current_dir(project.path())

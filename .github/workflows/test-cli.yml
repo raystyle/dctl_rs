@@ -33,8 +33,6 @@ jobs:
       - name: Clippy
         run: cargo clippy -p databasectl -- -D warnings
 
-      - name: Clippy without default features
-        run: cargo clippy -p databasectl --all-targets --no-default-features -- -D warnings
 
       - name: Test
         run: cargo test -p databasectl

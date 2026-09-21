@@ -83,7 +83,6 @@ fn run_install(tag: &str, pull_response: &str) -> Output {
     let mut command = Command::new(dctl_binary());
     command
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", tempdir.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .args(["local", "install", &format!("postgres@{tag}"), "--force"])

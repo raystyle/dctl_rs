@@ -666,7 +666,6 @@ fn postgres_dotenv_releases_metadata_lock_before_docker_credentials_read() {
 
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project.path())
@@ -720,7 +719,6 @@ fn postgres_start_revalidates_metadata_after_image_inspection() {
 
     let output = Command::new(dctl_binary())
         .env_clear()
-        .env("DO_NOT_TRACK", "1")
         .env("HOME", home.path())
         .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
         .current_dir(project.path())
@@ -1293,7 +1291,6 @@ fn removing_running_postgres_preserves_instance_and_supplies_stop_recovery() {
             command
                 .env_clear()
                 .env("HOME", home.path())
-                .env("DO_NOT_TRACK", "1")
                 .env("DOCKER_HOST", format!("unix://{}", socket_path.display()))
                 .current_dir(project.path())
                 .args(["local", "postgres", "remove"]);
