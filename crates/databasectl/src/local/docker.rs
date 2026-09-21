@@ -312,10 +312,40 @@ impl PullReporter {
     }
 }
 
-/// Pull an image by full reference (`postgres:18`, `falkordb/falkordb:v4.20.6`),
+/// Pull an image through the ADR-0008 fallback chain: daemon pull from
+/// Docker Hub, then the private registry over native v2 (OCI layout +
+/// docker load), then the local cache tar. The Hub error is what surfaces;
+/// every fallback step announces itself and its failure reason on stderr
+/// so the chain stays observable end to end.
+pub async fn pull_image(docker: &Docker, image_ref: &str, structured_output: bool) -> Result<()> {
+    match hub_pull(docker, image_ref, structured_output).await {
+        Ok(()) => Ok(()),
+        Err(primary) => {
+            eprintln!(
+                "Docker Hub pull failed ({primary}); trying {} then the local cache",
+                crate::local::registry::registry_base()
+            );
+            match crate::local::registry::pull_via_registry(docker, image_ref).await {
+                Ok(()) => return Ok(()),
+                Err(reason) => eprintln!("private registry pull failed: {reason}"),
+            }
+            match crate::local::registry::load_from_cache(docker, image_ref).await {
+                Ok(true) => {
+                    eprintln!("loaded {image_ref} from the local registry cache");
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(reason) => eprintln!("local cache load failed: {reason}"),
+            }
+            Err(primary)
+        }
+    }
+}
+
+/// Pull an image by full reference (`postgres:18`, `falkordb/falkorddb:v4.20.6`),
 /// keeping full progress for interactive terminals and collapsing it to one
 /// bounded summary line for redirected or structured output.
-pub async fn pull_image(docker: &Docker, image_ref: &str, structured_output: bool) -> Result<()> {
+async fn hub_pull(docker: &Docker, image_ref: &str, structured_output: bool) -> Result<()> {
     use bollard::query_parameters::CreateImageOptionsBuilder;
     let from = image_ref.to_string();
     let mode = pull_progress_mode(

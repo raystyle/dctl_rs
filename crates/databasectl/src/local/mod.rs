@@ -5,6 +5,7 @@ pub mod docker;
 pub mod falkordb;
 pub mod output;
 pub mod postgres;
+pub(crate) mod registry;
 pub mod server;
 
 use cli::{InstallVersionArg, LocalCommands, ServerCommands};
@@ -67,6 +68,7 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
         LocalCommands::Server { command } => run_server_commands(command, json).await,
         LocalCommands::Postgres { command } => postgres::run(command, json).await,
         LocalCommands::Falkordb { command } => falkordb::run(command, json).await,
+        LocalCommands::Registry { command } => registry::run(command, json).await,
     }
 }
 

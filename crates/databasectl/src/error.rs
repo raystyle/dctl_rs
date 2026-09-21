@@ -220,6 +220,11 @@ pub enum Error {
     #[error("{0}")]
     Ledger(String),
 
+    /// A private-registry (ADR-0008) failure: transport, auth, digest
+    /// mismatch, or load errors. Self-composed, rendered verbatim.
+    #[error("{0}")]
+    Registry(String),
+
     #[error("Invalid server name '{0}': must not contain path separators or '..'")]
     InvalidServerName(String),
 

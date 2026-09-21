@@ -15,6 +15,7 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 ## Must
 
 - 不可逆技术选择先立 `docs/adr/` 的 ADR 再动手;新需求先立 `docs/requirements/` 的 REQ 再写码
+- 提交前自检:新增/移动测试后看测试计数是否随改动增加(空循环、走错目录、main 之后的方法都曾这样漏网)
 - 改命令面同步更新 clap 定义内帮助文本与 README,并补 `try_parse_from` 解析测试
 - 推 main 前过 herdr 评审闸门:codex 回执轮次到 CONFIRM 才放行(流程见 `docs/guides/review-gate.md`)
 - 每次交付跑双 clippy 配置与全量测试;依赖真实 Docker 的测试在 lan-linux 容器复验(配方见环境节)

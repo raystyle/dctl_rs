@@ -54,7 +54,7 @@ dctl 的状态分两处存放:
 | 路径 | 范围 | 内容 |
 | --- | --- | --- |
 | `<project>/.dctl/` | 每项目 | 服务器元数据 `servers/*.json`、服务器数据目录;由 `dctl local init` 写入 gitignore |
-| `~/.dctl/` | 全局 | 命名部分配置 `configs/`、ledger 私钥 `ledger/` |
+| `~/.dctl/` | 全局 | 命名部分配置 `configs/`、ledger 私钥 `ledger/`、私仓凭据与镜像缓存 `registry/`(`auth`、`cache/`) |
 
 项目级命令只认当前目录下的 `.dctl/`,不向上搜索父目录;请在项目根目录运行。
 
@@ -71,6 +71,17 @@ $ dctl local install 26.8             # 或 26.8.9.10 / latest,预拉 ClickHouse
 $ dctl local install postgres@18      # 或 postgres:17-alpine
 $ dctl local install falkordb@4.20.6  # 或 falkordb:latest
 ```
+
+### 私仓直连与离线回落
+
+引擎 `install`/`start` 的镜像获取走透明回落链(ADR-0008):Docker Hub 优先,失败转私仓 registry.ohmygh.com(dctl 原生 v2 客户端拉取 OCI layout 并 `docker load`),再失败用本地缓存 tar;私仓拉取成功后自动刷新缓存。显式走私仓道:
+
+```console
+$ dctl local registry pull postgres:18   # 强制私仓拉取并刷新缓存;亦接受 name@sha256:<digest>
+$ dctl local registry catalog            # 列私仓 repos
+```
+
+私仓凭据从 `~/.dctl/registry/auth` 读取(`user:password` 一行,或 `Basic <token>`),或经 `DCTL_REGISTRY_AUTH` 环境变量注入(金库/CI 携带者,同 ledger 密钥约定);零入仓、零 argv、零日志。端点可由 `DCTL_REGISTRY_URL` 覆盖(运维/测试旋钮)。缓存即文件管理:删除 `~/.dctl/registry/cache/<slug>.tar` 即清理对应镜像。
 
 ### ClickHouse 服务器
 

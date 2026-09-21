@@ -20,6 +20,7 @@ pkg-fmt = "tgz"
 bin-dir = "dctl-{ target }-v{ version }/{ bin }{ binary-ext }"
 
 [dependencies]
+sha2 = "0.10"
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.13", default-features = false, features = ["stream", "json", "query", "rustls"] }
@@ -49,7 +50,6 @@ serde_ignored = "0.1.14"
 ledger-client = { git = "https://github.com/raystyle/ledger-rs", tag = "v0.1.1" }
 
 [dev-dependencies]
-sha2 = "0.10"
 serde_json = "1"
 tokio = { version = "1", features = ["test-util"] }
 wiremock = "0.6.5"

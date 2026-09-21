@@ -8,6 +8,6 @@
 | REQ-002 | implemented | should | 物理删除 telemetry.rs 与 failure.rs | PR #8;全仓 telemetry 引用清零 |
 | REQ-003 | implemented | must | FalkorDB 图数据库引擎接入 | cargo test -p databasectl --test local_falkor_readiness_test |
 | REQ-004 | implemented | should | 集成 ledger 标准的 issue 与 artifact 命令族 | cargo test -p databasectl --test ledger_request_test |
-| REQ-005 | draft | could | registry.ohmygh.com 私仓直连与离线回落 | null |
+| REQ-005 | implemented | could | registry.ohmygh.com 私仓直连与离线回落 | registry-fallback 批;ADR-0008(格式裁定 OCI layout) |
 | REQ-006 | implemented | must | 迁移到共享 ledger-rs crate 并统一权限收口 | PR #7;ledger-client v0.1.1 |
 | REQ-007 | implemented | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | PR #6;ADR-0007 |

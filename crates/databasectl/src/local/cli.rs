@@ -217,6 +217,21 @@ CONTEXT FOR AGENTS:
         command: PostgresCommands,
     },
 
+    /// Manage private-registry image pulls (registry.ohmygh.com, ADR-0008)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Native registry v2 client with an offline fallback chain; engine installs
+  and starts already use the chain transparently (Docker Hub, then this
+  registry, then the local cache tar). These commands force the private
+  path: `pull` fetches an image as an OCI layout and loads it into the
+  daemon (refreshing the ~/.dctl/registry/cache tar); `catalog` lists the
+  registry's repositories. Credentials come from ~/.dctl/registry/auth or
+  the DCTL_REGISTRY_AUTH carrier - never from argv.")]
+    Registry {
+        #[command(subcommand)]
+        command: RegistryCommands,
+    },
+
     /// Manage local FalkorDB graph instances (Docker-backed)
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
@@ -230,6 +245,25 @@ CONTEXT FOR AGENTS:
         #[command(subcommand)]
         command: FalkorCommands,
     },
+}
+
+#[derive(Subcommand)]
+pub enum RegistryCommands {
+    /// Pull an image from the private registry into the Docker daemon
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Reference is <name>[:tag] or <name>@sha256:<digest> against the private
+  registry (no Docker Hub fallback on this command - use the engine
+  install/start flows for the chain). The pull verifies every blob digest,
+  assembles an OCI layout, loads it via docker load, and refreshes the
+  cache tar at ~/.dctl/registry/cache/.")]
+    Pull {
+        /// Image reference against the private registry (default tag: latest)
+        reference: String,
+    },
+
+    /// List repositories in the private registry
+    Catalog,
 }
 
 #[derive(Subcommand)]
@@ -894,6 +928,37 @@ mod tests {
                 "{tag}"
             );
         }
+    }
+
+    // ── registry ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn registry_pull_accepts_tagged_and_digest_references() {
+        let LocalCommands::Registry {
+            command: RegistryCommands::Pull { reference },
+        } = local_command(&["registry", "pull", "db/tools:1.0"])
+        else {
+            panic!("expected registry pull");
+        };
+        assert_eq!(reference, "db/tools:1.0");
+
+        let LocalCommands::Registry {
+            command: RegistryCommands::Pull { reference },
+        } = local_command(&["registry", "pull", "db/tools@sha256:aaaaaaaaaaaaaaaa"])
+        else {
+            panic!("expected registry pull");
+        };
+        assert_eq!(reference, "db/tools@sha256:aaaaaaaaaaaaaaaa");
+    }
+
+    #[test]
+    fn registry_catalog_parses_without_arguments() {
+        let LocalCommands::Registry {
+            command: RegistryCommands::Catalog,
+        } = local_command(&["registry", "catalog"])
+        else {
+            panic!("expected registry catalog");
+        };
     }
 
     // ── server start (Docker flags) ──────────────────────────────────────

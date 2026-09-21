@@ -306,6 +306,11 @@ impl LocalErrorOutput {
                 Mapping::redacted(LocalErrorCode::IoError, "Local I/O operation failed")
             }
 
+            // ── registry (ADR-0008) ─────────────────────────────────────────
+            Error::Registry(_) => {
+                Mapping::redacted(LocalErrorCode::LocalError, "Registry operation failed")
+            }
+
             // ── postgres ────────────────────────────────────────────────────
             // Self-composed validation and state guidance; the foreign-text
             // sibling `Error::Postgres` stays in the fallback below.

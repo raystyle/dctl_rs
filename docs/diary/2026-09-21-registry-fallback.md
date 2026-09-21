@@ -1,0 +1,35 @@
+# registry-fallback 批:评审闸门轮实录与真机踩坑
+
+- 日期: 2026-09-21
+- 批面:ADR-0008 私仓直连与回落序(REQ-005),工作区批基线 2e8f817
+
+## 评审轮次(dctl-codex-review,tab 右格)
+
+- 一轮全量:回执 F1-F4 必修、G1-G7 建议、不 CONFIRM。
+- 修订:F/G 全处置;G1 反证纠正评审方(第三子句非死逻辑,`db/tools:latest` 靠它切分)。
+- 二轮快核:CONFIRM 放行;另留两条非阻塞备注(diary 记档、endpoint 旋钮 userinfo 防呆),均采纳落实。
+
+## 派单前自查修掉的五处(评审请求已列)
+
+1. 缓存刷新从不生效:`fs::copy` 目标父目录未建,ENOENT 被 `let _` 吞;改 `create_dir_all` 后 copy,失败可见告警。
+2. `pack_layout_tar` 把正在写的 `image.tar` 打进包(体积近翻倍);改跳过自身,测试断言无自打包条目。
+3. manifest blob 曾用 serde 重序列化字节:registry:2 的 Go 字段序与 serde 字母序不同会破坏内容寻址;改保留原始字节、digest 从交付字节计算。
+4. `reference_splitting_shapes` 空壳测试(循环体 `let _` 不断言):删改 `registry.rs` 内真单测。
+5. carrier 凭据测试名不副实:stub 改录 Authorization 头真断言。
+
+## 真机踩坑:containerd 镜像存储的字面名(最重要)
+
+lan-linux(Docker 29.8.1,containerd 镜像存储)真 registry:2 + 真 daemon 端到端抓出:`docker load` 按 OCI layout 的 `ref.name` 注记**字面**起名(如 `postgres:18`),而引用解析按归一名(`docker.io/library/postgres:18`)匹配,结果 `docker images` 里在列、`docker run` 却解析不到、转投 Hub。classic 存储时代 load 会归一化,此坑为 containerd 存储特有。修复:index.json 注记写全限定名(`fully_qualified`:单段名进 `docker.io/library/`、多段进 `docker.io/`、首段带点或冒号或 localhost 视为 host 原样)。复证:`docker run --pull=never` 直跑、inspect 解析到灌入镜像、ctr 见 fq 名在册。
+
+## lan-linux 配方复用与播种
+
+- 沿用 2026-09-20-fork-bootstrap 的 rust:1-slim 配方(socket gid 983,`--network host` 使 127.0.0.1:5000 可达);`--features telemetry` 已随 telemetry 退役删除。
+- 播种:registry:2 起临时容器,三引擎最新稳定版 Hub 原名推入(postgres:18、clickhouse/clickhouse-server:latest、falkordb/falkordb:latest);拉取前删本地 tag 保证 load 可观测。
+- 容器卷持久化(/tmp/dctl_cargo、/tmp/dctl_target)加速复轮。
+- 实证面:两轮全量测试绿、三镜像原生 v2 拉取、缓存 tar 落盘、引擎级生命周期(start 到 client 查询到 stop 到 remove)全通;falkordb 走 Docker schema2、postgres/clickhouse 走 OCI manifest,两族 media type 实弹都过。
+
+## 遗留(记档不做或后续)
+
+- docker_load 整 tar 入内存 Vec:GB 级镜像需流式化,后续批。
+- 私仓 repo 命名(Hub 原名还是别名托管)与 latest 锚清单:归总台裁定,REQ-005 追注在册。
+- lan-linux 上本轮残留:dctl-registry-test 容器(含播种数据)、三个已灌镜像与裸名别名、/tmp/dctl_cargo 与 /tmp/dctl_target 缓存卷;复验后按需清理。
