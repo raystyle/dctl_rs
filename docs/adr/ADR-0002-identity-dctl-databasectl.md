@@ -17,7 +17,7 @@ fork 需要与上游身份隔离,同时不与已安装的 chctl 状态冲突。�
 
 ## Decision
 
-仓库 `raystyle/dctl_rs`(private);crate 目录与包名 `databasectl`,二进制名 `dctl`;状态目录从 `.clickhouse` 改为项目级 `.dctl/` 与全局 `~/.dctl/`,与 chctl 安装完全隔离。保留不改:builds.clickhouse.com 与 packages.clickhouse.com 产品下载 URL、docker 镜像名、`~/.local/bin/clickhouse` 符号链接(它暴露的是 ClickHouse 产品二进制,不是 ctl 工具)。改名清扫整体入 `.git-blame-ignore-revs`,blame 仍指向上游源头。
+仓库 `raystyle/dctl_rs`(public;2026-09-21 更新:决策时为 private,后转公开,见 fork-bootstrap diary 转公开预案);crate 目录与包名 `databasectl`,二进制名 `dctl`;状态目录从 `.clickhouse` 改为项目级 `.dctl/` 与全局 `~/.dctl/`,与 chctl 安装完全隔离。保留不改:builds.clickhouse.com 与 packages.clickhouse.com 产品下载 URL、docker 镜像名、`~/.local/bin/clickhouse` 符号链接(它暴露的是 ClickHouse 产品二进制,不是 ctl 工具)。改名清扫整体入 `.git-blame-ignore-revs`,blame 仍指向上游源头。
 
 ## Consequences
 
