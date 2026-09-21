@@ -158,6 +158,17 @@ pub(crate) struct RegistryClient {
     http: reqwest::Client,
 }
 
+// Library auth semantics this struct relies on (user-supplied operational
+// notes, 2026-09-21): one Client is meant for one auth per process —
+// `store_auth_if_needed` keeps only the FIRST stored credentials, so
+// re-storing different ones on the same client silently drops them. dctl is
+// structurally safe: one endpoint per process, credentials fixed at
+// construction, and the Hub leg goes through the daemon (bollard), never
+// through this client. Multi-registry or credential-rotation support would
+// need one fresh Client per endpoint/auth pair. Also note anonymous is not
+// credential-free on bearer-challenge faces: an anonymous token still rides
+// subsequent requests there.
+
 impl RegistryClient {
     pub(crate) fn new() -> Result<Self> {
         let base = registry_base();

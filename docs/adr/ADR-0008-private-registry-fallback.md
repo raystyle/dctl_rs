@@ -23,6 +23,8 @@
 > 追注(2026-09-21,用户令经总台转):决策 1 第 2 步的直连腿由自研原生 v2 HTTP 客户端**换轨为官方生态库 oci-client**(github.com/oras-project/rust-oci-client,crates.io 名 oci-client,v0.18);自研腿收敛为库封装(manifest 原始字节、平台选择、blob 流式与 digest 校验、basic 挑战式鉴权均由库承担,OCI layout 组装与缓存仍在本仓)。背景:总台把 registry.ohmygh.com 切 R2 Worker 只读面(ohmycloud 仓 ADR-0002 加 REQ-064,实施中),对外 v2 协议面不变(GET 加 HEAD),basic 凭据与本地密档供给道不变,写入面恒 405;回落链序与本 ADR 其余决策不变。REQ-005 验收面不动。
 >
 > **服务端契约(定口径 c9c7fda9,2026-09-21 晚用户令)**:「匿名可拉取,不可枚举」:`/v2/` ping、manifests、blobs 匿名 200,oci-client 零凭据走完拉取链;`/v2/_catalog` 与 tags/list 恒 401 加 `WWW-Authenticate: Basic` 挑战(错凭据同挑战)。库的 Basic 是挑战门控且仅在 `/v2/` 探测点触发,匿名 200 面下凭据不会随库请求携带,故**枚举保留一处自建面**:`catalog` 命令走预带 Basic 头的显式请求(换轨令边界本为拉 manifest 加 blob,枚举不属换轨面,此例外记档);dctl 不做 tag 发现(引擎版本锚为固定引用,latest 锚清单即总台此用途),回落链按 ref 拉取零影响。沿革:439402f8 为匿名读中间态(此前全挑战式,与本仓 stub 行为同形),终口径 c9c7fda9。
+>
+> **库鉴权语义免疫记录(2026-09-21 深夜,用户口径核验)**:oci-client 的 `store_auth_if_needed` 首存即定格(同 Client 二次存不同凭据被静默丢弃),升级鉴权须每端点新建 Client;匿名在 bearer 域非无 token。本仓四条皆结构性免疫:每进程单端点、凭据构造时一次定格、Hub 腿走守护进程(bollard)不经此 Client、本面为 Basic/无挑战不触发 token 流。若未来多端点或运行中换凭据,须按端点/凭据对各建 Client(语义注记同步在 registry.rs 结构体注释)。
 
 ## Consequences
 
