@@ -299,7 +299,16 @@ fn json_output(flag: bool) -> bool {
 async fn run(cmd: Commands) -> Result<()> {
     match cmd {
         Commands::Local(args) => local::run(args.command, json_output(args.json)).await,
-        Commands::Ledger(args) => ledger::run(args.command, json_output(args.json)).await,
+        Commands::Ledger(args) => {
+            // The shared ledger client is blocking HTTP with its own
+            // embedded runtime; dropping that runtime inside this async
+            // context panics, so the whole command rides a blocking thread.
+            tokio::task::spawn_blocking(move || ledger::run(args.command, json_output(args.json)))
+                .await
+                .map_err(|join| {
+                    crate::error::Error::Ledger(format!("ledger task failed: {join}"))
+                })?
+        }
         Commands::Skills(args) => run_skills(args).await,
         Commands::Update(args) => run_update(args).await,
         #[cfg(feature = "telemetry")]

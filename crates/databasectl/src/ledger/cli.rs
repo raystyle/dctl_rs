@@ -21,10 +21,10 @@ CONTEXT FOR AGENTS:
   Reads need no key; writes sign with the local Ed25519 key (DCTL_LEDGER_KEY is
   only a carrier for the SAME keypair as the built-in kid — swapping in a
   different key fails verification until the new public JWK ships in the CLI).
-  `issue close` posts result (digest reference) then status=done; the done event
-  is what closes. Deterministic idempotency keys make reruns replay, not
-  duplicate — the issue stays open until done lands.
-  Typical flow: `ledger issue new` -> work -> `ledger artifact publish` -> `ledger issue close --digest <digest>`.")]
+  This CLI only ADDS issues; closing (status advances) belongs to the omc
+  workbench: `omc ledger issue status <repo> <n> <to>` (deletes likewise:
+  `omc ledger issue delete`).
+  Typical flow: `ledger issue new` -> work -> `ledger artifact publish` -> close via omc.")]
     Issue {
         #[command(subcommand)]
         command: IssueCommands,
@@ -35,7 +35,8 @@ CONTEXT FOR AGENTS:
 CONTEXT FOR AGENTS:
   Artifacts are information bodies (experience, lessons, research, records);
   digests are sha256 of the content, binaries are never uploaded.
-  attest_dev and attest_prod are separate; promote requires prior attestation.
+  attest_dev and attest_prod are separate. Lifecycle moves (promote/demote/
+  supersede) belong to the omc workbench, not this CLI.
   Truth source: https://ledger.ohmygh.com.")]
     Artifact {
         #[command(subcommand)]
@@ -83,28 +84,6 @@ pub enum IssueCommands {
     Show {
         /// Issue number
         number: String,
-    },
-
-    /// Close an issue as done, referencing a registered digest
-    #[command(after_help = "\
-CONTEXT FOR AGENTS:
-  Posts a result event referencing the digest, then a status=done event — done
-  is what closes the issue. Both events carry deterministic idempotency keys:
-  rerunning after a partial failure replays both events instead of appending
-  duplicates. Retrying with the same digest must reuse the same --note (or
-  none) — a different note is different content under the same key (409).
-  Publish the artifact first (`ledger artifact publish`).")]
-    Close {
-        /// Issue number
-        number: String,
-
-        /// Registered artifact/content digest (sha256:<64 hex>)
-        #[arg(long)]
-        digest: String,
-
-        /// Optional human note carried by the result event
-        #[arg(long)]
-        note: Option<String>,
     },
 }
 
@@ -159,7 +138,7 @@ CONTEXT FOR AGENTS:
         deps: Vec<String>,
     },
 
-    /// Attach an attestation or lifecycle event to an artifact
+    /// Attach a verification attestation to an artifact
     Attest {
         /// Artifact id
         id: String,
@@ -169,22 +148,11 @@ CONTEXT FOR AGENTS:
         kind: AttestKindArg,
     },
 
-    /// Promote an artifact to production (sugar for attest --kind promote)
-    Promote {
-        /// Artifact id
-        id: String,
-    },
-
-    /// List artifacts (family pagination: limit 100 + before cursor)
+    /// List artifacts
+    #[command(after_help = "CONTEXT FOR AGENTS:
+  The shared client serves one page: --current narrows to each name's latest
+  entry, --env filters by attestation environment.")]
     List {
-        /// Page size (the service caps at 100)
-        #[arg(long, default_value_t = 100)]
-        limit: u32,
-
-        /// Cursor: list artifacts before this id
-        #[arg(long)]
-        before: Option<String>,
-
         /// Only each name's current entry
         #[arg(long)]
         current: bool,
@@ -240,13 +208,11 @@ impl ArtifactKindArg {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "kebab-case")]
+/// Verification attestations only; promote/demote/supersede are omc's.
 pub enum AttestKindArg {
     AttestDev,
     AttestProd,
     VerificationFailed,
-    Promote,
-    Demote,
-    Supersede,
 }
 
 impl AttestKindArg {
@@ -256,9 +222,6 @@ impl AttestKindArg {
             AttestDev => "attest_dev",
             AttestProd => "attest_prod",
             VerificationFailed => "verification_failed",
-            Promote => "promote",
-            Demote => "demote",
-            Supersede => "supersede",
         }
     }
 }
@@ -413,18 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn promote_parses_and_attest_kind_maps() {
-        let cli = Cli::try_parse_from(["dctl", "ledger", "artifact", "promote", "art-7"]).unwrap();
-        let Commands::Ledger(args) = cli.command else {
-            panic!("ledger command");
-        };
-        let super::LedgerCommands::Artifact {
-            command: super::ArtifactCommands::Promote { id },
-        } = args.command
-        else {
-            panic!("promote");
-        };
-        assert_eq!(id, "art-7");
+    fn attest_kinds_map_and_artifact_kinds_spell_correctly() {
         assert_eq!(super::AttestKindArg::AttestDev.as_str(), "attest_dev");
         assert_eq!(
             super::AttestKindArg::VerificationFailed.as_str(),
@@ -435,6 +387,51 @@ mod tests {
             super::ArtifactKindArg::AttestedReport.as_str(),
             "attested-report"
         );
+    }
+
+    /// 权限收口 (REQ-006): close/promote and the lifecycle attest kinds are
+    /// omc's alone — they must not even parse here.
+    #[test]
+    fn close_and_lifecycle_moves_are_rejected_at_clap_time() {
+        for argv in [
+            vec![
+                "dctl",
+                "ledger",
+                "issue",
+                "close",
+                "3",
+                "--digest",
+                "sha256:aa",
+            ],
+            vec!["dctl", "ledger", "artifact", "promote", "art-7"],
+            vec![
+                "dctl", "ledger", "artifact", "attest", "art-7", "--kind", "promote",
+            ],
+            vec![
+                "dctl", "ledger", "artifact", "attest", "art-7", "--kind", "demote",
+            ],
+            vec![
+                "dctl",
+                "ledger",
+                "artifact",
+                "attest",
+                "art-7",
+                "--kind",
+                "supersede",
+            ],
+        ] {
+            let error = Cli::try_parse_from(argv.clone())
+                .err()
+                .unwrap_or_else(|| panic!("must not parse: {argv:?}"));
+            assert!(
+                matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::InvalidSubcommand
+                        | clap::error::ErrorKind::InvalidValue
+                ),
+                "{argv:?}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -469,7 +466,7 @@ mod tests {
             panic!("ledger command");
         };
         let super::LedgerCommands::Artifact {
-            command: super::ArtifactCommands::List { current, env, .. },
+            command: super::ArtifactCommands::List { current, env },
         } = args.command
         else {
             panic!("artifact list");

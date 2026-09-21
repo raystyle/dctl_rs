@@ -172,13 +172,11 @@ $ dctl ledger issue list [--limit 100] [--before <id>]     # 家族翻页:has_mo
 $ dctl ledger issue show 3
 $ dctl ledger artifact publish --name <名> --kind experience \
     --digest sha256:<64hex> [--version] [--git-range a..b] [--deps d1,d2]
-$ dctl ledger artifact attest <id> --kind attest_dev      # 或 attest_prod/demote/supersede
-$ dctl ledger artifact promote <id>
+$ dctl ledger artifact attest <id> --kind attest_dev      # 或 attest_prod/verification_failed
 $ dctl ledger artifact list [--current] [--env dev|prod]
-$ dctl ledger issue close 3 --digest sha256:<64hex>        # result 引 digest 后 status=done
 ```
 
-真源 [ledger.ohmygh.com](https://ledger.ohmygh.com)。读面无需凭据;写面走 Ed25519 五头签名道,私钥从环境 `DCTL_LEDGER_KEY`(PEM 内容或路径)或 `~/.dctl/ledger/dctl_rs.pem` 读取,永不入仓、不进命令行。产物只登记内容哈希与元数据,不收二进制。
+真源 [ledger.ohmygh.com](https://ledger.ohmygh.com),客户端实现为共享 [ledger-client](https://github.com/raystyle/ledger-rs) crate(v0.1.1,全舰队唯一签名道)。**本 CLI 只增不关不删**(总台权限收口):issue 关闭走 omc 工位 `omc ledger issue status <repo> <n> <to>`,删除走 `omc ledger issue delete`;产物的 promote/demote/supersede 同属 omc。读面无需凭据;写面私钥从环境 `DCTL_LEDGER_KEY`(PEM 内容、PEM 路径或 64-hex 种子)或 `~/.dctl/ledger/dctl_rs.pem` 读取,永不入仓、不进命令行。产物只登记内容哈希与元数据,不收二进制。
 
 ### 贡献者指南
 

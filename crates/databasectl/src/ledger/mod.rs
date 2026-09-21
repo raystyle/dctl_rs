@@ -1,21 +1,26 @@
-//! Handlers for `dctl ledger ...`: the repo's issue and artifact flows on
-//! ledger.ohmygh.com. Reads are plain GETs; writes go through the Ed25519
-//! five-header signing scheme in [`sign`].
+//! Handlers for `dctl ledger ...`: this repo's issue and artifact flows on
+//! ledger.ohmygh.com, on the shared `ledger-client` crate (the fleet's
+//! single signing/HTTP implementation, REQ-063 / REQ-006).
+//!
+//! Boundary (user ruling 2026-09-20): this CLI only ADDS issues and
+//! artifacts plus verification attestations; closing (status moves) and
+//! deletion belong to the omc workbench over herdr delegation.
+//!
+//! The shared client is blocking HTTP; `run` is accordingly synchronous.
 
 pub(crate) mod cli;
-pub(crate) mod client;
-pub(crate) mod keys;
+mod keys;
 mod output;
-pub(crate) mod sign;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use cli::{ArtifactCommands, IssueCommands, LedgerCommands};
-use serde_json::json;
+use ledger_client::Ledger;
+use serde_json::{Value, json};
 
-pub(crate) async fn run(cmd: LedgerCommands, json: bool) -> Result<()> {
+pub(crate) fn run(cmd: LedgerCommands, json: bool) -> Result<()> {
     match cmd {
-        LedgerCommands::Issue { command } => run_issue(command, json).await,
-        LedgerCommands::Artifact { command } => run_artifact(command, json).await,
+        LedgerCommands::Issue { command } => run_issue(command, json),
+        LedgerCommands::Artifact { command } => run_artifact(command, json),
         LedgerCommands::Key => {
             let out = output::KeyOutput {
                 jwk: keys::PUBLIC_JWK.to_string(),
@@ -28,37 +33,62 @@ pub(crate) async fn run(cmd: LedgerCommands, json: bool) -> Result<()> {
     }
 }
 
-async fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
+/// Writes: the real signing identity from env/archive.
+fn client() -> Result<Ledger> {
+    Ok(Ledger::new(keys::REPO_ID, keys::load_key_pair()?))
+}
+
+/// Reads need no credentials; the client type still wants a key, so reads
+/// carry a throwaway one that is never used (GETs are unsigned).
+fn read_client() -> Ledger {
+    Ledger::new(keys::REPO_ID, ledger_client::KeyPair::generate())
+}
+
+fn map_ledger_error(error: ledger_client::LedgerError) -> Error {
+    match error {
+        ledger_client::LedgerError::Http(source) => {
+            Error::Ledger(format!("ledger request failed: {source}"))
+        }
+        ledger_client::LedgerError::Api { status, message } => {
+            Error::Ledger(format!("ledger {status}: {message}"))
+        }
+        ledger_client::LedgerError::Key(message) => Error::Ledger(message),
+    }
+}
+
+fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
     match cmd {
         IssueCommands::New {
             title,
             kind,
             acceptance,
         } => {
-            let body = json!({
-                "title": title,
-                "kind": kind.as_str(),
-                "acceptance": acceptance,
-            });
-            let registered = client::signed_post(&issues_path(), body).await?;
+            let ledger = client()?;
+            let number = ledger
+                .issue_new(&title, kind.as_str(), &acceptance, None)
+                .map_err(map_ledger_error)?;
+            let registered = json!({ "ok": true, "issue": number });
             output::print(&output::RegisteredOutput { registered }, json);
             Ok(())
         }
         IssueCommands::List { limit, before } => {
-            let page = client::list_issues(limit, before.as_deref()).await?;
-            let next_before = page
-                .rows
-                .last()
-                .and_then(|row| row.get("issue_n"))
-                .map(|value| match value {
-                    serde_json::Value::String(text) => text.clone(),
-                    other => other.to_string(),
-                });
+            let ledger = read_client();
+            let page = ledger
+                .issue_list(limit, before.and_then(|before| before.parse().ok()))
+                .map_err(map_ledger_error)?;
+            let rows = page["rows"].as_array().cloned().unwrap_or_default();
+            let count = rows.len();
+            let has_more = page["has_more"].as_bool().unwrap_or(false);
+            let next_before = rows.last().and_then(|row| match &row["issue_n"] {
+                Value::String(text) => Some(text.clone()),
+                other if !other.is_null() => Some(other.to_string()),
+                _ => None,
+            });
             output::print(
                 &output::IssueListOutput {
-                    issues: page.rows,
-                    count: page.count,
-                    has_more: page.has_more,
+                    issues: rows,
+                    count,
+                    has_more,
                     next_before,
                 },
                 json,
@@ -66,53 +96,18 @@ async fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
             Ok(())
         }
         IssueCommands::Show { number } => {
-            let detail = client::show_issue(&number).await?;
+            let ledger = read_client();
+            let n: u64 = number.parse().map_err(|_| {
+                Error::Ledger(format!("issue number must be numeric, got '{number}'"))
+            })?;
+            let detail = ledger.issue_show(n).map_err(map_ledger_error)?;
             output::print(&output::DetailOutput { detail }, json);
-            Ok(())
-        }
-        IssueCommands::Close {
-            number,
-            digest,
-            note,
-        } => {
-            sign::validate_digest(&digest)?;
-            // Server shape (workers/ledger/src/index.ts:486-504): events
-            // carry a nested payload; free text belongs in the top-level
-            // body, structured fields in payload.
-            let mut result = json!({
-                "type": "result",
-                "payload": {"digest": digest},
-            });
-            if let Some(note) = note {
-                result["body"] = json!(note);
-            }
-            let done = json!({"type": "status", "payload": {"to": "done"}});
-            // Ordered chain per the contract: done is only accepted on top of
-            // a result event referencing a registered digest. Both events
-            // carry deterministic idempotency keys anchored on (issue, type,
-            // digest): a rerun after a half-completed close replays both
-            // events instead of appending duplicates (S002, family standard
-            // from hst_rs).
-            let result_idem = deterministic_event_idem(&number, "result", &digest);
-            let status_idem = deterministic_event_idem(&number, "status", &digest);
-            let first =
-                client::signed_post_with_idem(&events_path(&number), result, Some(&result_idem))
-                    .await?;
-            let second =
-                client::signed_post_with_idem(&events_path(&number), done, Some(&status_idem))
-                    .await?;
-            output::print(
-                &output::KeyEventOutput {
-                    events: vec![first, second],
-                },
-                json,
-            );
             Ok(())
         }
     }
 }
 
-async fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
+fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
     match cmd {
         ArtifactCommands::Publish {
             name,
@@ -122,65 +117,47 @@ async fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
             git_range,
             deps,
         } => {
-            sign::validate_digest(&digest)?;
+            validate_digest(&digest)?;
             for dep in &deps {
-                sign::validate_digest(dep)?;
+                validate_digest(dep)?;
             }
-            let mut body = json!({
-                "name": name,
-                "kind": kind.as_str(),
-                "digest": digest,
-            });
-            if let Some(version) = version {
-                body["version"] = json!(version);
-            }
-            if let Some(git_range) = git_range {
-                body["git_range"] = json!(git_range);
-            }
-            if !deps.is_empty() {
-                body["deps"] = json!(deps);
-            }
-            let registered = client::signed_post(&artifacts_path(), body).await?;
+            let ledger = client()?;
+            let artifact_id = ledger
+                .artifact_publish(
+                    &name,
+                    kind.as_str(),
+                    &digest,
+                    version.as_deref(),
+                    git_range.as_deref(),
+                    &deps,
+                    None,
+                )
+                .map_err(map_ledger_error)?;
+            let registered = json!({ "ok": true, "artifact_id": artifact_id, "digest": digest });
             output::print(&output::RegisteredOutput { registered }, json);
             Ok(())
         }
         ArtifactCommands::Attest { id, kind } => {
-            let body = json!({"type": kind.as_str(), "payload": {}});
-            let registered = client::signed_post(&attestations_path(&id), body).await?;
+            let ledger = client()?;
+            let registered = ledger
+                .artifact_attest(&id, kind.as_str(), json!({}), None)
+                .map_err(map_ledger_error)?;
             output::print(&output::RegisteredOutput { registered }, json);
             Ok(())
         }
-        ArtifactCommands::Promote { id } => {
-            let body = json!({"type": "promote", "payload": {}});
-            let registered = client::signed_post(&attestations_path(&id), body).await?;
-            output::print(&output::RegisteredOutput { registered }, json);
-            Ok(())
-        }
-        ArtifactCommands::List {
-            limit,
-            before,
-            current,
-            env,
-        } => {
-            let page = client::list_artifacts(
-                limit,
-                before.as_deref(),
-                current,
-                env.map(|env| env.as_str()),
-            )
-            .await?;
-            let rows: Vec<serde_json::Value> = page.rows;
+        ArtifactCommands::List { current, env } => {
+            let ledger = read_client();
+            let page = ledger
+                .artifact_list(current, env.map(|env| env.as_str()))
+                .map_err(map_ledger_error)?;
+            let rows = page["rows"].as_array().cloned().unwrap_or_default();
             let count = rows.len();
-            let has_more = page.has_more;
-            let next_before = rows.last().and_then(|row| {
-                row.get("artifact_id").and_then(|value| match value {
-                    serde_json::Value::String(text) => Some(text.clone()),
-                    _ => None,
-                })
+            let has_more = page["has_more"].as_bool().unwrap_or(false);
+            let next_before = rows.last().and_then(|row| match &row["artifact_id"] {
+                Value::String(text) => Some(text.clone()),
+                _ => None,
             });
-            // The artifact list reuses the issue list renderer shape: rows
-            // pass through as JSON; the human view is a compact digest table.
-            let out = ArtifactListOutputShim {
+            let out = ArtifactListOutput {
                 artifacts: rows,
                 count,
                 has_more,
@@ -192,16 +169,31 @@ async fn run_artifact(cmd: ArtifactCommands, json: bool) -> Result<()> {
     }
 }
 
+/// `sha256:` + 64 hex — the ledger's digest identity for both content and
+/// dependencies. Checked client-side so a typo fails before the round trip.
+fn validate_digest(digest: &str) -> Result<()> {
+    let valid = digest
+        .strip_prefix("sha256:")
+        .is_some_and(|hex| hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()));
+    if valid {
+        Ok(())
+    } else {
+        Err(Error::Ledger(format!(
+            "digest must be sha256:<64 hex>, got '{digest}'"
+        )))
+    }
+}
+
 #[derive(serde::Serialize)]
-struct ArtifactListOutputShim {
-    artifacts: Vec<serde_json::Value>,
+struct ArtifactListOutput {
+    artifacts: Vec<Value>,
     count: usize,
     has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     next_before: Option<String>,
 }
 
-impl std::fmt::Display for ArtifactListOutputShim {
+impl std::fmt::Display for ArtifactListOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.artifacts.is_empty() {
             return write!(f, "No artifacts (count {})", self.count);
@@ -223,16 +215,15 @@ impl std::fmt::Display for ArtifactListOutputShim {
             #[tabled(rename = "Digest")]
             digest: String,
         }
-        fn flag(row: &serde_json::Value, key: &str) -> String {
+        fn flag(row: &Value, key: &str) -> String {
             match &row[key] {
-                serde_json::Value::Bool(true) => "yes".to_string(),
-                serde_json::Value::Bool(false) => "-".to_string(),
+                Value::Bool(true) => "yes".to_string(),
                 _ => "-".to_string(),
             }
         }
-        fn field(row: &serde_json::Value, key: &str) -> String {
+        fn field(row: &Value, key: &str) -> String {
             match &row[key] {
-                serde_json::Value::String(text) => text.clone(),
+                Value::String(text) => text.clone(),
                 other => other.to_string(),
             }
         }
@@ -263,55 +254,25 @@ impl std::fmt::Display for ArtifactListOutputShim {
     }
 }
 
-/// Deterministic idempotency key for a close-chain event: the same
-/// (issue, event type, digest) triple always maps to the same key, so
-/// reruns replay instead of duplicating.
-fn deterministic_event_idem(number: &str, event_type: &str, digest: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(format!(
-        "{}-issue-{}-{}-{}",
-        keys::REPO_ID,
-        number,
-        event_type,
-        digest
-    ));
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
-}
-
-fn issues_path() -> String {
-    format!("/repos/{}/issues", keys::REPO_ID)
-}
-
-fn events_path(number: &str) -> String {
-    format!("/repos/{}/issues/{}/events", keys::REPO_ID, number)
-}
-
-fn artifacts_path() -> String {
-    format!("/repos/{}/artifacts", keys::REPO_ID)
-}
-
-fn attestations_path(id: &str) -> String {
-    format!("/repos/{}/artifacts/{}/attestations", keys::REPO_ID, id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn close_chain_idempotency_keys_are_deterministic_and_distinct() {
-        let result = deterministic_event_idem("3", "result", "sha256:aa");
-        let status = deterministic_event_idem("3", "status", "sha256:aa");
-        assert_eq!(result.len(), 64);
-        assert_ne!(result, status, "the two chain events must not share a key");
-        // Same triple replays; any varying component mints a new key.
-        assert_eq!(result, deterministic_event_idem("3", "result", "sha256:aa"));
-        assert_ne!(result, deterministic_event_idem("4", "result", "sha256:aa"));
-        assert_ne!(result, deterministic_event_idem("3", "result", "sha256:bb"));
+    fn digest_shape_is_enforced_before_the_round_trip() {
+        assert!(
+            validate_digest(
+                "sha256:a3f5b8e4d2c90f17e8a6b5d4c3b2a1908f7e6d5c4b3a2918f7e6d5c4b3a29180"
+            )
+            .is_ok()
+        );
+        for bad in [
+            "sha256:short",
+            "sha256:zzzz",
+            "md5:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:",
+        ] {
+            assert!(validate_digest(bad).is_err(), "{bad}");
+        }
     }
 }
