@@ -250,15 +250,18 @@ CONTEXT FOR AGENTS:
         password: Option<String>,
     },
 
-    /// Manage local server instances
-    #[command(after_help = "\
+    /// Manage local ClickHouse server instances (alias: clickhouse)
+    #[command(
+        alias = "clickhouse",
+        after_help = "\
 CONTEXT FOR AGENTS:
   `list` and `stop-all` cover ClickHouse and Docker-backed Postgres/FalkorDB; other subcommands
   are ClickHouse-only.
   Data persists across stop/start; only `remove` deletes it.
   Retain the name `start` returns (it may be generated) for later `stop`/`remove`.
   Custom configs inherit built-in defaults; find available names with `server configs`.
-  Typical flow: `server start dev` -> `local client dev` -> `server stop dev`")]
+  Typical flow: `server start dev` -> `client dev` -> `server stop dev`"
+    )]
     Server {
         #[command(subcommand)]
         command: ServerCommands,

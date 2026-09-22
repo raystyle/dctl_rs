@@ -27,7 +27,8 @@ async fn main() {
     let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if raw_args.len() > 1 {
         let second = raw_args[1].to_string_lossy().to_string();
-        if ENGINE_COMMANDS.contains(&second.as_str()) {
+        // `clickhouse` is the engine's proper name (clap alias on Server).
+        if second == "clickhouse" || ENGINE_COMMANDS.contains(&second.as_str()) {
             raw_args.insert(1, "local".into());
         }
     }

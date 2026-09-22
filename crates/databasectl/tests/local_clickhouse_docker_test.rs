@@ -548,6 +548,7 @@ fn reserve_port_pair() -> (u16, u16) {
 fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
     Command::new(dctl_binary())
         .env_clear()
+        .env("DCTL_REGISTRY_URL", "http://127.0.0.1:1")
         .env("HOME", home)
         .env("PATH", "/usr/bin:/bin")
         .env(
@@ -1127,6 +1128,7 @@ fn list_without_docker_degrades_to_stopped_with_a_warning() {
     // DOCKER_HOST points at a socket nobody serves: connect fails fast.
     let output = std::process::Command::new(dctl_binary())
         .env_clear()
+        .env("DCTL_REGISTRY_URL", "http://127.0.0.1:1")
         .env("HOME", home.path())
         .env("PATH", "/usr/bin:/bin")
         .env(

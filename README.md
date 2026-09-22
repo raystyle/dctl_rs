@@ -62,7 +62,7 @@ dctl 的状态分两处存放:
 
 ## 使用
 
-顶层命令面(`local` 前缀可省,两种形态等价;下文示例用无前缀形态):`dctl server`、`dctl postgres`、`dctl falkordb`、`dctl registry`、`dctl install`、`dctl init`、`dctl client`、`dctl skills`、`dctl update`、`dctl ledger`。处处接受 `--json`,agent 自动获得;退出码:0 成功、1 错误、2 usage 错误;3 不再由 dctl 自身产生(取消路径已随二进制引擎退役),仅作为容器内子进程的透传码出现。
+顶层命令面(`local` 前缀可省,两种形态等价;`clickhouse` 是 `server` 的别名;下文示例用无前缀形态):`dctl server`、`dctl postgres`、`dctl falkordb`、`dctl registry`、`dctl install`、`dctl init`、`dctl client`、`dctl skills`、`dctl update`、`dctl ledger`。处处接受 `--json`,agent 自动获得;退出码:0 成功、1 错误、2 usage 错误;3 不再由 dctl 自身产生(取消路径已随二进制引擎退役),仅作为容器内子进程的透传码出现。
 
 ### 镜像预拉取
 
