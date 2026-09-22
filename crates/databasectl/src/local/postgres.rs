@@ -1129,13 +1129,14 @@ async fn client(
         return docker::exec_psql_in_container(&docker, container_id, &psql_args).await;
     }
     let sql = gather_sql_input(query, queries_file)?;
-    run_native_query(
+    run_native_query_tls(
         "127.0.0.1",
         info.tcp_port,
         &user,
         Some(&password),
         &database,
         &sql,
+        true,
     )
     .await
 }
@@ -1252,12 +1253,40 @@ async fn run_native_query(
     database: &str,
     sql: &str,
 ) -> Result<()> {
+    run_native_query_tls(host, port, user, password, database, sql, false).await
+}
+
+/// `prefer_tls`: try the mTLS certificate leg first (managed instances,
+/// where dctl knows the server speaks TLS); direct mode connects to
+/// arbitrary servers and goes cleartext.
+async fn run_native_query_tls(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: Option<&str>,
+    database: &str,
+    sql: &str,
+    prefer_tls: bool,
+) -> Result<()> {
     use tokio_postgres::NoTls;
 
     let mut config = tokio_postgres::Config::new();
     config.user(user).host(host).port(port).dbname(database);
     if let Some(password) = password {
         config.password(password);
+    }
+    if prefer_tls
+        && let Ok(tls) = crate::local::ca::tls_config(user)
+        && let Ok((client, connection)) = config
+            .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
+            .await
+    {
+        tokio::spawn(async move {
+            if let Err(error) = connection.await {
+                eprintln!("postgres connection error: {error}");
+            }
+        });
+        return query_and_render(client, sql).await;
     }
     let (client, connection) = config
         .connect(NoTls)
@@ -1268,6 +1297,10 @@ async fn run_native_query(
             eprintln!("postgres connection error: {error}");
         }
     });
+    query_and_render(client, sql).await
+}
+
+async fn query_and_render(client: tokio_postgres::Client, sql: &str) -> Result<()> {
     let rows = client
         .simple_query(sql)
         .await
