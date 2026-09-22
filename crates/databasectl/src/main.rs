@@ -17,6 +17,10 @@ use error::{Error, Result};
 
 #[tokio::main]
 async fn main() {
+    // rustls: multiple crypto providers come in from different dependency
+    // paths (reqwest pulls ring, tokio-postgres-rustls pulls aws-lc-rs);
+    // pin the process default so TLS never panics at connect time.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     // REQ-011: `local` is the default mode — engine subcommands promote to
     // the top level via argv preprocessing (both `dctl server start` and
     // `dctl local server start` parse identically). A full tree restructure
