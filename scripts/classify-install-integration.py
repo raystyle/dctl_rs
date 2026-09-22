@@ -40,7 +40,8 @@ INSTALL_PREFIXES = ()
 # inventory test to reject an unclassified new shared/local source or test.
 NON_INSTALL_EXACT_PATHS = frozenset(
     {
-        "crates/databasectl/src/local/config.rs",
+        "crates/databasectl/src/local/ca.rs",
+"crates/databasectl/src/local/config.rs",
         "crates/databasectl/src/local/docker.rs",
         "crates/databasectl/src/local/falkordb.rs",
         "crates/databasectl/src/local/postgres.rs",
