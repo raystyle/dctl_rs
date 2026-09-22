@@ -14,3 +14,4 @@
 | ADR-0008 | accepted | 私仓直连与镜像拉取回落序(registry.ohmygh.com,OCI layout) | 无 |
 | ADR-0009 | accepted | Postgres 与 FalkorDB 原生客户端集成(tokio-postgres 加 falkordb,程序化道原生) | 无 |
 | ADR-0010 | accepted | 镜像拉取链序反转为私仓优先,支持 --registry 按次自定义源 | ADR-0008 决策 1(部分) |
+| ADR-0011 | accepted | 免密密钥身份认证:本地 CA 与三引擎 mTLS 架构 | 无 |

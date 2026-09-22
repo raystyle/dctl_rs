@@ -14,3 +14,4 @@
 | REQ-008 | implemented | should | Postgres 与 FalkorDB 原生客户端集成(全引擎宿主免装客户端) | native-clients 批;ADR-0009 |
 | REQ-010 | draft | should | 镜像拉取默认走私仓并可指定自定义仓库 | null |
 | REQ-011 | draft | must | 去掉 local 命令前缀层,默认即本地操作 | null |
+| REQ-009 | draft | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | ADR-0011 |
