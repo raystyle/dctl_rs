@@ -37,6 +37,7 @@ struct AgentInstallResult {
     path: PathBuf,
     #[serde(flatten)]
     summary: InstallSummary,
+    pruned_skills: usize,
 }
 
 #[derive(Serialize)]
@@ -57,6 +58,19 @@ const AGENT_SKILLS_ARCHIVE_URL: &str =
     "https://codeload.github.com/ClickHouse/agent-skills/tar.gz/refs/heads/main";
 const UNIVERSAL_AGENT_KEY: &str = "agents";
 const UNIVERSAL_COVERAGE: &[&str] = &["Amp", "Cline", "Codex", "Cursor", "OpenCode"];
+
+/// The upstream archive carries skills aimed at other CLIs, cloud services,
+/// and language SDKs; this fork keeps only the engine-knowledge pair that
+/// matches its face (REQ-013). Everything else from the archive is skipped
+/// on install and pruned from agent directories it previously filled.
+const RETAINED_SKILLS: &[&str] = &[
+    "clickhouse-architecture-advisor",
+    "clickhouse-best-practices",
+];
+
+fn is_retained_skill(slug: &str) -> bool {
+    RETAINED_SKILLS.contains(&slug)
+}
 
 const SUPPORTED_AGENTS: &[AgentSpec] = &[
     AgentSpec {
@@ -182,6 +196,7 @@ pub async fn install(args: SkillsArgs, json: bool) -> Result<()> {
     }
     let archive = download_agent_skills_archive().await?;
     let extracted = extract_skills_from_tarball(&archive.path)?;
+    let upstream_slugs = upstream_skill_slugs(&extracted.path)?;
     let skill_files = collect_skill_files(&extracted.path)?;
 
     if skill_files.is_empty() {
@@ -196,6 +211,7 @@ pub async fn install(args: SkillsArgs, json: bool) -> Result<()> {
         &root,
         selected,
         &skill_files,
+        &upstream_slugs,
         json,
         &mut io::stdout(),
     )
@@ -206,6 +222,7 @@ fn install_skill_files(
     root: &Path,
     selected: Vec<&'static AgentSpec>,
     skill_files: &[SkillFile],
+    upstream_slugs: &[String],
     json: bool,
     output: &mut dyn Write,
 ) -> Result<()> {
@@ -221,21 +238,24 @@ fn install_skill_files(
     for agent in selected {
         let summary = install_into_agent(root, agent, skill_files)?;
         let skill_dir = root.join(agent.install_dir);
+        let pruned_skills = prune_non_retained_upstream_skills(&skill_dir, upstream_slugs)?;
         if !json {
             writeln!(
                 output,
-                "  {} -> {} (created {}, updated {}, unchanged {})",
+                "  {} -> {} (created {}, updated {}, unchanged {}, pruned {})",
                 agent.key,
                 skill_dir.display(),
                 summary.created_files,
                 summary.updated_files,
-                summary.unchanged_files
+                summary.unchanged_files,
+                pruned_skills
             )?;
         }
         result.agents.push(AgentInstallResult {
             agent: agent.key,
             path: skill_dir,
             summary,
+            pruned_skills,
         });
     }
     if json {
@@ -389,6 +409,47 @@ fn installed_skill_names(skill_files: &[SkillFile]) -> Vec<String> {
     names
 }
 
+/// Every skill slug present in the upstream archive (retained or not), so
+/// installs can prune previously-installed upstream skills that this fork no
+/// longer keeps without touching skills the user installed themselves.
+fn upstream_skill_slugs(extracted_root: &Path) -> Result<Vec<String>> {
+    let mut slugs = Vec::new();
+    for entry in fs::read_dir(extracted_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            slugs.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    Ok(slugs)
+}
+
+/// Remove skill directories that came from the upstream archive but are not
+/// in the retained set. Directories not present in the archive (the user's
+/// own skills) are left alone.
+fn prune_non_retained_upstream_skills(
+    install_root: &Path,
+    upstream_slugs: &[String],
+) -> Result<usize> {
+    let entries = match fs::read_dir(install_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(err) => return Err(err.into()),
+    };
+    let mut pruned = 0;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if upstream_slugs.iter().any(|slug| slug == &name) && !is_retained_skill(&name) {
+            fs::remove_dir_all(entry.path())?;
+            pruned += 1;
+        }
+    }
+    Ok(pruned)
+}
+
 fn collect_skill_files(extracted_root: &Path) -> Result<Vec<SkillFile>> {
     let mut skill_files = Vec::new();
 
@@ -399,6 +460,9 @@ fn collect_skill_files(extracted_root: &Path) -> Result<Vec<SkillFile>> {
         }
 
         let skill_slug = skill_dir.file_name().to_string_lossy().into_owned();
+        if !is_retained_skill(&skill_slug) {
+            continue;
+        }
         collect_skill_files_recursive(
             &skill_dir.path(),
             &skill_dir.path(),
@@ -901,6 +965,7 @@ mod tests {
                 destination.path(),
                 selected,
                 &files,
+                &[],
                 true,
                 &mut output,
             )
@@ -948,14 +1013,17 @@ mod tests {
 
     #[test]
     fn extracts_only_skill_files_from_repo_archive() {
+        // Both fixture skills are retained slugs: the extraction assertions
+        // below stay about archive parsing; non-retained filtering has its
+        // own test.
         let archive = build_test_archive(&[
+            (
+                "agent-skills-main/skills/clickhouse-architecture-advisor/SKILL.md",
+                b"architecture".as_slice(),
+            ),
             (
                 "agent-skills-main/skills/clickhouse-best-practices/SKILL.md",
                 b"best practices".as_slice(),
-            ),
-            (
-                "agent-skills-main/skills/clickhouse-cli/SKILL.md",
-                b"cli skill".as_slice(),
             ),
             ("agent-skills-main/README.md", b"ignore me".as_slice()),
         ]);
@@ -976,8 +1044,8 @@ mod tests {
         assert_eq!(
             paths,
             vec![
-                "clickhouse-best-practices/SKILL.md",
-                "clickhouse-cli/SKILL.md"
+                "clickhouse-architecture-advisor/SKILL.md",
+                "clickhouse-best-practices/SKILL.md"
             ]
         );
     }
@@ -1148,5 +1216,62 @@ mod tests {
         let path = std::env::temp_dir().join(format!("dctl-skills-{name}-{unique}"));
         std::fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    fn write_skill(root: &Path, slug: &str, contents: &str) {
+        let dir = root.join(slug);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), contents).unwrap();
+    }
+
+    #[test]
+    fn collect_skill_files_keeps_only_retained_skills() {
+        let extracted = tempfile::tempdir().unwrap();
+        write_skill(extracted.path(), "clickhouse-best-practices", "kept");
+        write_skill(extracted.path(), "chdb-sql", "dropped");
+        write_skill(extracted.path(), "clickhouse-architecture-advisor", "kept");
+
+        let files = collect_skill_files(extracted.path()).unwrap();
+        let mut slugs: Vec<&str> = files.iter().map(|file| file.skill_slug.as_str()).collect();
+        slugs.sort_unstable();
+        slugs.dedup();
+        assert_eq!(
+            slugs,
+            [
+                "clickhouse-architecture-advisor",
+                "clickhouse-best-practices"
+            ]
+        );
+    }
+
+    #[test]
+    fn prune_removes_upstream_non_retained_but_keeps_user_skills() {
+        let install_root = tempfile::tempdir().unwrap();
+        write_skill(install_root.path(), "clickhouse-best-practices", "retained");
+        write_skill(install_root.path(), "chdb-sql", "stale upstream");
+        write_skill(install_root.path(), "my-own-skill", "user skill");
+
+        let upstream = vec![
+            "chdb-sql".to_string(),
+            "clickhouse-best-practices".to_string(),
+        ];
+        let pruned = prune_non_retained_upstream_skills(install_root.path(), &upstream).unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(
+            install_root
+                .path()
+                .join("clickhouse-best-practices")
+                .is_dir()
+        );
+        assert!(install_root.path().join("my-own-skill").is_dir());
+        assert!(!install_root.path().join("chdb-sql").exists());
+    }
+
+    #[test]
+    fn prune_on_missing_install_root_is_a_no_op() {
+        let missing = tempfile::tempdir().unwrap();
+        let path = missing.path().join("never-created");
+        assert_eq!(prune_non_retained_upstream_skills(&path, &[]).unwrap(), 0);
     }
 }

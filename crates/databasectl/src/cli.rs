@@ -45,7 +45,7 @@ CONTEXT FOR AGENTS:
   Typical flow: `ledger issue new` -> work -> `ledger artifact publish`; close/delete via the omc workbench.")]
     Ledger(crate::ledger::cli::LedgerArgs),
 
-    /// Install ClickHouse agent skills into supported coding agents
+    /// Install the curated ClickHouse skill pair into supported coding agents
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   --all, --detected-only or --agent skip the agent prompt; --global only sets the scope, so agents

@@ -169,7 +169,7 @@ FalkorDB 是 Redis 模块图数据库(openCypher);`client -q` 接 Cypher 语句,
 ### agent 技能安装
 
 ```console
-$ dctl skills --agent claude    # 把 ClickHouse agent 技能装进 coding agents
+$ dctl skills --agent claude    # 把精选 ClickHouse 技能对(架构顾问与最佳实践)装进 coding agents;上游包其余项跳过并清理
 ```
 
 ### ledger 公共账本
