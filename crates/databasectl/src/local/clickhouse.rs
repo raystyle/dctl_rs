@@ -128,6 +128,7 @@ fn tag_from_stored_version(stored: &str) -> &str {
     stored.strip_prefix("clickhouse:").unwrap_or(stored)
 }
 
+#[derive(Debug)]
 struct StartPreflight {
     http_port: Option<u16>,
     native_port: Option<u16>,
@@ -174,6 +175,19 @@ fn validate_start_options(
     }
 
     let bind_face = bind.map(parse_ch_bind).transpose()?;
+    // A --bind face that is not present in this network namespace would
+    // otherwise surface as "port already in use" (or degrade auto-pick);
+    // fail with the real cause instead.
+    if let Some(face) = bind_face
+        && !face.is_unspecified()
+        && let Err(error) = std::net::TcpListener::bind((face, 0))
+        && error.kind() == std::io::ErrorKind::AddrNotAvailable
+    {
+        return Err(Error::ClickhouseUsage(format!(
+            "--bind address {face} is not present on this host; run dctl where that \
+             interface exists (the host network namespace)"
+        )));
+    }
     let http_port = http_port
         .map(|port| resolve_port(Some(port), PortKind::Http, bind_face))
         .transpose()?;
@@ -923,12 +937,18 @@ fn resolve_port(
 }
 
 /// A port is usable when it is free on loopback and on the extra `--bind`
-/// face. An unspecified face (`0.0.0.0`/`::`) replaces the loopback probe
-/// with a wildcard probe: a wildcard bind conflicts with any existing
-/// binding on the port, on any interface.
+/// face. A v4 wildcard (`0.0.0.0`) replaces the loopback probe with a
+/// wildcard probe (it covers loopback and conflicts with any existing
+/// binding on the port); a v6 wildcard (`::`) probes like a specific face
+/// because Docker publishes it v6-only.
 fn port_free(port: u16, bind_face: Option<std::net::IpAddr>) -> bool {
     match bind_face {
-        Some(face) if face.is_unspecified() => std::net::TcpListener::bind((face, port)).is_ok(),
+        // A v4 wildcard covers loopback, so it replaces it. A v6 wildcard
+        // does not (Docker publishes [::] v6-only), so it probes like a
+        // specific face.
+        Some(face) if face.is_ipv4() && face.is_unspecified() => {
+            std::net::TcpListener::bind((face, port)).is_ok()
+        }
         Some(face) => {
             std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
                 && std::net::TcpListener::bind((face, port)).is_ok()
@@ -1375,6 +1395,41 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(error, Error::PortInUse { port: error_port, .. } if error_port == port),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolve_port_v6_wildcard_face_still_probes_loopback() {
+        // Docker publishes [::] v6-only, so a v6 wildcard face keeps the
+        // loopback companion probe: a port held on loopback stays unusable.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error =
+            resolve_port(Some(port), PortKind::Http, Some("::".parse().unwrap())).unwrap_err();
+        assert!(
+            matches!(error, Error::PortInUse { port: error_port, .. } if error_port == port),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_start_options_rejects_bind_face_missing_from_host() {
+        // TEST-NET-1 is never a local address, so the pre-flight surfaces
+        // the real cause instead of folding it into "port already in use".
+        let error = validate_start_options(
+            None,
+            None,
+            None,
+            None,
+            Some("192.0.2.1"),
+            None,
+            None,
+            Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::ClickhouseUsage(ref message) if message.contains("not present on this host")),
             "{error}"
         );
     }

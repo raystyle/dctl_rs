@@ -589,8 +589,7 @@ fn read_metadata(project: &Path, key: &str) -> serde_json::Value {
         .expect("metadata JSON")
 }
 
-#[test]
-fn fresh_start_with_bind_publishes_ports_on_loopback_and_bind_face() {
+fn assert_start_publishes_on_faces(bind: &str, expected: &[&str]) {
     let _guard = START_COMMAND_LOCK.lock().unwrap();
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
@@ -615,7 +614,7 @@ fn fresh_start_with_bind_publishes_ports_on_loopback_and_bind_face() {
             "server",
             "start",
             "--bind",
-            "127.0.0.2",
+            bind,
             "--http-port",
             &http_port.to_string(),
             "--native-port",
@@ -642,8 +641,29 @@ fn fresh_start_with_bind_publishes_ports_on_loopback_and_bind_face() {
             .map(|binding| binding["HostIp"].as_str().expect("HostIp"))
             .collect()
     };
-    assert_eq!(faces("8123/tcp"), ["127.0.0.1", "127.0.0.2"]);
-    assert_eq!(faces("9000/tcp"), ["127.0.0.1", "127.0.0.2"]);
+    assert_eq!(faces("8123/tcp"), expected, "--bind {bind}");
+    assert_eq!(faces("9000/tcp"), expected, "--bind {bind}");
+}
+
+#[test]
+fn fresh_start_with_bind_publishes_ports_on_loopback_and_bind_face() {
+    assert_start_publishes_on_faces("127.0.0.2", &["127.0.0.1", "127.0.0.2"]);
+}
+
+#[test]
+fn fresh_start_with_v4_wildcard_bind_replaces_loopback_face() {
+    assert_start_publishes_on_faces("0.0.0.0", &["0.0.0.0"]);
+}
+
+#[test]
+fn fresh_start_with_loopback_bind_dedupes_to_single_face() {
+    assert_start_publishes_on_faces("127.0.0.1", &["127.0.0.1"]);
+}
+
+#[test]
+fn fresh_start_with_v6_wildcard_bind_keeps_loopback_companion() {
+    // Docker publishes [::] v6-only, so the loopback companion stays.
+    assert_start_publishes_on_faces("::", &["127.0.0.1", "::"]);
 }
 
 #[test]

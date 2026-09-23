@@ -651,7 +651,9 @@ pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> 
     let loopback = "127.0.0.1".to_string();
     let host_faces: Vec<String> = match opts.bind {
         None => vec![loopback],
-        Some(face) if face.is_unspecified() => vec![face.to_string()],
+        // A v4 wildcard covers loopback, so it replaces it. A v6 wildcard
+        // does not (Docker publishes [::] v6-only), so loopback rides along.
+        Some(face) if face.is_ipv4() && face.is_unspecified() => vec![face.to_string()],
         Some(face) if face.to_string() == loopback => vec![loopback],
         Some(face) => vec![loopback, face.to_string()],
     };

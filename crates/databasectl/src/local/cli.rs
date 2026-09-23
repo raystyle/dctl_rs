@@ -579,7 +579,8 @@ CONTEXT FOR AGENTS:
         native_port: Option<u16>,
 
         /// Extra host interface to publish the ports on, in addition to
-        /// loopback; 0.0.0.0 publishes on all interfaces. Ignored on resume.
+        /// loopback. 0.0.0.0 publishes on all IPv4 interfaces (replacing
+        /// loopback); :: adds the IPv6 wildcard. Ignored on resume.
         #[arg(
             long = "bind",
             value_name = "IP",
@@ -986,9 +987,8 @@ mod tests {
     #[test]
     fn server_start_rejects_non_ip_bind_face() {
         let error = local_parse_error(&["server", "start", "--bind", "lan-linux"]);
-        let rendered = error.to_string();
-        assert!(rendered.contains("--bind"), "{rendered}");
-        assert!(rendered.contains("IPv4 or IPv6"), "{rendered}");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("--bind"), "{error}");
     }
 
     // ── install selectors ────────────────────────────────────────────────
