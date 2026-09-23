@@ -16,4 +16,4 @@
 | REQ-011 | draft | must | 去掉 local 命令前缀层,默认即本地操作 | null |
 | REQ-009 | draft | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | ADR-0011 |
 | REQ-012 | implemented | must | clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面 | --bind 批 f7a39d2;NSM 部署真机验收 |
-| REQ-013 | draft | should | skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项 | null |
+| REQ-013 | implemented | should | skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项 | 剪枝批 4e6834f;实机冒烟收敛两项 |

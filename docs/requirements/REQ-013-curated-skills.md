@@ -1,9 +1,9 @@
 ---
 id: REQ-013
 title: skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项
-status: draft
+status: implemented
 priority: should
-trace: null
+trace: skills 剪枝批(2b43d50 + 4e6834f);实机冒烟 17 agent 目录各剔 9 存 2,清单收敛两项
 ---
 
 # skills 面剪枝
