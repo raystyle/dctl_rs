@@ -1,9 +1,9 @@
 ---
 id: REQ-012
 title: clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面
-status: draft
+status: implemented
 priority: must
-trace: null
+trace: --bind 批(81b3d03 加旗标 + f7a39d2 评审修订);真机四面实证见评审轮与 NSM 部署批(docs/diary/2026-09-23-nsm-ch-deploy.md)
 ---
 
 # clickhouse start 增 --bind 旗标

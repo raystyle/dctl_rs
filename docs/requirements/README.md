@@ -15,4 +15,4 @@
 | REQ-010 | draft | should | 镜像拉取默认走私仓并可指定自定义仓库 | null |
 | REQ-011 | draft | must | 去掉 local 命令前缀层,默认即本地操作 | null |
 | REQ-009 | draft | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | ADR-0011 |
-| REQ-012 | draft | must | clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面 | null |
+| REQ-012 | implemented | must | clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面 | --bind 批 f7a39d2;NSM 部署真机验收 |
