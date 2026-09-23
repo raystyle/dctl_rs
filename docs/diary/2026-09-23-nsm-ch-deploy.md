@@ -25,3 +25,9 @@
 - **持久 cargo 缓存卷盖掉镜像自带 cargo**:空 bind mount 挂 /usr/local/cargo 后 `exec: "cargo": not found`(named volume 首挂自动拷镜像内容,bind mount 不会)。先播种:`docker run --rm -v /tmp/dctl_cargo:/mnt rust:1-slim sh -c "cp -a /usr/local/cargo/. /mnt/"`。
 - toYYYYMM(DateTime64) 的 DROP PARTITION 用 `DROP PARTITION ID '200001'`(裸数字 200001 报「Wrong number of fields」)。
 - 验收冒烟法:vector 写一行 ts=2000-01-01 的合成流(独立分区),验 MV 链后 DROP PARTITION ID 清除,零残留不污染对账窗。
+
+## skills 剪枝批(REQ-013,同日晚)
+
+- 动因:用户令修正对齐 skill 面。上游 agent-skills 全量 11 项里,infra-* 教上游 clickhousectl 命令加 ClickHouse Cloud 编排、managed-postgres-rca 走 api.clickhouse.cloud 云 API、chdb-*/clickhouse-js-node-*/clickstack 均域外;保留纯引擎知识两项(architecture-advisor、best-practices)。
+- 落法:RETAINED_SKILLS 收集过滤 + 装后 prune(目录名 ∈ 档案 slug 集 且 ∉ 保留集 才清;用户自有技能不动;目录缺失 no-op);JSON 按 agent 增 pruned_skills。
+- 评审 G 处置:G1 本节补档、G2 根帮助口径同步 curated、G4 两处 prune 边界记 REQ(同名误清、下架项不清)、G5 认正(check-md 实为 40 文件)。码面 CONFIRM,实机冒烟(2 项列表 + 五目录清理)后推。

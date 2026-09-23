@@ -19,7 +19,7 @@ pub(crate) mod help_order {
     .display_order(0)))]
 #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Install the ClickHouse agent skills: `dctl skills --agent claude`")]
+  Install the curated ClickHouse skills: `dctl skills --agent claude`")]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
