@@ -549,8 +549,8 @@ CONTEXT FOR AGENTS:
   Docker-managed: same container lifecycle as Postgres and FalkorDB.
   Ports: 8123 (HTTP) and 9000 (native); auto-picked when busy, never the same.
   The generated password is printed once by start; query later with `local client -q`.
-  An existing stopped instance is resumed; --user/--password/--database/--config/--env and
-  the port flags are ignored on a resume (the container keeps its settings).
+  An existing stopped instance is resumed; --user/--password/--database/--config/--env,
+  the port flags, and --bind are ignored on a resume (the container keeps its settings).
   A failed fresh start rolls back container and data; pre-existing data is kept.")]
     Start {
         /// Server name (default: "default", or random if default is already running)
@@ -577,6 +577,15 @@ CONTEXT FOR AGENTS:
         /// Native TCP port; when omitted, 9000 if free else auto-selected
         #[arg(long, value_parser = crate::local::clickhouse::parse_ch_native_port_arg)]
         native_port: Option<u16>,
+
+        /// Extra host interface to publish the ports on, in addition to
+        /// loopback; 0.0.0.0 publishes on all interfaces. Ignored on resume.
+        #[arg(
+            long = "bind",
+            value_name = "IP",
+            value_parser = crate::local::clickhouse::parse_ch_bind_arg
+        )]
+        bind: Option<String>,
 
         /// CLICKHOUSE_USER (default: default)
         #[arg(long)]
@@ -951,6 +960,37 @@ mod tests {
         error.to_string()
     }
 
+    // ── server start --bind ─────────────────────────────────────────────
+
+    #[test]
+    fn server_start_parses_and_normalizes_bind_face() {
+        let command = local_command(&["server", "start", "--bind", "192.168.88.175"]);
+        let LocalCommands::Server {
+            command: ServerCommands::Start { bind, .. },
+        } = command
+        else {
+            panic!("expected server start");
+        };
+        assert_eq!(bind.as_deref(), Some("192.168.88.175"));
+
+        let command = local_command(&["server", "start", "--bind", "::0001"]);
+        let LocalCommands::Server {
+            command: ServerCommands::Start { bind, .. },
+        } = command
+        else {
+            panic!("expected server start");
+        };
+        assert_eq!(bind.as_deref(), Some("::1"));
+    }
+
+    #[test]
+    fn server_start_rejects_non_ip_bind_face() {
+        let error = local_parse_error(&["server", "start", "--bind", "lan-linux"]);
+        let rendered = error.to_string();
+        assert!(rendered.contains("--bind"), "{rendered}");
+        assert!(rendered.contains("IPv4 or IPv6"), "{rendered}");
+    }
+
     // ── install selectors ────────────────────────────────────────────────
 
     #[test]
@@ -1146,6 +1186,7 @@ mod tests {
                     version,
                     http_port,
                     native_port,
+                    bind,
                     user,
                     password,
                     database,
@@ -1164,6 +1205,8 @@ mod tests {
             "18123",
             "--native-port",
             "19000",
+            "--bind",
+            "192.168.88.5",
             "--user",
             "app",
             "--password",
@@ -1184,6 +1227,7 @@ mod tests {
         assert_eq!(version.as_deref(), Some("26.8"));
         assert_eq!(http_port, Some(18123));
         assert_eq!(native_port, Some(19000));
+        assert_eq!(bind.as_deref(), Some("192.168.88.5"));
         assert_eq!(user.as_deref(), Some("app"));
         assert_eq!(password.as_deref(), Some("secret"));
         assert_eq!(database.as_deref(), Some("events"));

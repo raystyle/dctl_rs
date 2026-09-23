@@ -590,6 +590,63 @@ fn read_metadata(project: &Path, key: &str) -> serde_json::Value {
 }
 
 #[test]
+fn fresh_start_with_bind_publishes_ports_on_loopback_and_bind_face() {
+    let _guard = START_COMMAND_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario {
+            running: true,
+            live_before_start: false,
+            ..Default::default()
+        },
+    );
+    let (http_port, native_port) = reserve_port_pair();
+    let _http = FakeClickhouseHttp::start_after(http_port, docker.started_flag());
+
+    let output = run(
+        project.path(),
+        home.path(),
+        &[
+            "local",
+            "--json",
+            "server",
+            "start",
+            "--bind",
+            "127.0.0.2",
+            "--http-port",
+            &http_port.to_string(),
+            "--native-port",
+            &native_port.to_string(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let requests = docker.requests();
+    let create = requests
+        .iter()
+        .find(|request| request.path.starts_with("/containers/create"))
+        .expect("container create request");
+    let body: serde_json::Value = serde_json::from_str(&create.body).expect("create body JSON");
+    let faces = |container_port: &str| -> Vec<&str> {
+        body["HostConfig"]["PortBindings"][container_port]
+            .as_array()
+            .expect(container_port)
+            .iter()
+            .map(|binding| binding["HostIp"].as_str().expect("HostIp"))
+            .collect()
+    };
+    assert_eq!(faces("8123/tcp"), ["127.0.0.1", "127.0.0.2"]);
+    assert_eq!(faces("9000/tcp"), ["127.0.0.1", "127.0.0.2"]);
+}
+
+#[test]
 fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
     let _guard = START_COMMAND_LOCK.lock().unwrap();
     let project = tempfile::tempdir().unwrap();

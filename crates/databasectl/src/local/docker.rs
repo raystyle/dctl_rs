@@ -622,6 +622,9 @@ pub struct ClickhouseRunOpts<'a> {
     pub image_ref: &'a str,
     pub http_port: u16,
     pub native_port: u16,
+    /// Extra host face for the published ports, beyond loopback. An
+    /// unspecified address (`0.0.0.0`) publishes on all interfaces instead.
+    pub bind: Option<std::net::IpAddr>,
     pub data_dir: &'a std::path::Path,
     pub project_cwd: &'a str,
     pub user: &'a str,
@@ -642,15 +645,30 @@ pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> 
     use bollard::query_parameters::CreateContainerOptionsBuilder;
 
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    // Host faces the ports are published on: loopback by default; `--bind`
+    // adds one more face (or replaces loopback with a wildcard). Loopback
+    // always stays published so dctl's own probes and client keep working.
+    let loopback = "127.0.0.1".to_string();
+    let host_faces: Vec<String> = match opts.bind {
+        None => vec![loopback],
+        Some(face) if face.is_unspecified() => vec![face.to_string()],
+        Some(face) if face.to_string() == loopback => vec![loopback],
+        Some(face) => vec![loopback, face.to_string()],
+    };
     for (container_port, host_port) in
         [("8123/tcp", opts.http_port), ("9000/tcp", opts.native_port)]
     {
         port_bindings.insert(
             container_port.to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("127.0.0.1".to_string()),
-                host_port: Some(host_port.to_string()),
-            }]),
+            Some(
+                host_faces
+                    .iter()
+                    .map(|host_ip| PortBinding {
+                        host_ip: Some(host_ip.clone()),
+                        host_port: Some(host_port.to_string()),
+                    })
+                    .collect(),
+            ),
         );
     }
 

@@ -73,6 +73,23 @@ pub(crate) fn parse_ch_native_port_arg(value: &str) -> std::result::Result<u16, 
     Ok(port)
 }
 
+/// `--bind <IP>`: an extra host face for the published ports, stored in
+/// canonical form (`192.168.88.175`, `::1`, `0.0.0.0`).
+pub(crate) fn parse_ch_bind_arg(value: &str) -> std::result::Result<String, String> {
+    parse_ch_bind(value)
+        .map(|ip| ip.to_string())
+        .map_err(|error| error.to_string())
+}
+
+fn parse_ch_bind(value: &str) -> Result<std::net::IpAddr> {
+    value.parse().map_err(|_| {
+        Error::ClickhouseUsage(format!(
+            "invalid --bind address '{value}': expected an IPv4 or IPv6 host address \
+             (for example: 192.168.88.175), or 0.0.0.0 to publish on all interfaces"
+        ))
+    })
+}
+
 fn parse_ch_port_value(value: &str) -> std::result::Result<u16, String> {
     value
         .parse::<u16>()
@@ -114,15 +131,18 @@ fn tag_from_stored_version(stored: &str) -> &str {
 struct StartPreflight {
     http_port: Option<u16>,
     native_port: Option<u16>,
+    bind_face: Option<std::net::IpAddr>,
     config_source: Option<std::path::PathBuf>,
     extra_env: Vec<String>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_start_options(
     name: Option<&str>,
     version: Option<&str>,
     http_port: Option<u16>,
     native_port: Option<u16>,
+    bind: Option<&str>,
     password: Option<&str>,
     config: Option<&str>,
     extra_env: Vec<String>,
@@ -153,11 +173,12 @@ fn validate_start_options(
         }
     }
 
+    let bind_face = bind.map(parse_ch_bind).transpose()?;
     let http_port = http_port
-        .map(|port| resolve_port(Some(port), PortKind::Http))
+        .map(|port| resolve_port(Some(port), PortKind::Http, bind_face))
         .transpose()?;
     let native_port = native_port
-        .map(|port| resolve_port(Some(port), PortKind::Clickhouse))
+        .map(|port| resolve_port(Some(port), PortKind::Clickhouse, bind_face))
         .transpose()?;
     if let (Some(http), Some(native)) = (http_port, native_port)
         && http == native
@@ -176,6 +197,7 @@ fn validate_start_options(
     Ok(StartPreflight {
         http_port,
         native_port,
+        bind_face,
         config_source,
         extra_env,
     })
@@ -187,6 +209,7 @@ pub(crate) struct StartCmd {
     pub version: Option<String>,
     pub http_port: Option<u16>,
     pub native_port: Option<u16>,
+    pub bind: Option<String>,
     pub user: Option<String>,
     pub password: Option<String>,
     pub database: Option<String>,
@@ -202,6 +225,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         version,
         http_port,
         native_port,
+        bind,
         user,
         password,
         database,
@@ -215,12 +239,14 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         version.as_deref(),
         http_port,
         native_port,
+        bind.as_deref(),
         password.as_deref(),
         config.as_deref(),
         extra_env,
     )?;
     let explicit_http_port = preflight.http_port;
     let explicit_native_port = preflight.native_port;
+    let bind_face = preflight.bind_face;
     let config_source = preflight.config_source;
     let extra_env = preflight.extra_env;
 
@@ -292,11 +318,11 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         // Fresh create.
         let http_port = match explicit_http_port {
             Some(port) => port,
-            None => resolve_port(None, PortKind::Http)?,
+            None => resolve_port(None, PortKind::Http, bind_face)?,
         };
         let native_port = match explicit_native_port {
             Some(port) => port,
-            None => resolve_native_port_excluding(http_port)?,
+            None => resolve_native_port_excluding(http_port, bind_face)?,
         };
 
         let instance_dir = server::servers_dir_join(&key);
@@ -314,6 +340,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             image_ref: &ch_image_ref(&tag),
             http_port,
             native_port,
+            bind: bind_face,
             data_dir: &data_dir,
             project_cwd: &project_cwd,
             user: &user,
@@ -865,7 +892,11 @@ async fn ch_readiness_error(
 
 // ── ports ──────────────────────────────────────────────────────────────────
 
-fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
+fn resolve_port(
+    explicit: Option<u16>,
+    kind: PortKind,
+    bind_face: Option<std::net::IpAddr>,
+) -> Result<u16> {
     let default_port = match kind {
         PortKind::Clickhouse => DEFAULT_CH_NATIVE_PORT,
         _ => DEFAULT_CH_HTTP_PORT,
@@ -876,28 +907,46 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
                 "--port 0 is not allowed; pick a specific port or omit the flag".into(),
             ));
         }
-        Some(port) if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() => return Ok(port),
+        Some(port) if port_free(port, bind_face) => return Ok(port),
         Some(port) => return Err(Error::PortInUse { kind, port }),
         None => {}
     }
-    if std::net::TcpListener::bind(("127.0.0.1", default_port)).is_ok() {
+    if port_free(default_port, bind_face) {
         return Ok(default_port);
     }
     for p in (default_port + 1)..=(default_port + 100) {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        if port_free(p, bind_face) {
             return Ok(p);
         }
     }
     Err(Error::PortUnavailable(kind))
 }
 
-fn resolve_native_port_excluding(http_port: u16) -> Result<u16> {
-    let picked = resolve_port(None, PortKind::Clickhouse)?;
+/// A port is usable when it is free on loopback and on the extra `--bind`
+/// face. An unspecified face (`0.0.0.0`/`::`) replaces the loopback probe
+/// with a wildcard probe: a wildcard bind conflicts with any existing
+/// binding on the port, on any interface.
+fn port_free(port: u16, bind_face: Option<std::net::IpAddr>) -> bool {
+    match bind_face {
+        Some(face) if face.is_unspecified() => std::net::TcpListener::bind((face, port)).is_ok(),
+        Some(face) => {
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+                && std::net::TcpListener::bind((face, port)).is_ok()
+        }
+        None => std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
+    }
+}
+
+fn resolve_native_port_excluding(
+    http_port: u16,
+    bind_face: Option<std::net::IpAddr>,
+) -> Result<u16> {
+    let picked = resolve_port(None, PortKind::Clickhouse, bind_face)?;
     if picked != http_port {
         return Ok(picked);
     }
     for p in (DEFAULT_CH_NATIVE_PORT + 1)..=(DEFAULT_CH_NATIVE_PORT + 101) {
-        if p != http_port && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        if p != http_port && port_free(p, bind_face) {
             return Ok(p);
         }
     }
@@ -1260,5 +1309,73 @@ async fn read_ch_env_for_dotenv(container_id: &str) -> (String, String, String) 
     match docker::connect().await {
         Ok(d) => read_ch_env(&d, container_id).await,
         Err(_) => (DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_arg_accepts_and_normalizes_addresses() {
+        assert_eq!(
+            parse_ch_bind_arg("192.168.88.175").unwrap(),
+            "192.168.88.175"
+        );
+        assert_eq!(parse_ch_bind_arg("0.0.0.0").unwrap(), "0.0.0.0");
+        assert_eq!(parse_ch_bind_arg("::0001").unwrap(), "::1");
+    }
+
+    #[test]
+    fn bind_arg_rejects_non_addresses() {
+        for value in ["lan-linux", "999.999.1.1", ""] {
+            assert!(
+                parse_ch_bind_arg(value).is_err(),
+                "expected `{value}` to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_port_without_bind_face_probes_loopback_only() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        assert_eq!(
+            resolve_port(Some(port), PortKind::Http, None).unwrap(),
+            port
+        );
+    }
+
+    #[test]
+    fn resolve_port_wildcard_face_rejects_port_held_on_loopback() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = resolve_port(
+            Some(port),
+            PortKind::Http,
+            Some(std::net::IpAddr::from([0, 0, 0, 0])),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::PortInUse { port: error_port, .. } if error_port == port),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn resolve_port_specific_face_rejects_port_held_on_wildcard() {
+        let listener = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let error = resolve_port(
+            Some(port),
+            PortKind::Http,
+            Some("127.0.0.1".parse().unwrap()),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::PortInUse { port: error_port, .. } if error_port == port),
+            "{error}"
+        );
     }
 }

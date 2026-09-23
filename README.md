@@ -89,6 +89,7 @@ $ dctl registry catalog            # 列私仓 repos;读面匿名开放,有本�
 $ dctl init                       # 脚手架 .dctl/、clickhouse/、postgres/、falkordb/ 目录
 $ dctl server start               # default 实例,clickhouse:26.8,双口被占自动选空闲口
 $ dctl server start dev --http-port 8333 --native-port 9333
+$ dctl server start nsm --bind 192.168.88.175  # 双口追加发布到该面(loopback 保留;0.0.0.0 全接口)
 $ dctl server start --version 26.8.9   # 指定镜像 tag;latest 亦可
 $ dctl server list                # 三引擎并列(运行中 + 已停止)
 $ dctl server stop [NAME]         # 幂等;stop-all 停本项目所有引擎
