@@ -3,7 +3,7 @@ id: REQ-0014
 title: 项目作用域状态目录迁入 ~/.dctl 应用数据目录(不随 cwd 漂移)
 status: implemented
 priority: must
-trace: 总台派单 2026-10-02(dctl 状态目录落仓问题);ADR-0012;实现批(桶寻址 + 迁移 + init 收敛 + 文档同步);实机冒烟:净 cwd 跑 server list 零落点、legacy .dctl/servers 迁入桶且旧壳清
+trace: 总台派单 2026-10-02(dctl 状态目录落仓问题);ADR-0012;实现批(桶寻址 + 迁移 + init 收敛 + 文档同步);实机冒烟:净 cwd 跑 server list 零落点、legacy .dctl/servers 迁入桶且旧壳清;评审轮 5519267 回执 F1/F2+G1-G3,修订批桶权威同名跳过、集成脚本桶化、Copy 无元数据数据目录拒绝、gitignore 内容校验、refusal 文案给 docker 路径
 ---
 
 # 项目作用域状态目录迁入 ~/.dctl 应用数据目录

@@ -1012,8 +1012,9 @@ fn readiness_timeout_rolls_back_fresh_container_and_data() {
 
 #[test]
 fn recovery_from_deleted_metadata_resumes_with_correct_ports() {
-    // The F1 regression chain: metadata gone (git clean -xdf clears
-    // .dctl/), a stopped labelled container remains. Recovery via labels
+    // The F1 regression chain: metadata deleted (state lives in the
+    // app-data bucket, so nothing in the repo shields it), a stopped
+    // labelled container remains. Recovery via labels
     // stores 0/0 ports (a stopped container publishes none); the resume
     // must refresh BOTH ports from the container's own bindings before
     // probing readiness — http://127.0.0.1:0/ping never becomes ready.

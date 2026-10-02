@@ -67,13 +67,23 @@ run_case() {
     fi
 }
 
+
+# The per-project state bucket (ADR-0012), mirroring the binary's
+# ~/.dctl/projects/<first-16-sha256-hex-of-canonical-cwd>/servers address.
+# $1 = canonical project dir (run_case exports real_dir via dynamic scope).
+servers() {
+    local id
+    id=$(printf '%s' "$1" | sha256sum | cut -c1-16)
+    printf '%s/.dctl/projects/%s/servers' "${DCTL_TEST_HOME:-$HOME}" "$id"
+}
+
 # Helper: fail the case
 die() { echo "    -> $*"; return 1; }
 
 # ── 1. Reuses existing container after stop/delete-metadata via discovery ──
 case_orphan_recovery() {
     "$CTL" local postgres start --name a --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
-    local meta=.dctl/servers/a-pg18.json
+    local meta; meta="$(servers "$real_dir")/a-pg18.json"
     local cid_before; cid_before=$(jq -r .container_id "$meta")
     "$CTL" local postgres stop a >/dev/null 2>&1 || { die "stop"; return 1; }
     rm "$meta"
@@ -88,7 +98,7 @@ case_orphan_recovery() {
 # ── 2. start with externally-removed container errors with recovery guidance ──
 case_externally_removed_container() {
     "$CTL" local postgres start --name b --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
-    local cid; cid=$(jq -r .container_id .dctl/servers/b-pg18.json)
+    local cid; cid=$(jq -r .container_id "$(servers "$real_dir")/b-pg18.json")
     docker rm -f "$cid" >/dev/null 2>&1 || { die "docker rm failed"; return 1; }
     # Metadata still references the dead id. Should error with explicit
     # recovery guidance, not silently recreate against potentially-corrupt PGDATA.
@@ -107,8 +117,8 @@ case_two_concurrent_servers() {
     "$CTL" local postgres start --name c1 --version 18-alpine >/dev/null 2>&1 || { die "start c1"; return 1; }
     "$CTL" local postgres start --name c2 --version 18-alpine >/dev/null 2>&1 || { die "start c2"; return 1; }
     local p1 p2
-    p1=$(jq -r .tcp_port .dctl/servers/c1-pg18.json)
-    p2=$(jq -r .tcp_port .dctl/servers/c2-pg18.json)
+    p1=$(jq -r .tcp_port "$(servers "$real_dir")/c1-pg18.json")
+    p2=$(jq -r .tcp_port "$(servers "$real_dir")/c2-pg18.json")
     [[ "$p1" != "$p2" ]] || { die "ports collide: $p1 == $p2"; return 1; }
     [[ "$p1" -gt 0 && "$p2" -gt 0 ]] || { die "ports invalid"; return 1; }
     "$CTL" local postgres stop c1 >/dev/null 2>&1
@@ -122,10 +132,10 @@ case_per_version_isolation() {
     "$CTL" local postgres start --name d --version 17-alpine >/dev/null 2>&1 || { die "start 17"; return 1; }
     "$CTL" local postgres stop d >/dev/null 2>&1
     "$CTL" local postgres start --name d --version 18-alpine >/dev/null 2>&1 || { die "start 18"; return 1; }
-    [[ -f .dctl/servers/d-pg17.json ]] || { die "17 metadata vanished"; return 1; }
-    [[ -f .dctl/servers/d-pg18.json ]] || { die "18 metadata not created"; return 1; }
-    [[ -d .dctl/servers/d-pg17/data ]] || { die "17 data dir vanished"; return 1; }
-    [[ -d .dctl/servers/d-pg18/data ]] || { die "18 data dir not created"; return 1; }
+    [[ -f "$(servers "$real_dir")/d-pg17.json" ]] || { die "17 metadata vanished"; return 1; }
+    [[ -f "$(servers "$real_dir")/d-pg18.json" ]] || { die "18 metadata not created"; return 1; }
+    [[ -d "$(servers "$real_dir")/d-pg17/data" ]] || { die "17 data dir vanished"; return 1; }
+    [[ -d "$(servers "$real_dir")/d-pg18/data" ]] || { die "18 data dir not created"; return 1; }
     # Bare `local postgres stop d` should ask for --version since multiple match.
     local out; out=$("$CTL" local postgres stop d 2>&1) || true
     echo "$out" | grep -q "pass --version" || { die "no disambiguation message: $out"; return 1; }
@@ -164,15 +174,15 @@ case_install_rejects_latest() {
 # ── 8. Cross-engine name reuse coexists (CH and PG can share a name) ──
 case_cross_engine_coexist() {
     # Fake a stopped CH "shared" instance with metadata only.
-    mkdir -p .dctl/servers/shared/data
-    cat > .dctl/servers/shared.json <<EOF
+    mkdir -p "$(servers "$real_dir")/shared/data"
+    cat > "$(servers "$real_dir")/shared.json" <<EOF
 {"name":"shared","pid":99999,"version":"25.12.5.44","http_port":8123,"tcp_port":9000,"started_at":"0","cwd":"$PWD","engine":"clickhouse"}
 EOF
     # Starting Postgres "shared" should succeed — CH and PG live in different files.
     "$CTL" local postgres start --name shared --version 18-alpine >/dev/null 2>&1 \
         || { die "postgres start with same name failed"; return 1; }
-    [[ -f .dctl/servers/shared.json ]] || { die "CH metadata clobbered"; return 1; }
-    [[ -f .dctl/servers/shared-pg18.json ]] || { die "PG metadata not created"; return 1; }
+    [[ -f "$(servers "$real_dir")/shared.json" ]] || { die "CH metadata clobbered"; return 1; }
+    [[ -f "$(servers "$real_dir")/shared-pg18.json" ]] || { die "PG metadata not created"; return 1; }
     "$CTL" local postgres stop shared >/dev/null 2>&1
     "$CTL" local postgres remove shared >/dev/null 2>&1
 }
@@ -217,7 +227,7 @@ case_non_tty_query() {
     "$CTL" local postgres start --name q --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
     # Wait for pg to be query-ready (up to ~5s); the first start already waits
     # for the container, but pg itself takes a moment to accept queries.
-    local cid; cid=$(jq -r .container_id .dctl/servers/q-pg18.json)
+    local cid; cid=$(jq -r .container_id "$(servers "$real_dir")/q-pg18.json")
     # `pg_isready` without -h checks a unix socket dir that may not exist in
     # alpine builds yet; force TCP to wait for actual query readiness.
     for _ in {1..50}; do
@@ -265,7 +275,7 @@ case_majors_start_and_serve() {
             fail=1
             continue
         fi
-        local cid; cid=$(jq -r .container_id ".dctl/servers/$n-pg$tag.json")
+        local cid; cid=$(jq -r .container_id "$(servers "$real_dir")/$n-pg$tag.json")
         local ready=0
         for _ in {1..50}; do
             if docker exec "$cid" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1; then

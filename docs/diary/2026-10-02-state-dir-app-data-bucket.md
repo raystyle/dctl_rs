@@ -25,3 +25,12 @@
 - 双 clippy 零警告、fmt 过、全量 333 测试绿;check-md 42 文件干净;classify 门禁 OK。
 - WSL 实机冒烟:净 cwd 跑 `server list` 后 cwd 零 `.dctl/`、桶落 home;预置 legacy(json+data+锁+.gitignore)再跑,迁入桶、旧壳全清、`project-path` 落盘。
 - 待办:lan-linux 上真 Docker socket 套件复验(scripts/test-postgres-integration.sh);EXDEV 拒绝分支的真机验证(本机 /tmp 与 home 同 fs,单测已盖)。
+
+## 评审轮(dctl-codex-review,首轮回执 2F+3G)
+
+- F1 同名键覆盖:桶已有同名条目而 legacy 重现(旧版二进制又跑过/手工拷回)时,原实现 rename 静默覆盖桶 json、目录同名则 ENOTEMPTY 半合并中止。修:桶权威,同名跳过 + stderr 留痕 + 旧壳自然保留,单测与实机钉住(exit 0、桶不覆盖、异名照迁)。
+- F2 集成脚本漏桶化:scripts/test-postgres-integration.sh 16 处 .dctl/servers 未跟批,脚本加 servers() helper(sha256sum 前 16 hex,与二进制实跑桶 id 对拍 MATCH)。
+- G1 Copy 判活旁路:数据目录无兄弟 json 时不被扫描,fork 风险;修:Copy 前该形态直接 StateMigration 拒绝。
+- G2 cleanup 保守性:.gitignore 仅内容等于自身写入形态 `*\n` 才删;读目录错误留痕且视为不可清。
+- G3 refusal 文案:锁死态下 dctl stop 不可用,文案改指 docker ps --filter label=created_by=dctl + docker stop。
+- 另:clickhouse 测试过时注释(git clean -xdf clears .dctl/)改词。

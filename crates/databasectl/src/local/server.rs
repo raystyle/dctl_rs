@@ -232,13 +232,20 @@ enum MoveMode {
 fn migration_refusal(detail: String) -> Error {
     Error::StateMigration(format!(
         "refusing to migrate project state across filesystems: {detail} \
-         Stop the running servers, then retry the command."
+         Resolve it outside dctl (locate the containers with \
+         `docker ps --filter label=created_by=dctl` and `docker stop` them, or \
+         make Docker reachable), then retry the command."
     ))
 }
 
 /// Move every stateful entry of `legacy` (all but the lock file) into
 /// `target`, then leave shell cleanup to the caller. `Rename` mode switches
 /// to `Copy` semantics only through the caller's CrossesDevices handling.
+///
+/// The bucket is authoritative: a legacy entry whose name already exists in
+/// the bucket is skipped (never overwritten), left in place for the user to
+/// reconcile, and reported on stderr. Skipping also keeps one conflicting
+/// entry from aborting the move midway into a half-merged state.
 fn migrate_state_at(legacy: &Path, target: &Path, mode: MoveMode) -> Result<()> {
     if mode == MoveMode::Copy {
         ensure_no_live_containers(legacy)?;
@@ -252,6 +259,15 @@ fn migrate_state_at(legacy: &Path, target: &Path, mode: MoveMode) -> Result<()> 
         }
         let source = entry.path();
         let destination = target.join(&name);
+        if destination.exists() {
+            eprintln!(
+                "Warning: legacy state '{}': the bucket already has an entry \
+                 with this name, so the bucket wins and the legacy copy stays \
+                 in place; remove it manually once reconciled.",
+                source.display()
+            );
+            continue;
+        }
         match mode {
             MoveMode::Rename => std::fs::rename(&source, &destination)?,
             MoveMode::Copy => {
@@ -274,10 +290,23 @@ fn migrate_state_at(legacy: &Path, target: &Path, mode: MoveMode) -> Result<()> 
 /// Unreachable Docker and unreadable metadata are unverifiable, so they
 /// refuse too (fail-closed, ADR-0012). Runs before any entry moves, so
 /// directory iteration order cannot leave an unchecked instance behind.
+/// A data directory without sibling metadata is equally unverifiable and
+/// refuses: the liveness check below only knows containers through their
+/// metadata.
 fn ensure_no_live_containers(dir: &Path) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
+        if entry.path().is_dir() {
+            let metadata = dir.join(format!("{}.json", name.to_string_lossy()));
+            if !metadata.is_file() {
+                return Err(migration_refusal(format!(
+                    "data directory '{}' has no metadata file to prove its containers stopped.",
+                    entry.path().display()
+                )));
+            }
+            continue;
+        }
         let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
             continue;
         };
@@ -326,15 +355,12 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> 
 
 /// Remove the emptied legacy shells: the lock file and `servers/` directory
 /// once nothing but the lock remains, then `.dctl/` once it holds nothing
-/// but our own `.gitignore`. Anything else in there belongs to the user and
-/// is left in place.
+/// but our own `.gitignore` (recognized by its exact `*` payload, so a
+/// user-authored ignore file is never removed). Anything else in there
+/// belongs to the user and is left in place.
 fn cleanup_legacy_shell(legacy_servers: &Path) -> Result<()> {
-    let only_lock_left = std::fs::read_dir(legacy_servers)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| entry.ok())
-                .all(|entry| entry.file_name() == METADATA_LOCK_FILE)
-        })
+    let only_lock_left = list_entry_names(legacy_servers)
+        .map(|names| names.iter().all(|name| name == METADATA_LOCK_FILE))
         .unwrap_or(false);
     if !only_lock_left {
         return Ok(());
@@ -346,19 +372,49 @@ fn cleanup_legacy_shell(legacy_servers: &Path) -> Result<()> {
     std::fs::remove_dir(legacy_servers)?;
 
     if let Some(legacy_root) = legacy_servers.parent() {
-        let only_ignore_left = std::fs::read_dir(legacy_root)
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok())
-                    .all(|entry| entry.file_name() == ".gitignore")
-            })
+        let only_ignore_left = list_entry_names(legacy_root)
+            .map(|names| names.iter().all(|name| name == ".gitignore"))
             .unwrap_or(false);
-        if only_ignore_left {
+        let ignore_is_ours = std::fs::read_to_string(legacy_root.join(".gitignore"))
+            .is_ok_and(|content| content == "*\n");
+        if only_ignore_left && ignore_is_ours {
             std::fs::remove_file(legacy_root.join(".gitignore"))?;
             std::fs::remove_dir(legacy_root)?;
         }
     }
     Ok(())
+}
+
+/// Entry names of `dir`, or `None` (logged) when the directory cannot be
+/// read. Cleanup must treat that as "not empty" rather than silently
+/// deciding an unreadable directory is disposable.
+fn list_entry_names(dir: &Path) -> Option<Vec<std::ffi::OsString>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => {
+            let mut names = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => names.push(entry.file_name()),
+                    Err(error) => {
+                        eprintln!(
+                            "Warning: cannot list '{}' during legacy cleanup: {error}",
+                            dir.display()
+                        );
+                        return None;
+                    }
+                }
+            }
+            Some(names)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(Vec::new()),
+        Err(error) => {
+            eprintln!(
+                "Warning: cannot list '{}' during legacy cleanup: {error}",
+                dir.display()
+            );
+            None
+        }
+    }
 }
 
 /// Disk identifier for a Postgres instance: `<name>-pg<major>`. Used in the
@@ -1476,6 +1532,73 @@ mod state_bucket_tests {
         cleanup_legacy_shell(&legacy_servers).unwrap();
 
         assert!(!project.path().join(".dctl").exists());
+    }
+
+    #[test]
+    fn rename_migration_skips_keys_the_bucket_already_has() {
+        // F1: a legacy directory reappearing next to an already-migrated
+        // bucket must not overwrite bucket state or abort half-merged.
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(target.join("default-pg18.json"), b"bucket-authoritative").unwrap();
+        std::fs::write(legacy.join("default-pg18.json"), b"legacy-stale").unwrap();
+        std::fs::create_dir_all(legacy.join("fresh-pg18/data")).unwrap();
+
+        migrate_state_at(&legacy, &target, MoveMode::Rename).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("default-pg18.json")).unwrap(),
+            b"bucket-authoritative",
+            "the bucket wins; the legacy copy never overwrites it"
+        );
+        assert!(
+            legacy.join("default-pg18.json").is_file(),
+            "the skipped legacy copy stays for the user to reconcile"
+        );
+        assert!(
+            target.join("fresh-pg18/data").is_dir(),
+            "non-conflicting entries still migrate"
+        );
+    }
+
+    #[test]
+    fn copy_migration_refuses_data_dirs_without_metadata() {
+        // G1: a data directory with no sibling json cannot prove its
+        // containers stopped, so the cross-device copy must refuse.
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        std::fs::create_dir_all(legacy.join("orphan-pg18/data")).unwrap();
+
+        let error = migrate_state_at(&legacy, &target, MoveMode::Copy).unwrap_err();
+        assert!(
+            matches!(error, Error::StateMigration(_)),
+            "metadata-less data directory must refuse: {error}"
+        );
+    }
+
+    #[test]
+    fn shell_cleanup_keeps_a_user_authored_gitignore() {
+        // G2: only our own exact `*` payload is removed; a user-authored
+        // ignore file blocks the shell removal.
+        let project = tempfile::tempdir().unwrap();
+        let legacy_servers = project.path().join(".dctl/servers");
+        std::fs::create_dir_all(&legacy_servers).unwrap();
+        std::fs::write(legacy_servers.join(METADATA_LOCK_FILE), b"").unwrap();
+        std::fs::write(project.path().join(".dctl/.gitignore"), "custom-entry\n").unwrap();
+
+        cleanup_legacy_shell(&legacy_servers).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(project.path().join(".dctl/.gitignore")).unwrap(),
+            "custom-entry\n"
+        );
+        assert!(project.path().join(".dctl").exists());
     }
 
     #[test]
