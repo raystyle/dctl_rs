@@ -34,3 +34,11 @@
 - G2 cleanup 保守性:.gitignore 仅内容等于自身写入形态 `*\n` 才删;读目录错误留痕且视为不可清。
 - G3 refusal 文案:锁死态下 dctl stop 不可用,文案改指 docker ps --filter label=created_by=dctl + docker stop。
 - 另:clickhouse 测试过时注释(git clean -xdf clears .dctl/)改词。
+
+## lan-linux2 复验轮(lan-linux 关机,同版 Docker 29.8.1)
+
+- 全量测试(真 Docker socket,uid 1000 + groups 999):**338 passed / 0 failed**,与本机一致。环境坑:lan-linux2 的 ssh 配置用户是 ubuntu(非 ray)、socket gid 999(非 983);持久 target/cargo 卷若 root 先写需 chmod -R a+rwX 再让 uid 1000 增量;容器必装 procps/git(util-linux 按需)。
+- 首跑抓到一枚测试环境假设:copy_migration_refuses_..._without_docker 在真 Docker 下反转(不存在的容器 404=可证明停止即放行,行为正确)。重构为注入式探针(ensure_no_live_containers_with),三分支(探针不可达、在跑、证明停止)环境无关钉死。
+- EXDEV 跨设备真机验证(/repo=ext4、/tmp=overlay):stopped 状态 copy 迁移成功(json+数据入桶);running 容器精确拒绝(「instance 'r-pg18' is still running」+ docker stop 指引),legacy 原样保留。顺手修 cleanup 缺口:跨设备迁移后 .dctl/ 变空目录原逻辑不清,现空目录与只剩自有 .gitignore 的情形统一清;remove 容忍 NotFound(并发窗口)。
+- 集成套件 12/15:two_concurrent_servers、stop_all_engine_scopes、non_tty_query 三败,**基线 6465a52 同环境同复现**(c2 撞 5432),定性为既有缺陷:resolve_port 用 socket 探测占口,而 Docker 纯 iptables NAT 发布口在宿主无 listener,探测失明;旧机 lan-linux 应为 userland-proxy 模式故历史全绿。另因:Docker 端口探测应读 docker ps/inspect 的 published ports。与本批无关,记 REQ 候选。
+- shell 验证脚本坑:printf 单引号模板里的 \" 原样输出坏 JSON(用 jq -n 生成);mktemp -d 目录 700 属 root,uid 1000 场景必须 chmod。

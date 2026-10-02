@@ -294,6 +294,17 @@ fn migrate_state_at(legacy: &Path, target: &Path, mode: MoveMode) -> Result<()> 
 /// refuses: the liveness check below only knows containers through their
 /// metadata.
 fn ensure_no_live_containers(dir: &Path) -> Result<()> {
+    ensure_no_live_containers_with(dir, docker::is_container_running_blocking)
+}
+
+/// The decision core of [`ensure_no_live_containers`] with the liveness
+/// probe injected, so tests pin the refusal semantics (unreachable probe,
+/// running container, missing metadata) without depending on whether a
+/// Docker daemon happens to be reachable on the test host.
+fn ensure_no_live_containers_with(
+    dir: &Path,
+    verify_running: impl Fn(&str) -> Result<bool>,
+) -> Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -326,7 +337,7 @@ fn ensure_no_live_containers(dir: &Path) -> Result<()> {
         let Some(container_id) = info.container_id.as_deref() else {
             continue;
         };
-        let running = docker::is_container_running_blocking(container_id).map_err(|error| {
+        let running = verify_running(container_id).map_err(|error| {
             refusal(format!("cannot be verified (Docker unreachable: {error})"))
         })?;
         if running {
@@ -369,17 +380,28 @@ fn cleanup_legacy_shell(legacy_servers: &Path) -> Result<()> {
     if lock_file.is_file() {
         std::fs::remove_file(&lock_file)?;
     }
-    std::fs::remove_dir(legacy_servers)?;
+    match std::fs::remove_dir(legacy_servers) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        other => other?,
+    }
 
     if let Some(legacy_root) = legacy_servers.parent() {
-        let only_ignore_left = list_entry_names(legacy_root)
+        // An emptied `.dctl/` (or one holding only our own `*` ignore file)
+        // goes away; anything else belongs to the user and stays.
+        let only_dctl_owned_left = list_entry_names(legacy_root)
             .map(|names| names.iter().all(|name| name == ".gitignore"))
             .unwrap_or(false);
-        let ignore_is_ours = std::fs::read_to_string(legacy_root.join(".gitignore"))
-            .is_ok_and(|content| content == "*\n");
-        if only_ignore_left && ignore_is_ours {
-            std::fs::remove_file(legacy_root.join(".gitignore"))?;
-            std::fs::remove_dir(legacy_root)?;
+        let ignore = legacy_root.join(".gitignore");
+        let ignore_is_ours = !ignore.exists()
+            || std::fs::read_to_string(&ignore).is_ok_and(|content| content == "*\n");
+        if only_dctl_owned_left && ignore_is_ours {
+            if ignore.exists() {
+                std::fs::remove_file(&ignore)?;
+            }
+            match std::fs::remove_dir(legacy_root) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                other => other?,
+            }
         }
     }
     Ok(())
@@ -1473,39 +1495,68 @@ mod state_bucket_tests {
         );
     }
 
+    /// Container-backed metadata under an unreachable liveness probe. The
+    /// probe is injected, so the refusal semantics hold regardless of
+    /// whether the test host itself has Docker.
     #[test]
-    fn copy_migration_refuses_container_backed_state_without_docker() {
+    fn copy_migration_refuses_unverifiable_containers() {
         let legacy_root = tempfile::tempdir().unwrap();
-        let target_root = tempfile::tempdir().unwrap();
         let legacy = legacy_root.path().join("servers");
-        let target = target_root.path().join("servers");
         std::fs::create_dir_all(&legacy).unwrap();
         std::fs::write(
             legacy.join("default-pg18.json"),
-            serde_json::to_vec(&ServerInfo {
-                name: "default-pg18".into(),
-                pid: 0,
-                version: "postgres:18".into(),
-                http_port: 0,
-                tcp_port: 5432,
-                started_at: "test".into(),
-                cwd: "/work".into(),
-                engine: Engine::Postgres,
-                container_id: Some("live-container".into()),
-            })
-            .unwrap(),
+            container_backed_metadata(),
         )
         .unwrap();
 
-        let error = migrate_state_at(&legacy, &target, MoveMode::Copy).unwrap_err();
+        let error = ensure_no_live_containers_with(&legacy, |_| {
+            Err(Error::DockerNotAvailable("test probe".into()))
+        })
+        .unwrap_err();
         assert!(
             matches!(error, Error::StateMigration(_)),
-            "container-backed state without a reachable daemon must refuse: {error}"
+            "an unreachable probe must refuse: {error}"
         );
         assert!(
             legacy.join("default-pg18.json").is_file(),
             "a refused migration leaves the legacy state untouched"
         );
+    }
+
+    #[test]
+    fn copy_migration_refuses_running_containers() {
+        let legacy_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("default-pg18.json"),
+            container_backed_metadata(),
+        )
+        .unwrap();
+
+        let error = ensure_no_live_containers_with(&legacy, |_| Ok(true)).unwrap_err();
+        assert!(
+            matches!(error, Error::StateMigration(_)),
+            "a running container must refuse: {error}"
+        );
+
+        // A probe that proves the container stopped lets the copy proceed.
+        ensure_no_live_containers_with(&legacy, |_| Ok(false)).unwrap();
+    }
+
+    fn container_backed_metadata() -> Vec<u8> {
+        serde_json::to_vec(&ServerInfo {
+            name: "default-pg18".into(),
+            pid: 0,
+            version: "postgres:18".into(),
+            http_port: 0,
+            tcp_port: 5432,
+            started_at: "test".into(),
+            cwd: "/work".into(),
+            engine: Engine::Postgres,
+            container_id: Some("live-container".into()),
+        })
+        .unwrap()
     }
 
     #[test]
@@ -1580,6 +1631,20 @@ mod state_bucket_tests {
             matches!(error, Error::StateMigration(_)),
             "metadata-less data directory must refuse: {error}"
         );
+    }
+
+    #[test]
+    fn shell_cleanup_removes_an_emptied_legacy_root() {
+        // Cross-device migrations never wrote a legacy .gitignore; an
+        // emptied `.dctl/` root must still go away (EXDEV live check).
+        let project = tempfile::tempdir().unwrap();
+        let legacy_servers = project.path().join(".dctl/servers");
+        std::fs::create_dir_all(&legacy_servers).unwrap();
+        std::fs::write(legacy_servers.join(METADATA_LOCK_FILE), b"").unwrap();
+
+        cleanup_legacy_shell(&legacy_servers).unwrap();
+
+        assert!(!project.path().join(".dctl").exists());
     }
 
     #[test]
