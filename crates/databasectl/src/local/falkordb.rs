@@ -1021,9 +1021,30 @@ fn format_falkor_readiness_error(
 /// Resolve one host port: an explicit port must be free (else PortInUse),
 /// otherwise start from `default_port` and auto-pick within +100.
 fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
+    // A port already bound locally fails without a daemon round-trip; only
+    // a socket-free candidate needs the Docker-published set (REQ-0015).
+    if let Some(port) = explicit
+        && std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+    {
+        return Err(Error::PortInUse { kind, port });
+    }
+    resolve_port_with(
+        explicit,
+        kind,
+        &crate::local::docker::published_host_ports_blocking(),
+    )
+}
+
+/// The decision core of [`resolve_port`] with the Docker-published port set
+/// injected, so tests pin the NAT-blindness fix without a daemon (REQ-0015):
+/// a candidate needs a free socket AND no container publishing it.
+fn resolve_port_with(explicit: Option<u16>, kind: PortKind, published: &[u16]) -> Result<u16> {
     let default_port = match kind {
         PortKind::Http => DEFAULT_FK_BROWSER_PORT,
         _ => DEFAULT_FK_PORT,
+    };
+    let free = |port: u16| {
+        !published.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
     };
     match explicit {
         Some(0) => {
@@ -1031,7 +1052,7 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
                 "--port 0 is not allowed; pick a specific port or omit the flag".into(),
             ));
         }
-        Some(port) if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() => {
+        Some(port) if free(port) => {
             return Ok(port);
         }
         Some(port) => {
@@ -1039,11 +1060,11 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
         }
         None => {}
     }
-    if std::net::TcpListener::bind(("127.0.0.1", default_port)).is_ok() {
+    if free(default_port) {
         return Ok(default_port);
     }
     for p in (default_port + 1)..=(default_port + 100) {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        if free(p) {
             return Ok(p);
         }
     }
@@ -1054,12 +1075,16 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
 /// protocol port (each free-port probe releases its socket before Docker
 /// binds both, so an unguarded pick can take the same port twice).
 fn resolve_browser_port_excluding(host_port: u16) -> Result<u16> {
-    let picked = resolve_port(None, PortKind::FalkordbBrowser)?;
+    let published = crate::local::docker::published_host_ports_blocking();
+    let picked = resolve_port_with(None, PortKind::FalkordbBrowser, &published)?;
     if picked != host_port {
         return Ok(picked);
     }
     for p in (DEFAULT_FK_BROWSER_PORT + 1)..=(DEFAULT_FK_BROWSER_PORT + 101) {
-        if p != host_port && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        if p != host_port
+            && !published.contains(&p)
+            && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        {
             return Ok(p);
         }
     }
@@ -1444,6 +1469,39 @@ async fn read_fk_password_for_dotenv(container_id: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+
+    #[test]
+    fn resolve_port_skips_docker_published_ports() {
+        // REQ-0015: an iptables-NAT published port has no host listener, so
+        // only the injected set can see it; the pick must steer around it.
+        let error = resolve_port_with(
+            Some(DEFAULT_FK_PORT),
+            PortKind::Falkordb,
+            &[DEFAULT_FK_PORT],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::PortInUse { port, .. } if port == DEFAULT_FK_PORT),
+            "explicit collision with a published port: {error:?}"
+        );
+        let picked = resolve_port_with(None, PortKind::Falkordb, &[DEFAULT_FK_PORT]).unwrap();
+        assert_ne!(picked, DEFAULT_FK_PORT);
+        assert!(((DEFAULT_FK_PORT + 1)..=(DEFAULT_FK_PORT + 100)).contains(&picked));
+    }
+
+    #[test]
+    fn browser_port_exclusion_skips_docker_published_ports() {
+        // The exclusion loop must honor the published set too.
+        let published = [DEFAULT_FK_BROWSER_PORT];
+        assert!(
+            !resolve_port_with(
+                Some(DEFAULT_FK_BROWSER_PORT),
+                PortKind::FalkordbBrowser,
+                &published
+            )
+            .is_ok()
+        );
+    }
 
     struct FakeReadinessProbe {
         states: VecDeque<ContainerReadinessState>,

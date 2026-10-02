@@ -12,8 +12,10 @@
 | REQ-006 | implemented | must | 迁移到共享 ledger-rs crate 并统一权限收口 | PR #7;ledger-client v0.1.1 |
 | REQ-007 | implemented | must | ClickHouse 引擎 Docker 化,三引擎统一容器管理 | PR #6;ADR-0007 |
 | REQ-008 | implemented | should | Postgres 与 FalkorDB 原生客户端集成(全引擎宿主免装客户端) | native-clients 批;ADR-0009 |
-| REQ-010 | draft | should | 镜像拉取默认走私仓并可指定自定义仓库 | null |
-| REQ-011 | draft | must | 去掉 local 命令前缀层,默认即本地操作 | null |
-| REQ-009 | draft | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | ADR-0011 |
+| REQ-010 | implemented | should | 镜像拉取默认走私仓并可指定自定义仓库 | 私仓优先拉取链 e17a645;ADR-0010 |
+| REQ-011 | implemented | must | 去掉 local 命令前缀层,默认即本地操作 | 39f6573 引擎命令免前缀 |
+| REQ-009 | implemented | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | PG 先行批 f7ffced;FK/CH 腿后续批未立 |
 | REQ-012 | implemented | must | clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面 | --bind 批 f7a39d2;NSM 部署真机验收 |
 | REQ-013 | implemented | should | skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项 | 剪枝批 4e6834f;实机冒烟收敛两项 |
+| REQ-0014 | implemented | must | 项目作用域状态目录迁入 ~/.dctl 应用数据目录(不随 cwd 漂移) | 三笔 5519267/dceddd0/640c1ac;ADR-0012;评审两轮 CONFIRM |
+| REQ-0015 | draft | must | 端口选择感知 Docker 已发布口(NAT 模式探测失明修复) | 本批实现中;lan-linux2 集成三败归因此缺陷 |

@@ -1,9 +1,9 @@
 ---
 id: REQ-009
 title: 三引擎免密密钥身份认证(客户端证书 mTLS)
-status: draft
+status: implemented
 priority: should
-trace: null
+trace: PG mTLS 先行批落地(f7ffced + 本地 CA);FK/CH 腿按本 REQ「后续批(另立)」未实施,两引擎认证走口令道
 ---
 
 # 三引擎免密密钥身份认证

@@ -1,9 +1,9 @@
 ---
 id: REQ-011
 title: 去掉 local 命令前缀层,默认即本地操作
-status: draft
+status: implemented
 priority: must
-trace: null
+trace: 39f6573(引擎命令免 local 前缀);现命令面真相 dctl --help
 ---
 
 # 去掉 local 命令前缀层

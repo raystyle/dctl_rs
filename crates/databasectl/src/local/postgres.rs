@@ -993,13 +993,35 @@ fn format_postgres_readiness_error(
 }
 
 fn resolve_port(explicit: Option<u16>) -> Result<u16> {
+    // A port already bound locally fails without a daemon round-trip; only
+    // a socket-free candidate needs the Docker-published set (REQ-0015).
+    if let Some(port) = explicit
+        && std::net::TcpListener::bind(("127.0.0.1", port)).is_err()
+    {
+        return Err(Error::PortInUse {
+            kind: PortKind::Postgres,
+            port,
+        });
+    }
+    resolve_port_with(explicit, &docker::published_host_ports_blocking())
+}
+
+/// The decision core of [`resolve_port`] with the Docker-published port set
+/// injected, so tests pin the NAT-blindness fix without a daemon. A port is
+/// a candidate only when the socket is free AND no container publishes it:
+/// iptables-NAT publishing leaves no host listener for the socket probe to
+/// see (REQ-0015).
+fn resolve_port_with(explicit: Option<u16>, published: &[u16]) -> Result<u16> {
+    let free = |port: u16| {
+        !published.contains(&port) && std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    };
     match explicit {
         Some(0) => {
             return Err(Error::PostgresUsage(
                 "--port 0 is not allowed; pick a specific port or omit the flag".into(),
             ));
         }
-        Some(port) if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() => {
+        Some(port) if free(port) => {
             return Ok(port);
         }
         Some(port) => {
@@ -1010,11 +1032,11 @@ fn resolve_port(explicit: Option<u16>) -> Result<u16> {
         }
         None => {}
     }
-    if std::net::TcpListener::bind(("127.0.0.1", DEFAULT_PG_PORT)).is_ok() {
+    if free(DEFAULT_PG_PORT) {
         return Ok(DEFAULT_PG_PORT);
     }
     for p in (DEFAULT_PG_PORT + 1)..=(DEFAULT_PG_PORT + 100) {
-        if std::net::TcpListener::bind(("127.0.0.1", p)).is_ok() {
+        if free(p) {
             return Ok(p);
         }
     }
@@ -1795,6 +1817,20 @@ mod tests {
 
         assert_ne!(port, DEFAULT_PG_PORT);
         drop(default_listener);
+    }
+
+    #[test]
+    fn resolve_port_skips_docker_published_ports() {
+        // REQ-0015: an iptables-NAT published port has no host listener, so
+        // only the injected set can see it; the pick must steer around it.
+        let error = resolve_port_with(Some(DEFAULT_PG_PORT), &[DEFAULT_PG_PORT]).unwrap_err();
+        assert!(
+            matches!(error, Error::PortInUse { port, .. } if port == DEFAULT_PG_PORT),
+            "explicit collision with a published port: {error:?}"
+        );
+        let picked = resolve_port_with(None, &[DEFAULT_PG_PORT]).unwrap();
+        assert_ne!(picked, DEFAULT_PG_PORT);
+        assert!(((DEFAULT_PG_PORT + 1)..=(DEFAULT_PG_PORT + 100)).contains(&picked));
     }
 
     #[test]

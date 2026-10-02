@@ -929,6 +929,30 @@ fn resolve_port(
     kind: PortKind,
     bind_face: Option<std::net::IpAddr>,
 ) -> Result<u16> {
+    // A port already failing the face probes fails without a daemon
+    // round-trip; only a socket-free candidate needs the Docker-published
+    // set (REQ-0015).
+    if let Some(port) = explicit
+        && !port_free_with(port, bind_face, &[])
+    {
+        return Err(Error::PortInUse { kind, port });
+    }
+    resolve_port_with(
+        explicit,
+        kind,
+        bind_face,
+        &crate::local::docker::published_host_ports_blocking(),
+    )
+}
+
+/// The decision core of [`resolve_port`] with the Docker-published port set
+/// injected, so tests pin the NAT-blindness fix without a daemon (REQ-0015).
+fn resolve_port_with(
+    explicit: Option<u16>,
+    kind: PortKind,
+    bind_face: Option<std::net::IpAddr>,
+    published: &[u16],
+) -> Result<u16> {
     let default_port = match kind {
         PortKind::Clickhouse => DEFAULT_CH_NATIVE_PORT,
         _ => DEFAULT_CH_HTTP_PORT,
@@ -939,15 +963,15 @@ fn resolve_port(
                 "--port 0 is not allowed; pick a specific port or omit the flag".into(),
             ));
         }
-        Some(port) if port_free(port, bind_face) => return Ok(port),
+        Some(port) if port_free_with(port, bind_face, published) => return Ok(port),
         Some(port) => return Err(Error::PortInUse { kind, port }),
         None => {}
     }
-    if port_free(default_port, bind_face) {
+    if port_free_with(default_port, bind_face, published) {
         return Ok(default_port);
     }
     for p in (default_port + 1)..=(default_port + 100) {
-        if port_free(p, bind_face) {
+        if port_free_with(p, bind_face, published) {
             return Ok(p);
         }
     }
@@ -958,8 +982,13 @@ fn resolve_port(
 /// face. A v4 wildcard (`0.0.0.0`) replaces the loopback probe with a
 /// wildcard probe (it covers loopback and conflicts with any existing
 /// binding on the port); a v6 wildcard (`::`) probes like a specific face
-/// because Docker publishes it v6-only.
-fn port_free(port: u16, bind_face: Option<std::net::IpAddr>) -> bool {
+/// because Docker publishes it v6-only. Docker-published ports are rejected
+/// outright: iptables-NAT publishing leaves no host listener, so the socket
+/// probes cannot see them (REQ-0015).
+fn port_free_with(port: u16, bind_face: Option<std::net::IpAddr>, published: &[u16]) -> bool {
+    if published.contains(&port) {
+        return false;
+    }
     match bind_face {
         // A v4 wildcard covers loopback, so it replaces it. A v6 wildcard
         // does not (Docker publishes [::] v6-only), so it probes like a
@@ -979,12 +1008,13 @@ fn resolve_native_port_excluding(
     http_port: u16,
     bind_face: Option<std::net::IpAddr>,
 ) -> Result<u16> {
-    let picked = resolve_port(None, PortKind::Clickhouse, bind_face)?;
+    let published = crate::local::docker::published_host_ports_blocking();
+    let picked = resolve_port_with(None, PortKind::Clickhouse, bind_face, &published)?;
     if picked != http_port {
         return Ok(picked);
     }
     for p in (DEFAULT_CH_NATIVE_PORT + 1)..=(DEFAULT_CH_NATIVE_PORT + 101) {
-        if p != http_port && port_free(p, bind_face) {
+        if p != http_port && port_free_with(p, bind_face, &published) {
             return Ok(p);
         }
     }
@@ -1372,6 +1402,20 @@ mod tests {
                 "expected `{value}` to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn resolve_port_skips_docker_published_ports() {
+        // REQ-0015: published ports have no host listener under iptables
+        // NAT, so the injected set alone must reject them.
+        assert!(!port_free_with(
+            DEFAULT_CH_HTTP_PORT,
+            None,
+            &[DEFAULT_CH_HTTP_PORT]
+        ));
+        let picked = resolve_port_with(None, PortKind::Http, None, &[DEFAULT_CH_HTTP_PORT])
+            .expect("picker steers around the published port");
+        assert_ne!(picked, DEFAULT_CH_HTTP_PORT);
     }
 
     #[test]

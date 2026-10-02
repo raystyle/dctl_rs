@@ -22,7 +22,7 @@ tags: [state-layout, storage, project-scope]
 1. **桶布局**:项目作用域服务器状态全量迁至 `~/.dctl/projects/<id>/servers/`(`id` = canonical cwd 字符串的 sha256 前 16 hex;桶内 `project-path` 文件旁存 canonical 明文,排障可读)。元数据 json、`.metadata.lock`、实例数据目录全进桶。`~/.dctl/` 沿用 ADR-0002 以来的既定全局根,不开 XDG 新根(避免双全局根分裂)。
 2. **换址单点**:`servers_dir()`/`servers_dir_join()`/`ensure_*_data_dir()` 系列整体改指桶内,项目隔离由桶键承担;`ServerInfo.cwd` 与 Docker label 的 canonical cwd 口径不变,recover/过滤行为不变。
 3. **cwd 零落点**:cwd 不再产生任何运行态目录;`init` 只建 `clickhouse/`、`postgres/`、`falkordb/` 用户脚手架,`ensure_runtime_gitignore` 与 `.dctl/.gitignore` 机制整体退役(无落点则无兜底需求)。
-4. **迁移(fail-closed)**:任意项目作用域命令首次在新版运行时,持桶锁把旧 `cwd/.dctl/servers/` 内容迁入桶,`.metadata.lock` 不搬(无状态);同文件系统逐条目 rename(bind mount 沿 inode,运行中容器无感);跨文件系统(EXDEV)copy+rm 仅在无运行中实例时执行,判据为元数据 container_id 经 Docker inspect 存活;有运行中实例或 Docker 不可达即中止迁移并给出「stop 后重试」的可操作错误。旧壳尽力清:`servers/` 迁空则删,`.dctl/` 只剩 `.gitignore` 则一并删,非空则保留由用户处置。
+4. **迁移(fail-closed)**:任意项目作用域命令首次在新版运行时,持桶锁把旧 `cwd/.dctl/servers/` 内容迁入桶,`.metadata.lock` 不搬(无状态);同文件系统逐条目 rename(bind mount 沿 inode,运行中容器无感);跨文件系统(EXDEV)copy+rm 仅在无运行中实例时执行,判据为元数据 container_id 经 Docker inspect 存活;有运行中实例或 Docker 不可达即中止迁移,错误文案给 dctl 之外的可执行指引(`docker ps --filter label=created_by=dctl` 定位并 `docker stop`,或恢复 Docker 可达;refusal 态下 dctl 自身的 stop 同样被迁移闸挡住,故指引不指向它)。桶为权威:legacy 与桶同名条目跳过不覆盖,留置给用户 reconcile。旧壳尽力清:`servers/` 迁空则删,`.dctl/` 只剩自身 `*` 形态 `.gitignore` 或已空则删,非空则保留由用户处置。
 
 ## Consequences
 

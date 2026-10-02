@@ -1,9 +1,9 @@
 ---
 id: REQ-007
 title: ClickHouse 引擎 Docker 化,三引擎统一容器管理
-status: draft
+status: implemented
 priority: must
-trace: null
+trace: 915bded(ClickHouse Docker 引擎核心,三引擎统一 part 1)加 bab465f(ch 别名);实机 lan-linux 全生命周期 SMOKE(见 2026-09-20 bootstrap diary)
 ---
 
 > 用户裁定 2026-09-21:ClickHouse 也统一使用 Docker 维护,三库 client 在 dctl 内集成。ADR-0007 立案。

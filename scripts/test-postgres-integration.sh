@@ -42,11 +42,14 @@ FAILED_TESTS=()
 run_case() {
     local name=$1; shift
     local dir; dir=$(mktemp -d -t "pg-edge-$name.XXXX")
+    # Isolated HOME so the per-project state bucket (ADR-0012) lands in a
+    # scratch dir instead of the real user's ~/.dctl/projects/.
+    local home; home=$(mktemp -d -t "pg-edge-home-$name.XXXX")
     # The CLI canonicalizes the project path before stamping it into
     # container labels, so we match against the realpath here.
     local real_dir; real_dir=$(cd "$dir" && pwd -P)
     cd "$dir" || { echo "[FAIL] $name: tempdir"; FAIL=$((FAIL+1)); return; }
-    if "$@"; then
+    if HOME="$home" "$@"; then
         echo "[PASS] $name"
         PASS=$((PASS+1))
     else
@@ -60,11 +63,15 @@ run_case() {
     cd /
     # On Linux, residual postgres data dirs are owned by uid 999 (the
     # postgres user inside the container), so a plain `rm` fails. Try
-    # host-side first; fall back to a privileged Alpine container.
-    if [[ -d "$dir" ]] && ! rm -rf "$dir" 2>/dev/null; then
-        docker run --rm -v "$(dirname "$dir"):/work" alpine:latest \
-            rm -rf "/work/$(basename "$dir")" >/dev/null 2>&1 || true
-    fi
+    # host-side first; fall back to a privileged Alpine container. The
+    # scratch HOME gets the same treatment: its bucket may hold data dirs
+    # owned by the container user too.
+    for target in "$dir" "$home"; do
+        if [[ -d "$target" ]] && ! rm -rf "$target" 2>/dev/null; then
+            docker run --rm -v "$(dirname "$target"):/work" alpine:latest \
+                rm -rf "/work/$(basename "$target")" >/dev/null 2>&1 || true
+        fi
+    done
 }
 
 

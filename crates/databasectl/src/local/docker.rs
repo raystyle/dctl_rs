@@ -1492,6 +1492,48 @@ pub async fn start_existing(docker: &Docker, id: &str) -> Result<()> {
         .map_err(|e| Error::DockerError(e.to_string()))
 }
 
+/// Host ports that any container (running or stopped) has published. A
+/// pure-iptables NAT daemon (userland-proxy off) publishes ports without a
+/// host listener, so socket probing alone cannot see them and an
+/// auto-selected port collides at container-create time. Port pickers feed
+/// this list into their "free" judgment. Unreachable Docker yields an empty
+/// set: the picker then degrades to socket probing alone, and the start's
+/// own Docker step surfaces the outage.
+pub async fn published_host_ports(docker: &Docker) -> Vec<u16> {
+    use bollard::query_parameters::ListContainersOptionsBuilder;
+
+    let opts = ListContainersOptionsBuilder::default().all(true).build();
+    let Ok(containers) = docker.list_containers(Some(opts)).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for container in containers {
+        let Some(ports) = container.ports else {
+            continue;
+        };
+        for port in ports {
+            if let Some(public) = port.public_port {
+                out.push(public);
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// [`published_host_ports`] for the synchronous port pickers: one daemon
+/// round-trip, empty when the daemon is unreachable.
+pub fn published_host_ports_blocking() -> Vec<u16> {
+    block_on(async move {
+        let docker = match connect().await {
+            Ok(docker) => docker,
+            Err(_) => return Vec::new(),
+        };
+        published_host_ports(&docker).await
+    })
+}
+
 /// Discover Postgres containers belonging to this project that don't yet have
 /// a metadata file in the project bucket, and write a `ServerInfo` for
 /// each so they show up in `local server list` and can be managed.

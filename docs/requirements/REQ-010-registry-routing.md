@@ -1,9 +1,9 @@
 ---
 id: REQ-010
 title: 镜像拉取默认走私仓并可指定自定义仓库
-status: draft
+status: implemented
 priority: should
-trace: null
+trace: e17a645(私仓优先拉取链 + --registry 覆盖,ADR-0010)
 ---
 
 # 镜像拉取默认走私仓并可指定自定义仓库

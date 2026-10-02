@@ -42,3 +42,9 @@
 - EXDEV 跨设备真机验证(/repo=ext4、/tmp=overlay):stopped 状态 copy 迁移成功(json+数据入桶);running 容器精确拒绝(「instance 'r-pg18' is still running」+ docker stop 指引),legacy 原样保留。顺手修 cleanup 缺口:跨设备迁移后 .dctl/ 变空目录原逻辑不清,现空目录与只剩自有 .gitignore 的情形统一清;remove 容忍 NotFound(并发窗口)。
 - 集成套件 12/15:two_concurrent_servers、stop_all_engine_scopes、non_tty_query 三败,**基线 6465a52 同环境同复现**(c2 撞 5432),定性为既有缺陷:resolve_port 用 socket 探测占口,而 Docker 纯 iptables NAT 发布口在宿主无 listener,探测失明;旧机 lan-linux 应为 userland-proxy 模式故历史全绿。另因:Docker 端口探测应读 docker ps/inspect 的 published ports。与本批无关,记 REQ 候选。
 - shell 验证脚本坑:printf 单引号模板里的 \" 原样输出坏 JSON(用 jq -n 生成);mktemp -d 目录 700 属 root,uid 1000 场景必须 chmod。
+
+## 端口选择感知发布口(REQ-0015,封版批)
+
+- 根因:resolve_port 的 TcpListener 探测对 iptables-NAT 发布口失明(宿主无 listener),NAT 模式机自动选口在 create 阶段才炸。修:docker::published_host_ports(list all 容器取 public_port),三引擎 resolve_port 注入化(_with 薄壳),explicit 口本地已占走零 daemon 快径。
+- 测试:三引擎注入式单测、fk browser 排除、fake docker published_ports 注入(start 断言 5432 被跳选 5433);「无效输入零 Docker 请求」语义由惰性快径保住(初版无条件拉 published 被该测试抓住)。
+- 顺批:集成脚本 run_case 每 case 隔离 HOME(孤儿桶不再落真实 HOME);ADR-0012 refusal 措辞对齐 G3;REQ-007/009/010/011 四枚状态滞后回填(009 注明 FK/CH 腿未立的边界)。
