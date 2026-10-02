@@ -19,6 +19,17 @@ const TAG: &str = "26.8";
 const CONTAINER: &str = "ch-id";
 const IMAGE: &str = "clickhouse/clickhouse-server:26.8";
 
+/// The per-project state bucket under HOME (ADR-0012): the same
+/// `~/.dctl/projects/<id>/servers` address the binary derives from the
+/// canonical working directory, mirrored here for staging and assertions.
+fn bucket_servers(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonical project path");
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(".dctl").join("projects").join(id).join("servers")
+}
+
 fn dctl_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_dctl"))
 }
@@ -561,8 +572,8 @@ fn run(project: &Path, home: &Path, args: &[&str]) -> Output {
         .expect("run dctl")
 }
 
-fn write_ch_metadata(project: &Path, http_port: u16, native_port: u16) {
-    let servers = project.join(".dctl/servers");
+fn write_ch_metadata(home: &Path, project: &Path, http_port: u16, native_port: u16) {
+    let servers = bucket_servers(home, project);
     std::fs::create_dir_all(servers.join("default-ch26.8/data")).expect("create server data dir");
     let cwd = project.canonicalize().expect("canonical project path");
     let metadata = serde_json::json!({
@@ -583,8 +594,8 @@ fn write_ch_metadata(project: &Path, http_port: u16, native_port: u16) {
     .expect("write server metadata");
 }
 
-fn read_metadata(project: &Path, key: &str) -> serde_json::Value {
-    let path = project.join(format!(".dctl/servers/{key}.json"));
+fn read_metadata(home: &Path, project: &Path, key: &str) -> serde_json::Value {
+    let path = bucket_servers(home, project).join(format!("{key}.json"));
     serde_json::from_slice(&std::fs::read(&path).expect("metadata file exists"))
         .expect("metadata JSON")
 }
@@ -750,9 +761,8 @@ fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
         .expect("data dir bind to /var/lib/clickhouse");
     assert!(
         data_bind.starts_with(
-            &project
-                .path()
-                .join(".dctl/servers/default-ch26.8/data")
+            &bucket_servers(home.path(), project.path())
+                .join("default-ch26.8/data")
                 .display()
                 .to_string()
         ),
@@ -771,13 +781,12 @@ fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
     assert_eq!(body["Labels"]["dctl.name"], "default");
     assert_eq!(body["Labels"]["dctl.major"], TAG);
 
-    let metadata = read_metadata(project.path(), "default-ch26.8");
+    let metadata = read_metadata(home.path(), project.path(), "default-ch26.8");
     assert_eq!(metadata["container_id"], CONTAINER);
     assert_eq!(metadata["engine"], "clickhouse");
     assert!(
-        project
-            .path()
-            .join(".dctl/servers/default-ch26.8/data")
+        bucket_servers(home.path(), project.path())
+            .join("default-ch26.8/data")
             .is_dir()
     );
     assert_eq!(http.requests()[0].0, "GET /ping");
@@ -847,7 +856,7 @@ fn resume_starts_existing_container_without_creating() {
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
     let native_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, native_port);
+    write_ch_metadata(home.path(), project.path(), http_port, native_port);
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -911,7 +920,7 @@ fn start_when_container_running_reports_already_running() {
     let _guard = START_COMMAND_LOCK.lock().unwrap();
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    write_ch_metadata(project.path(), reserve_port(), reserve_port());
+    write_ch_metadata(home.path(), project.path(), reserve_port(), reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -987,14 +996,15 @@ fn readiness_timeout_rolls_back_fresh_container_and_data() {
         "the failed fresh container is removed"
     );
     assert!(
-        !project
-            .path()
-            .join(".dctl/servers/default-ch26.8.json")
+        !bucket_servers(home.path(), project.path())
+            .join("default-ch26.8.json")
             .exists(),
         "fresh metadata is rolled back"
     );
     assert!(
-        !project.path().join(".dctl/servers/default-ch26.8").exists(),
+        !bucket_servers(home.path(), project.path())
+            .join("default-ch26.8")
+            .exists(),
         "fresh data directory is rolled back"
     );
     drop(docker);
@@ -1042,7 +1052,7 @@ fn recovery_from_deleted_metadata_resumes_with_correct_ports() {
         "stderr: {}",
         String::from_utf8_lossy(&listed.stderr)
     );
-    let recovered_path = project.path().join(".dctl/servers/default-ch26.8.json");
+    let recovered_path = bucket_servers(home.path(), project.path()).join("default-ch26.8.json");
     assert!(recovered_path.exists(), "recovery writes the metadata file");
     let recovered: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&recovered_path).unwrap()).unwrap();
@@ -1100,7 +1110,7 @@ fn stop_when_already_stopped_is_idempotent_success() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1129,7 +1139,7 @@ fn legacy_binary_era_metadata_can_be_stopped_and_removed() {
     // stop reports already-stopped, remove clears metadata and data dir.
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let servers = project.path().join(".dctl/servers");
+    let servers = bucket_servers(home.path(), project.path());
     std::fs::create_dir_all(servers.join("dev/data")).unwrap();
     let metadata = serde_json::json!({
         "name": "dev",
@@ -1200,7 +1210,7 @@ fn list_without_docker_degrades_to_stopped_with_a_warning() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
 
     // DOCKER_HOST points at a socket nobody serves: connect fails fast.
     let output = std::process::Command::new(dctl_binary())
@@ -1280,7 +1290,7 @@ fn stop_stops_the_running_container() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1324,7 +1334,7 @@ fn remove_deletes_container_data_and_metadata() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1342,14 +1352,15 @@ fn remove_deletes_container_data_and_metadata() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        !project
-            .path()
-            .join(".dctl/servers/default-ch26.8.json")
+        !bucket_servers(home.path(), project.path())
+            .join("default-ch26.8.json")
             .exists(),
         "metadata removed"
     );
     assert!(
-        !project.path().join(".dctl/servers/default-ch26.8").exists(),
+        !bucket_servers(home.path(), project.path())
+            .join("default-ch26.8")
+            .exists(),
         "data removed"
     );
     assert!(
@@ -1367,7 +1378,7 @@ fn remove_running_server_is_refused_with_stop_hint() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1404,7 +1415,7 @@ fn dotenv_writes_clickhouse_env_vars() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1441,7 +1452,7 @@ fn client_query_runs_over_http_with_container_credentials() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let (http, http_port) = http_listener_now();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1480,7 +1491,7 @@ fn client_managed_requires_running_server() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),
@@ -1503,7 +1514,7 @@ fn list_reports_running_and_stopped_instances() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     let http_port = reserve_port();
-    write_ch_metadata(project.path(), http_port, reserve_port());
+    write_ch_metadata(home.path(), project.path(), http_port, reserve_port());
     let docker = FakeDocker::start(
         &home.path().join("docker.sock"),
         project.path(),

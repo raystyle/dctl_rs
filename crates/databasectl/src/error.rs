@@ -209,6 +209,12 @@ pub enum Error {
         source: std::io::Error,
     },
 
+    /// A project-state migration (ADR-0012) refusal: cross-device move with
+    /// running or unverifiable instances. Self-composed guidance rendered
+    /// verbatim.
+    #[error("{0}")]
+    StateMigration(String),
+
     #[error("{0}")]
     Skills(String),
 

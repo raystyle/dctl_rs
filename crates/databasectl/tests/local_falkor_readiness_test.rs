@@ -28,6 +28,17 @@ enum ContainerOutcome {
     ImmediateExit,
 }
 
+/// The per-project state bucket under HOME (ADR-0012), mirrored from the
+/// binary's `~/.dctl/projects/<id>/servers` address for staging and
+/// assertions.
+fn bucket_servers(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonical project path");
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(".dctl").join("projects").join(id).join("servers")
+}
+
 struct DockerScenario {
     existing: bool,
     outcome: ContainerOutcome,
@@ -63,7 +74,12 @@ struct FakeDocker {
 }
 
 impl FakeDocker {
-    fn start(socket_path: &Path, project_path: &Path, scenario: DockerScenario) -> Self {
+    fn start(
+        socket_path: &Path,
+        home_path: &Path,
+        project_path: &Path,
+        scenario: DockerScenario,
+    ) -> Self {
         let listener = UnixListener::bind(socket_path).expect("bind fake Docker socket");
         listener
             .set_nonblocking(true)
@@ -73,6 +89,7 @@ impl FakeDocker {
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
         let project = project_path.to_path_buf();
+        let home = home_path.to_path_buf();
         let thread = thread::spawn(move || {
             let DockerScenario {
                 existing,
@@ -103,7 +120,7 @@ impl FakeDocker {
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("set fake Docker read timeout");
                 let mut request = read_request(&mut stream);
-                request.metadata_lock_available = metadata_lock_available(&project);
+                request.metadata_lock_available = metadata_lock_available(&home, &project);
                 thread_requests.lock().unwrap().push(request.clone());
 
                 match (request.method.as_str(), request.path.as_str()) {
@@ -129,8 +146,7 @@ impl FakeDocker {
                         let body: serde_json::Value = serde_json::from_str(&request.body)
                             .expect("container create body JSON");
                         if body["Image"] == "alpine:latest" {
-                            let instance_dir =
-                                project.join(format!(".dctl/servers/{INSTANCE_KEY}"));
+                            let instance_dir = bucket_servers(&home, &project).join(INSTANCE_KEY);
                             match std::fs::remove_dir_all(instance_dir) {
                                 Ok(()) => {}
                                 Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -145,7 +161,8 @@ impl FakeDocker {
                     }
                     ("POST", "/containers/fk-id/start") => {
                         started = true;
-                        let data_dir = project.join(format!(".dctl/servers/{INSTANCE_KEY}/data"));
+                        let data_dir =
+                            bucket_servers(&home, &project).join(format!("{INSTANCE_KEY}/data"));
                         std::fs::create_dir_all(&data_dir).expect("create simulated data dir");
                         write_response(&mut stream, 204, "application/json", b"");
                     }
@@ -278,8 +295,8 @@ fn read_request(stream: &mut UnixStream) -> DockerRequest {
     }
 }
 
-fn metadata_lock_available(project: &Path) -> bool {
-    let path = project.join(".dctl/servers/.metadata.lock");
+fn metadata_lock_available(home: &Path, project: &Path) -> bool {
+    let path = bucket_servers(home, project).join(".metadata.lock");
     let Ok(file) = OpenOptions::new()
         .read(true)
         .write(true)
@@ -347,7 +364,7 @@ fn setup(scenario: DockerScenario) -> Project {
     let dir = tempfile::tempdir().expect("create project");
     let home = tempfile::tempdir().expect("create home");
     let socket = dir.path().join("docker.sock");
-    let docker = FakeDocker::start(&socket, dir.path(), scenario);
+    let docker = FakeDocker::start(&socket, home.path(), dir.path(), scenario);
     Project {
         dir,
         home,
@@ -372,9 +389,7 @@ impl Project {
     }
 
     fn metadata_path(&self) -> PathBuf {
-        self.dir
-            .path()
-            .join(format!(".dctl/servers/{INSTANCE_KEY}.json"))
+        bucket_servers(self.home.path(), self.dir.path()).join(format!("{INSTANCE_KEY}.json"))
     }
 
     fn start_args(&self, extra: &[&str]) -> Vec<String> {
@@ -578,7 +593,7 @@ fn resume_reuses_container_and_reads_stored_password() {
     });
 
     // Pre-existing stopped instance metadata pointing at fk-id.
-    let servers = project.dir.path().join(".dctl/servers");
+    let servers = bucket_servers(project.home.path(), project.dir.path());
     std::fs::create_dir_all(&servers).expect("create servers dir");
     let metadata = serde_json::json!({
         "name": INSTANCE_KEY,
@@ -642,7 +657,7 @@ fn remove_running_instance_is_refused() {
         ..DockerScenario::default()
     });
 
-    let servers = project.dir.path().join(".dctl/servers");
+    let servers = bucket_servers(project.home.path(), project.dir.path());
     std::fs::create_dir_all(&servers).expect("create servers dir");
     let metadata = serde_json::json!({
         "name": INSTANCE_KEY,

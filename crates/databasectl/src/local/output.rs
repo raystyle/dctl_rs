@@ -53,6 +53,10 @@ enum LocalErrorCode {
     /// body names the file and gives conservative recovery guidance without
     /// exposing serde's source text.
     ServerMetadataInvalid,
+    /// A project-state migration (ADR-0012) refusal: cross-device move with
+    /// running or unverifiable instances. dctl composes the guidance itself,
+    /// rendered verbatim.
+    StateMigration,
     IoError,
     LocalError,
 }
@@ -329,6 +333,10 @@ impl LocalErrorOutput {
                 "Could not open SQL input file; check that --queries-file exists and is readable",
             ),
 
+            // Migration refusals are self-composed with their own recovery
+            // steps (stop, then retry), so parity carries the guidance.
+            Error::StateMigration(_) => Mapping::parity(LocalErrorCode::StateMigration),
+
             // ── bounded fallback ────────────────────────────────────────────
             // Subprocess text and `Postgres` (OS text from a failed psql
             // exec) are foreign output. `Skills` and `Ledger` belong to other
@@ -444,10 +452,11 @@ impl fmt::Display for InstallOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct InitOutput {
-    /// Every project-local path this invocation created, e.g. `.dctl/`,
-    /// `.dctl/.gitignore`, `clickhouse/`, or `postgres/`.
+    /// Every project-local path this invocation created, e.g. `clickhouse/`,
+    /// `postgres/`, or `falkordb/`. Runtime state lives in the dctl app-data
+    /// dir (ADR-0012), never under the working directory.
     pub paths: Vec<String>,
-    /// Human-output detail only: the project dir already existed before this
+    /// Human-output detail only: every scaffold already existed before this
     /// run. This affects human wording only, so it is not serialized.
     #[serde(skip)]
     pub already_initialized: bool,
@@ -456,13 +465,11 @@ pub struct InitOutput {
 impl fmt::Display for InitOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if !self.already_initialized {
-            write!(f, "Initialized ClickHouse project in .dctl/")?;
-        } else if self.paths.iter().any(|path| path == ".dctl/.gitignore") {
-            write!(f, "Restored runtime ignore at .dctl/.gitignore")?;
+            write!(f, "Initialized project scaffolds")?;
         } else {
-            write!(f, "Already initialized at .dctl/")?;
+            write!(f, "Already initialized")?;
         }
-        for path in self.paths.iter().filter(|path| !path.starts_with(".dctl/")) {
+        for path in &self.paths {
             write!(f, "\nCreated project scaffold in {path}")?;
         }
         Ok(())
@@ -592,7 +599,7 @@ impl fmt::Display for ServerListOutput {
                 writeln!(f, "No servers found in project '{}'.", scope.path)?;
                 writeln!(
                     f,
-                    "Project-local server list uses the exact current working directory; parent `.dctl` directories are not searched."
+                    "The server list is scoped to this exact working directory; parent directories are not searched, and state lives under ~/.dctl/projects/."
                 )?;
                 return write!(
                     f,

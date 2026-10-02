@@ -1,7 +1,7 @@
 //! Docker status failures must never become a stopped or missing instance.
 
 use serde_json::{Value, json};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use wiremock::matchers::{method, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -13,10 +13,22 @@ struct Project {
     data: PathBuf,
 }
 
+/// The per-project state bucket under HOME (ADR-0012), mirrored from the
+/// binary's address. This harness reuses the project directory as HOME, so
+/// the bucket lands inside it; only the `.dctl/projects/` subtree is
+/// runtime-owned.
+fn bucket_servers(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonical project path");
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(".dctl").join("projects").join(id).join("servers")
+}
+
 impl Project {
     fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
-        let servers = directory.path().join(".dctl/servers");
+        let servers = bucket_servers(directory.path(), directory.path());
         let data = servers.join("default-pg18/data/sentinel");
         std::fs::create_dir_all(data.parent().unwrap()).unwrap();
         std::fs::write(&data, "keep existing data").unwrap();

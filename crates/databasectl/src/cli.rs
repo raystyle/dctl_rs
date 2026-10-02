@@ -30,8 +30,9 @@ pub enum Commands {
     /// Manage local ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Project-scoped commands use `.dctl` under the exact current directory; parent directories
-  are not searched. Run them from the project root.
+  Project-scoped commands key on the exact current directory; parent directories
+  are not searched. Run them from the project root. Runtime state lives under
+  ~/.dctl/projects/<id>/ (id derived from the canonical cwd), never in the repo.
   `dctl local server start` pulls `clickhouse/clickhouse-server:26.8` if the image is missing.
   Typical flow: `local server start` -> `local client -q 'SELECT 1'`")]
     Local(LocalArgs),

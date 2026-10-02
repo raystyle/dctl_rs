@@ -25,11 +25,6 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
         LocalCommands::Init => {
             let result = init::init()?;
             let mut paths = Vec::new();
-            if result.clickhouse_dir_created {
-                paths.push(".dctl/".to_string());
-            } else if result.runtime_gitignore_created {
-                paths.push(".dctl/.gitignore".to_string());
-            }
             if result.clickhouse_scaffold_created {
                 paths.push("clickhouse/".to_string());
             }
@@ -40,8 +35,8 @@ pub async fn run(cmd: LocalCommands, json: bool) -> Result<()> {
                 paths.push("falkordb/".to_string());
             }
             let out = output::InitOutput {
+                already_initialized: paths.is_empty(),
                 paths,
-                already_initialized: !result.clickhouse_dir_created,
             };
             output::print_output(&out, json);
             Ok(())

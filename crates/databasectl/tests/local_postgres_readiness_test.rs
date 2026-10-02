@@ -51,7 +51,12 @@ struct FakeDocker {
 }
 
 impl FakeDocker {
-    fn start(socket_path: &Path, project_path: &Path, scenario: DockerScenario) -> Self {
+    fn start(
+        socket_path: &Path,
+        home_path: &Path,
+        project_path: &Path,
+        scenario: DockerScenario,
+    ) -> Self {
         let listener = UnixListener::bind(socket_path).expect("bind fake Docker socket");
         listener
             .set_nonblocking(true)
@@ -61,7 +66,9 @@ impl FakeDocker {
         let thread_stop = Arc::clone(&stop);
         let thread_requests = Arc::clone(&requests);
         let project = project_path.to_path_buf();
-        let partial_data_path = project_path.join(".dctl/servers/default-pg18/data/partial-init");
+        let home = home_path.to_path_buf();
+        let partial_data_path =
+            bucket_servers(&home, &project).join("default-pg18/data/partial-init");
         let thread = thread::spawn(move || {
             let DockerScenario {
                 existing,
@@ -98,7 +105,7 @@ impl FakeDocker {
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .expect("set fake Docker read timeout");
                 let mut request = read_request(&mut stream);
-                request.metadata_lock_available = metadata_lock_available(&project);
+                request.metadata_lock_available = metadata_lock_available(&home, &project);
                 thread_requests.lock().unwrap().push(request.clone());
 
                 match (request.method.as_str(), request.path.as_str()) {
@@ -107,7 +114,7 @@ impl FakeDocker {
                         write_json(&mut stream, 200, "[]")
                     }
                     ("GET", "/images/postgres:18/json") => {
-                        inject_metadata_during_image_inspect(&project);
+                        inject_metadata_during_image_inspect(&home, &project);
                         write_json(&mut stream, 200, "{}");
                     }
                     ("GET", "/images/alpine:latest/json") => write_json(&mut stream, 200, "{}"),
@@ -121,7 +128,7 @@ impl FakeDocker {
                         let body: serde_json::Value = serde_json::from_str(&request.body)
                             .expect("container create body JSON");
                         if body["Image"] == "alpine:latest" {
-                            let instance_dir = project.join(".dctl/servers/default-pg18");
+                            let instance_dir = bucket_servers(&home, &project).join("default-pg18");
                             match std::fs::remove_dir_all(instance_dir) {
                                 Ok(()) => {}
                                 Err(error) if error.kind() == ErrorKind::NotFound => {}
@@ -138,7 +145,8 @@ impl FakeDocker {
                         let status = start_statuses.pop_front().unwrap_or(204);
                         if status == 204 {
                             started = true;
-                            let data_dir = project.join(".dctl/servers/default-pg18/data");
+                            let data_dir =
+                                bucket_servers(&home, &project).join("default-pg18/data");
                             std::fs::create_dir_all(&data_dir).expect("create simulated PGDATA");
                             std::fs::write(data_dir.join("PG_VERSION"), "18")
                                 .expect("write simulated PGDATA marker");
@@ -308,8 +316,8 @@ fn read_request(stream: &mut UnixStream) -> DockerRequest {
     }
 }
 
-fn metadata_lock_available(project: &Path) -> bool {
-    let path = project.join(".dctl/servers/.metadata.lock");
+fn metadata_lock_available(home: &Path, project: &Path) -> bool {
+    let path = bucket_servers(home, project).join(".metadata.lock");
     let Ok(file) = OpenOptions::new()
         .read(true)
         .write(true)
@@ -322,13 +330,24 @@ fn metadata_lock_available(project: &Path) -> bool {
     file.try_lock().is_ok()
 }
 
-fn inject_metadata_during_image_inspect(project: &Path) {
+/// The per-project state bucket under HOME (ADR-0012), mirrored from the
+/// binary's `~/.dctl/projects/<id>/servers` address for staging and
+/// assertions.
+fn bucket_servers(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonical project path");
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(".dctl").join("projects").join(id).join("servers")
+}
+
+fn inject_metadata_during_image_inspect(home: &Path, project: &Path) {
     let marker = project.join("inject-metadata-during-image-inspect");
     if !marker.exists() {
         return;
     }
 
-    let servers = project.join(".dctl/servers");
+    let servers = bucket_servers(home, project);
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -399,8 +418,8 @@ fn reserve_port() -> u16 {
         .port()
 }
 
-fn write_resumed_server(project: &Path) {
-    let servers = project.join(".dctl/servers");
+fn write_resumed_server(home: &Path, project: &Path) {
+    let servers = bucket_servers(home, project);
     std::fs::create_dir_all(servers.join("default-pg18/data"))
         .expect("create resumed server data directory");
     let cwd = project.canonicalize().expect("canonical project path");
@@ -422,8 +441,8 @@ fn write_resumed_server(project: &Path) {
     .expect("write resumed server metadata");
 }
 
-fn write_dotenv_server(project: &Path) {
-    let servers = project.join(".dctl/servers");
+fn write_dotenv_server(home: &Path, project: &Path) {
+    let servers = bucket_servers(home, project);
     std::fs::create_dir_all(servers.join("default-pg18/data"))
         .expect("create dotenv server data directory");
     let metadata = serde_json::json!({
@@ -459,18 +478,17 @@ fn run_start(
     let home = tempfile::tempdir().expect("create home tempdir");
     let project = tempfile::tempdir().expect("create project tempdir");
     if resumed {
-        write_resumed_server(project.path());
+        write_resumed_server(home.path(), project.path());
     }
     if preexisting_data {
-        let marker = project
-            .path()
-            .join(".dctl/servers/default-pg18/data/existing-data");
+        let marker =
+            bucket_servers(home.path(), project.path()).join("default-pg18/data/existing-data");
         std::fs::create_dir_all(marker.parent().unwrap())
             .expect("create pre-existing Postgres data directory");
         std::fs::write(marker, "keep").expect("write pre-existing data marker");
     }
     let socket_path = home.path().join("docker.sock");
-    let docker = FakeDocker::start(&socket_path, project.path(), scenario);
+    let docker = FakeDocker::start(&socket_path, home.path(), project.path(), scenario);
     let output = run_start_command(
         home.path(),
         project.path(),
@@ -628,10 +646,11 @@ fn fresh_start_waits_for_delayed_postgres_readiness_without_exposing_password() 
 fn postgres_dotenv_releases_metadata_lock_before_docker_credentials_read() {
     let home = tempfile::tempdir().expect("create home tempdir");
     let project = tempfile::tempdir().expect("create project tempdir");
-    write_dotenv_server(project.path());
+    write_dotenv_server(home.path(), project.path());
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: true,
@@ -684,6 +703,7 @@ fn postgres_start_revalidates_metadata_after_image_inspection() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -731,10 +751,9 @@ fn postgres_start_revalidates_metadata_after_image_inspection() {
             .any(|request| request.path.starts_with("/containers/create")),
         "start ignored concurrently committed metadata: {requests:?}"
     );
-    let metadata: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(project.path().join(".dctl/servers/default-pg18.json")).unwrap(),
-    )
-    .unwrap();
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(metadata_path(home.path(), project.path())).unwrap())
+            .unwrap();
     assert_eq!(metadata["container_id"], "concurrent-id");
 }
 
@@ -775,7 +794,7 @@ fn resumed_start_also_waits_for_postgres_readiness() {
 
 #[test]
 fn wall_clock_timeout_fails_and_rolls_back_fresh_data() {
-    let (output, requests, project, _home, _docker) = run_start(
+    let (output, requests, project, home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::Running,
@@ -814,13 +833,12 @@ fn wall_clock_timeout_fails_and_rolls_back_fresh_data() {
         1,
     );
     assert!(
-        !project.path().join(".dctl/servers/default-pg18").exists(),
+        !fresh_instance_dir(home.path(), project.path()).exists(),
         "wall-clock timeout retained PGDATA created by this attempt"
     );
     assert!(
-        !project
-            .path()
-            .join(".dctl/servers/default-pg18.json")
+        !fresh_instance_dir(home.path(), project.path())
+            .join("default-pg18.json")
             .exists(),
         "wall-clock timeout retained success metadata"
     );
@@ -832,7 +850,7 @@ fn immediate_exit_redacts_bounded_logs_without_claiming_success() {
         .map(|index| format!("startup line {index}: {}", "x".repeat(300)))
         .collect();
     logs.push("FATAL: startup failed before readiness".to_string());
-    let (output, requests, project, _home, _docker) = run_start(
+    let (output, requests, project, home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -863,13 +881,12 @@ fn immediate_exit_redacts_bounded_logs_without_claiming_success() {
     assert!(!stderr.contains("[earlier log output truncated]"));
     assert!(readiness_requests(&requests).is_empty());
     assert!(
-        !project.path().join(".dctl/servers/default-pg18").exists(),
+        !fresh_instance_dir(home.path(), project.path()).exists(),
         "failed fresh start retained PGDATA created by this attempt"
     );
     assert!(
-        !project
-            .path()
-            .join(".dctl/servers/default-pg18.json")
+        !fresh_instance_dir(home.path(), project.path())
+            .join("default-pg18.json")
             .exists(),
         "failed fresh start retained success metadata"
     );
@@ -877,7 +894,7 @@ fn immediate_exit_redacts_bounded_logs_without_claiming_success() {
 
 #[test]
 fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_selection() {
-    let (output, requests, project, _home, _docker) = run_start(
+    let (output, requests, project, home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -901,17 +918,13 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
     assert!(!stderr.contains("directory contained data before this start attempt"));
     assert!(!stderr.contains("recovery metadata retained"));
     assert!(
-        project
-            .path()
-            .join(".dctl/servers/default-pg18/data/existing-data")
+        fresh_instance_dir(home.path(), project.path())
+            .join("data/existing-data")
             .exists(),
         "failed start removed pre-existing data"
     );
     assert!(
-        project
-            .path()
-            .join(".dctl/servers/default-pg18.json")
-            .exists(),
+        metadata_path(home.path(), project.path()).exists(),
         "failed start did not retain recovery metadata"
     );
     assert_eq!(
@@ -925,7 +938,7 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
 
 #[test]
 fn incomplete_container_cleanup_retains_pgdata_and_recovery_metadata() {
-    let (output, requests, project, _home, _docker) = run_start(
+    let (output, requests, project, home, _docker) = run_start(
         DockerScenario {
             existing: false,
             outcome: ContainerOutcome::ImmediateExit,
@@ -949,17 +962,13 @@ fn incomplete_container_cleanup_retains_pgdata_and_recovery_metadata() {
     assert!(!stderr.contains("remove failed by test"));
     assert!(!stderr.contains("recovery metadata retained"));
     assert!(
-        project
-            .path()
-            .join(".dctl/servers/default-pg18/data/PG_VERSION")
+        fresh_instance_dir(home.path(), project.path())
+            .join("data/PG_VERSION")
             .exists(),
         "PGDATA was removed while its container remained"
     );
     assert!(
-        project
-            .path()
-            .join(".dctl/servers/default-pg18.json")
-            .exists(),
+        metadata_path(home.path(), project.path()).exists(),
         "incomplete cleanup did not retain recovery metadata"
     );
     assert_eq!(
@@ -971,12 +980,12 @@ fn incomplete_container_cleanup_retains_pgdata_and_recovery_metadata() {
     );
 }
 
-fn fresh_instance_dir(project: &Path) -> PathBuf {
-    project.join(".dctl/servers/default-pg18")
+fn fresh_instance_dir(home: &Path, project: &Path) -> PathBuf {
+    bucket_servers(home, project).join("default-pg18")
 }
 
-fn metadata_path(project: &Path) -> PathBuf {
-    project.join(".dctl/servers/default-pg18.json")
+fn metadata_path(home: &Path, project: &Path) -> PathBuf {
+    bucket_servers(home, project).join("default-pg18.json")
 }
 
 fn request_index(requests: &[DockerRequest], method: &str, path_fragment: &str) -> usize {
@@ -993,6 +1002,7 @@ fn create_success_start_failure_rolls_back_exact_container_and_fresh_data() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -1019,8 +1029,8 @@ fn create_success_start_failure_rolls_back_exact_container_and_fresh_data() {
     let start = request_index(&requests, "POST", "/containers/pg-id/start");
     let remove = request_index(&requests, "DELETE", "/containers/pg-id?");
     assert!(create < start && start < remove);
-    assert!(!fresh_instance_dir(project.path()).exists());
-    assert!(!metadata_path(project.path()).exists());
+    assert!(!fresh_instance_dir(home.path(), project.path()).exists());
+    assert!(!metadata_path(home.path(), project.path()).exists());
 }
 
 #[test]
@@ -1030,6 +1040,7 @@ fn initialization_timeout_removes_partial_pgdata() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -1057,8 +1068,8 @@ fn initialization_timeout_removes_partial_pgdata() {
     );
     assert!(!stderr.contains("database system is starting up"));
     request_index(&requests, "DELETE", "/containers/pg-id?");
-    assert!(!fresh_instance_dir(project.path()).exists());
-    assert!(!metadata_path(project.path()).exists());
+    assert!(!fresh_instance_dir(home.path(), project.path()).exists());
+    assert!(!metadata_path(home.path(), project.path()).exists());
 }
 
 #[test]
@@ -1069,6 +1080,7 @@ fn metadata_failure_uses_the_fresh_start_rollback() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -1094,8 +1106,8 @@ fn metadata_failure_uses_the_fresh_start_rollback() {
     assert!(!stderr.contains("failed to remove metadata"));
     request_index(&requests, "DELETE", "/containers/pg-id?");
     assert!(readiness_requests(&requests).is_empty());
-    assert!(!fresh_instance_dir(project.path()).exists());
-    assert!(metadata_path(project.path()).is_dir());
+    assert!(!fresh_instance_dir(home.path(), project.path()).exists());
+    assert!(metadata_path(home.path(), project.path()).is_dir());
 }
 
 #[test]
@@ -1105,6 +1117,7 @@ fn retry_after_rolled_back_start_failure_succeeds_cleanly() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -1121,7 +1134,7 @@ fn retry_after_rolled_back_start_failure_succeeds_cleanly() {
 
     let first = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     assert_eq!(first.status.code(), Some(1));
-    assert!(!fresh_instance_dir(project.path()).exists());
+    assert!(!fresh_instance_dir(home.path(), project.path()).exists());
 
     let second = run_start_command(home.path(), project.path(), &socket_path, false, 2);
     let requests = docker.requests();
@@ -1140,22 +1153,23 @@ fn retry_after_rolled_back_start_failure_succeeds_cleanly() {
             .count(),
         2
     );
-    assert!(fresh_instance_dir(project.path()).exists());
-    assert!(metadata_path(project.path()).is_file());
+    assert!(fresh_instance_dir(home.path(), project.path()).exists());
+    assert!(metadata_path(home.path(), project.path()).is_file());
 }
 
 #[test]
 fn resume_failure_preserves_existing_container_metadata_and_data() {
     let home = tempfile::tempdir().expect("create home tempdir");
     let project = tempfile::tempdir().expect("create project tempdir");
-    write_resumed_server(project.path());
-    let marker = fresh_instance_dir(project.path()).join("data/user-data");
+    write_resumed_server(home.path(), project.path());
+    let marker = fresh_instance_dir(home.path(), project.path()).join("data/user-data");
     std::fs::create_dir_all(marker.parent().unwrap()).expect("create resumed data directory");
     std::fs::write(&marker, "keep me").expect("write resumed data marker");
 
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: true,
@@ -1175,7 +1189,7 @@ fn resume_failure_preserves_existing_container_metadata_and_data() {
 
     assert_eq!(output.status.code(), Some(1));
     assert!(marker.is_file());
-    assert!(metadata_path(project.path()).is_file());
+    assert!(metadata_path(home.path(), project.path()).is_file());
     assert!(requests.iter().any(|request| {
         request.method == "POST" && request.path.starts_with("/containers/pg-id/stop?")
     }));
@@ -1189,6 +1203,7 @@ fn cleanup_failure_preserves_rollback_behavior_but_redacts_json_diagnostics() {
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(
         &socket_path,
+        home.path(),
         project.path(),
         DockerScenario {
             existing: false,
@@ -1215,8 +1230,8 @@ fn cleanup_failure_preserves_rollback_behavior_but_redacts_json_diagnostics() {
     assert!(!stderr.contains("Postgres startup rollback incomplete"));
     assert!(!stderr.contains("remove failed by test"));
     request_index(&requests, "DELETE", "/containers/pg-id?");
-    assert!(fresh_instance_dir(project.path()).exists());
-    assert!(metadata_path(project.path()).is_file());
+    assert!(fresh_instance_dir(home.path(), project.path()).exists());
+    assert!(metadata_path(home.path(), project.path()).is_file());
 }
 
 #[test]
@@ -1227,6 +1242,7 @@ fn removing_running_postgres_preserves_instance_and_supplies_stop_recovery() {
         let socket_path = home.path().join("docker.sock");
         let docker = FakeDocker::start(
             &socket_path,
+            home.path(),
             project.path(),
             DockerScenario {
                 existing: false,
@@ -1242,7 +1258,7 @@ fn removing_running_postgres_preserves_instance_and_supplies_stop_recovery() {
         );
         let started = run_start_command(home.path(), project.path(), &socket_path, false, 2);
         assert!(started.status.success(), "{:?}", started);
-        let servers = project.path().join(".dctl/servers");
+        let servers = bucket_servers(home.path(), project.path());
         let metadata_path = servers.join(format!("{name}-pg18.json"));
         if name != "default" {
             let original = servers.join("default-pg18.json");

@@ -1493,7 +1493,7 @@ pub async fn start_existing(docker: &Docker, id: &str) -> Result<()> {
 }
 
 /// Discover Postgres containers belonging to this project that don't yet have
-/// a metadata file under `.dctl/servers/`, and write a `ServerInfo` for
+/// a metadata file in the project bucket, and write a `ServerInfo` for
 /// each so they show up in `local server list` and can be managed.
 ///
 /// Safe to call multiple times in one CLI invocation. When Docker isn't

@@ -37,6 +37,6 @@ dctl(DataBase Control):ClickHouse/Postgres/FalkorDB 三引擎统一 Docker 容�
 ## 环境
 
 - 开发机 WSL(/mnt/wsl/repos/dctl_rs,无 Docker);Docker 依赖测试用 `ssh ray@lan-linux`(Docker 29.8.1,无 Rust,以 rust:1-slim 容器跑,完整配方与权限坑见 `docs/diary/2026-09-20-fork-bootstrap.md`)
-- 状态目录:项目级 `.dctl/`,全局 `~/.dctl/`;三引擎实例键 `<name>-<engine><version>`,容器名 `dctl-<engine>-<name>-<version>`
+- 状态目录:全局 `~/.dctl/`;项目作用域状态在 `~/.dctl/projects/<id>/servers/`(`<id>` = canonical cwd 哈希,cwd 零落点,见 ADR-0012);三引擎实例键 `<name>-<engine><version>`,容器名 `dctl-<engine>-<name>-<version>`
 - 上游:`upstream` remote 已退役(2026-09-21 裁定,见 ADR-0001 追注),不做 backport;必要时临时加 remote 取补丁
 - 文档路径统一正斜杠写法 `docs/adr/`

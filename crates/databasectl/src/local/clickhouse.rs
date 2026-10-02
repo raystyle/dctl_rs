@@ -305,8 +305,6 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             drop(metadata_lock);
             continue;
         }
-        crate::init::ensure_runtime_gitignore()?;
-
         // Resume path.
         if let Some(prior) = prior {
             let cid = prior.container_id.as_deref().unwrap_or("");
@@ -339,10 +337,10 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             None => resolve_native_port_excluding(http_port, bind_face)?,
         };
 
-        let instance_dir = server::servers_dir_join(&key);
+        let instance_dir = server::servers_dir_join(&key)?;
         let remove_fresh_data_on_failure = fresh_instance_dir_is_disposable(&instance_dir);
         server::ensure_ch_data_dir(&user_name, &tag)?;
-        let data_dir = server::ch_data_dir(&user_name, &tag);
+        let data_dir = server::ch_data_dir(&user_name, &tag)?;
 
         let user = user.unwrap_or_else(|| DEFAULT_USER.to_string());
         let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_string());
@@ -460,8 +458,19 @@ async fn rollback_failed_fresh_start(
     primary: Error,
     metadata_lock: &server::MetadataLock,
 ) -> Error {
-    let instance_dir = server::servers_dir_join(&info.name);
     let mut diagnostics = Vec::new();
+    // Rollback runs after the primary failure; a broken bucket address must
+    // not panic the cleanup, it only skips the data-directory steps.
+    let instance_dir = match server::servers_dir_join(&info.name) {
+        Ok(dir) => Some(dir),
+        Err(error) => {
+            diagnostics.push(format!(
+                "could not resolve the state dir for '{}': {error}",
+                info.name
+            ));
+            None
+        }
+    };
 
     let container_removed = match docker::remove_container(docker, container_id).await {
         Ok(()) => true,
@@ -473,8 +482,12 @@ async fn rollback_failed_fresh_start(
         }
     };
 
-    let instance_removed = if remove_fresh_data_on_failure && container_removed {
-        match docker::remove_host_dir_blocking(&instance_dir) {
+    let instance_removed = if let (true, true, Some(instance_dir)) = (
+        remove_fresh_data_on_failure,
+        container_removed,
+        instance_dir.as_ref(),
+    ) {
+        match docker::remove_host_dir_blocking(instance_dir) {
             Ok(()) if !instance_dir.exists() => true,
             Ok(()) => {
                 diagnostics.push(format!(
@@ -492,15 +505,20 @@ async fn rollback_failed_fresh_start(
             }
         }
     } else {
-        let reason = if remove_fresh_data_on_failure {
+        let reason = if instance_dir.is_none() {
+            "the state dir could not be resolved"
+        } else if remove_fresh_data_on_failure {
             "the container could not be removed"
         } else {
             "the directory contained data before this start attempt"
         };
-        diagnostics.push(format!(
-            "retained ClickHouse data '{}' because {reason}",
-            instance_dir.display()
-        ));
+        match &instance_dir {
+            Some(instance_dir) => diagnostics.push(format!(
+                "retained ClickHouse data '{}' because {reason}",
+                instance_dir.display()
+            )),
+            None => diagnostics.push(format!("retained ClickHouse data because {reason}")),
+        }
         false
     };
 
@@ -1220,7 +1238,7 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
             // old process (if any) has to be stopped by hand.
             let legacy = legacy_ch_info_locked(name, &metadata_lock)?
                 .ok_or_else(|| Error::ServerNotFound(name.to_string()))?;
-            let legacy_dir = server::servers_dir_join(&legacy.name);
+            let legacy_dir = server::servers_dir_join(&legacy.name)?;
             server::try_remove_server_info_locked(&legacy.name, &metadata_lock)?;
             docker::remove_host_dir_blocking(&legacy_dir)?;
             if !json {
@@ -1252,7 +1270,7 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
         let _ = docker::stop_and_remove_blocking(cid);
     }
 
-    let ch_dir = server::servers_dir_join(&key);
+    let ch_dir = server::servers_dir_join(&key)?;
     docker::remove_host_dir_blocking(&ch_dir)?;
     server::try_remove_server_info_locked(&key, &metadata_lock)?;
     let out = output::ServerRemoveOutput {

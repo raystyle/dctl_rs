@@ -332,8 +332,6 @@ async fn start(
             drop(metadata_lock);
             continue;
         }
-        crate::init::ensure_runtime_gitignore()?;
-
         // Resume path: an instance for this exact (name, major) already exists.
         if let Some(prior) = prior {
             let cid = prior.container_id.as_deref().unwrap_or("");
@@ -375,10 +373,10 @@ async fn start(
             None => resolve_port(None)?,
         };
 
-        let instance_dir = server::servers_dir_join(&key);
+        let instance_dir = server::servers_dir_join(&key)?;
         let remove_fresh_data_on_failure = fresh_instance_dir_is_disposable(&instance_dir);
         server::ensure_pg_data_dir(&user_name, &major)?;
-        let data_dir = server::pg_data_dir(&user_name, &major);
+        let data_dir = server::pg_data_dir(&user_name, &major)?;
 
         let user = user.unwrap_or_else(|| DEFAULT_USER.to_string());
         let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_string());
@@ -487,6 +485,16 @@ fn fresh_instance_dir_is_disposable(path: &Path) -> bool {
     }
 }
 
+/// Display helper for rollback diagnostics: the resolved path when the
+/// bucket address works, otherwise the instance key so the message stays
+/// actionable without a path.
+fn metadata_display(resolved: &Result<std::path::PathBuf>, key: &str) -> String {
+    match resolved {
+        Ok(path) => path.display().to_string(),
+        Err(_) => key.to_string(),
+    }
+}
+
 async fn rollback_failed_fresh_start(
     docker: &bollard::Docker,
     container_id: &str,
@@ -495,9 +503,20 @@ async fn rollback_failed_fresh_start(
     primary: Error,
     metadata_lock: &server::MetadataLock,
 ) -> Error {
-    let instance_dir = server::servers_dir_join(&info.name);
-    let metadata_path = server::servers_dir_join(&format!("{}.json", info.name));
     let mut diagnostics = Vec::new();
+    // Rollback runs after the primary failure; a broken bucket address must
+    // not panic the cleanup, it only skips the data-directory steps and
+    // degrades path diagnostics to the instance key.
+    let (instance_dir, metadata_path) = (
+        server::servers_dir_join(&info.name),
+        server::servers_dir_join(&format!("{}.json", info.name)),
+    );
+    if let Err(error) = &instance_dir {
+        diagnostics.push(format!(
+            "could not resolve the state dir for '{}': {error}",
+            info.name
+        ));
+    }
 
     let container_removed = match docker::remove_container(docker, container_id).await {
         Ok(()) => true,
@@ -509,8 +528,12 @@ async fn rollback_failed_fresh_start(
         }
     };
 
-    let instance_removed = if remove_fresh_data_on_failure && container_removed {
-        match docker::remove_host_dir_blocking(&instance_dir) {
+    let instance_removed = if let (true, true, Some(instance_dir)) = (
+        remove_fresh_data_on_failure,
+        container_removed,
+        instance_dir.as_ref().ok(),
+    ) {
+        match docker::remove_host_dir_blocking(instance_dir) {
             Ok(()) if !instance_dir.exists() => true,
             Ok(()) => {
                 diagnostics.push(format!(
@@ -528,14 +551,16 @@ async fn rollback_failed_fresh_start(
             }
         }
     } else {
-        let reason = if remove_fresh_data_on_failure {
+        let reason = if instance_dir.is_err() {
+            "the state dir could not be resolved"
+        } else if remove_fresh_data_on_failure {
             "the container could not be removed"
         } else {
             "the directory contained data before this start attempt"
         };
         diagnostics.push(format!(
             "retained Postgres data '{}' because {reason}",
-            instance_dir.display()
+            metadata_display(&instance_dir, &info.name)
         ));
         false
     };
@@ -545,19 +570,19 @@ async fn rollback_failed_fresh_start(
             Ok(()) => return primary,
             Err(error) => diagnostics.push(format!(
                 "failed to remove metadata '{}': {error}",
-                metadata_path.display()
+                metadata_display(&metadata_path, &info.name)
             )),
         }
     } else {
         match server::save_server_info_locked(info, metadata_lock) {
             Ok(()) => diagnostics.push(format!(
                 "recovery metadata retained at '{}'; run `dctl local postgres remove {}` to clean up",
-                metadata_path.display(),
+                metadata_display(&metadata_path, &info.name),
                 user_name_from_key(&info.name)
             )),
             Err(error) => diagnostics.push(format!(
                 "failed to preserve recovery metadata '{}': {error}",
-                metadata_path.display()
+                metadata_display(&metadata_path, &info.name)
             )),
         }
     }
@@ -997,7 +1022,7 @@ fn resolve_port(explicit: Option<u16>) -> Result<u16> {
 }
 
 fn generate_password() -> String {
-    // 24 alphanumeric chars. Persisted in `.dctl/servers/<name>.json`
+    // 24 alphanumeric chars. Persisted in the bucket as `<name>.json`
     // so other processes (and `dotenv`) can recover the value.
     Alphanumeric.sample_string(&mut rand::rng(), 24)
 }
@@ -1067,12 +1092,12 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
         let _ = docker::stop_and_remove_blocking(cid);
     }
 
-    // Postgres data dir lives at .dctl/servers/<key>/data/. Remove the
+    // Postgres data dir lives at <bucket>/servers/<key>/data/. Remove the
     // <key>/ wrapper so the (name, version) pair leaves no on-disk state.
     // On Linux the bind-mounted PGDATA contains files owned by uid 999, so
     // a plain rm fails — `remove_host_dir_blocking` falls back to a
     // privileged container in that case.
-    let pg_dir = server::servers_dir_join(&key);
+    let pg_dir = server::servers_dir_join(&key)?;
     docker::remove_host_dir_blocking(&pg_dir)?;
     server::try_remove_server_info_locked(&key, &metadata_lock)?;
     let out = output::ServerRemoveOutput {

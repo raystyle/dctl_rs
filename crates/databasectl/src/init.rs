@@ -1,12 +1,5 @@
 use crate::error::Result;
-use std::io::Write;
 use std::path::PathBuf;
-
-pub fn local_dir() -> PathBuf {
-    std::env::current_dir()
-        .expect("failed to get current directory")
-        .join(".dctl")
-}
 
 /// The physical directory whose project-local state is selected by this
 /// invocation. Local commands intentionally do not search parent directories.
@@ -37,52 +30,15 @@ pub fn falkordb_project_dir() -> PathBuf {
 /// `init()` itself prints nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct InitResult {
-    pub clickhouse_dir_created: bool,
-    pub runtime_gitignore_created: bool,
     pub clickhouse_scaffold_created: bool,
     pub postgres_scaffold_created: bool,
     pub falkordb_scaffold_created: bool,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RuntimeIgnoreResult {
-    pub directory_created: bool,
-    pub gitignore_created: bool,
-}
-
-/// Ensure project-local runtime state is ignored without replacing a custom
-/// ignore file. The create-new write also preserves a file created by a
-/// concurrent process, and every other I/O failure reaches the caller.
-pub fn ensure_runtime_gitignore() -> Result<RuntimeIgnoreResult> {
-    let dir = local_dir();
-    let directory_created = !dir.exists();
-    std::fs::create_dir_all(&dir)?;
-
-    let gitignore = dir.join(".gitignore");
-    let gitignore_created = match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&gitignore)
-    {
-        Ok(mut file) => {
-            file.write_all(b"*\n")?;
-            true
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && gitignore.is_file() => {
-            false
-        }
-        Err(error) => return Err(error.into()),
-    };
-
-    Ok(RuntimeIgnoreResult {
-        directory_created,
-        gitignore_created,
-    })
-}
-
+/// Create the user-facing project scaffolds. Runtime state lives under the
+/// dctl app-data dir (ADR-0012), so nothing here touches the working
+/// directory beyond the scaffolds themselves.
 pub fn init() -> Result<InitResult> {
-    let runtime_ignore = ensure_runtime_gitignore()?;
-
     let clickhouse_scaffold_created = create_project_scaffold(
         project_dir(),
         &["tables", "materialized_views", "queries", "seed"],
@@ -95,8 +51,6 @@ pub fn init() -> Result<InitResult> {
         create_project_scaffold(falkordb_project_dir(), &["queries", "seed"])?;
 
     Ok(InitResult {
-        clickhouse_dir_created: runtime_ignore.directory_created,
-        runtime_gitignore_created: runtime_ignore.gitignore_created,
         clickhouse_scaffold_created,
         postgres_scaffold_created,
         falkordb_scaffold_created,
@@ -128,8 +82,8 @@ mod tests {
         let subdirs = ["tables", "materialized_views", "queries", "seed"];
 
         let created = create_project_scaffold(dir.clone(), &subdirs).unwrap();
-        assert!(created);
 
+        assert!(created);
         for subdir in &subdirs {
             let path = dir.join(subdir);
             assert!(path.is_dir(), "{} should be a directory", path.display());

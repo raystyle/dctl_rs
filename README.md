@@ -53,10 +53,10 @@ dctl 的状态分两处存放:
 
 | 路径 | 范围 | 内容 |
 | --- | --- | --- |
-| `<project>/.dctl/` | 每项目 | 服务器元数据 `servers/*.json`、服务器数据目录;由 `dctl local init` 写入 gitignore |
-| `~/.dctl/` | 全局 | 命名部分配置 `configs/`、ledger 私钥 `ledger/`、私仓凭据与镜像缓存 `registry/`(`auth`、`cache/`) |
+| `~/.dctl/projects/<id>/` | 每项目 | 服务器元数据 `servers/*.json` 与数据目录(`<id>` 由项目根目录派生,桶内 `project-path` 存明文路径;ADR-0012) |
+| `~/.dctl/` | 全局 | 命名部分配置 `configs/`、ledger 私钥 `ledger/`、私仓凭据与镜像缓存 `registry/`(`auth`、`cache/`)、项目状态桶 `projects/` |
 
-项目级命令只认当前目录下的 `.dctl/`,不向上搜索父目录;请在项目根目录运行。
+项目级命令按当前工作目录定位状态桶,不向上搜索父目录;请在项目根目录运行。运行时状态不落项目目录,仓库工作树保持干净。
 
 遥测已整体退役(ADR-0003 / REQ-002):无采集、无上报、无相关环境变量。
 
@@ -86,7 +86,7 @@ $ dctl registry catalog            # 列私仓 repos;读面匿名开放,有本�
 ### ClickHouse 服务器
 
 ```console
-$ dctl init                       # 脚手架 .dctl/、clickhouse/、postgres/、falkordb/ 目录
+$ dctl init                       # 脚手架 clickhouse/、postgres/、falkordb/ 目录
 $ dctl server start               # default 实例,clickhouse:26.8,双口被占自动选空闲口
 $ dctl server start dev --http-port 8333 --native-port 9333
 $ dctl server start nsm --bind 192.168.88.175  # 双口追加发布到该面(loopback 保留;0.0.0.0 全接口)
@@ -109,18 +109,6 @@ start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以�
 
 ```text
 <project>/
-├── .dctl/                  # 运行时状态(gitignore 自动写入,不入库)
-│   ├── .gitignore          # 内容恒为 *,忽略整个 .dctl/
-│   └── servers/            # 各服务器实例元数据与数据
-│       ├── default-ch26.8.json   # ClickHouse 实例元数据(名称/容器/端口/版本)
-│       ├── default-ch26.8/
-│       │   └── data/       # ClickHouse 数据(bind mount 到容器)
-│       ├── default-pg18.json   # Postgres 实例元数据
-│       ├── default-pg18/
-│       │   └── data/       # Postgres 数据(bind mount 到容器)
-│       ├── default-fk4.20.6.json  # FalkorDB 实例元数据
-│       └── default-fk4.20.6/
-│           └── data/       # FalkorDB 数据(bind mount 到容器)
 ├── clickhouse/             # ClickHouse SQL 脚手架(可提交,含 .gitkeep)
 │   ├── tables/
 │   ├── materialized_views/
@@ -137,7 +125,7 @@ start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以�
     └── seed/
 ```
 
-**入库规则**:`clickhouse/`、`postgres/`、`falkordb/` 是你项目的 SQL/Cypher 脚手架(各含 `.gitkeep` 保证空目录入库),随代码提交;`.dctl/` 是运行时状态(服务器数据与元数据),`init` 自动写入 `.dctl/.gitignore`(内容为 `*`)确保整目录不入库。ledger 私钥在全局 `~/.dctl/ledger/dctl_rs.pem`(0600),不在项目目录内。
+**入库规则**:`clickhouse/`、`postgres/`、`falkordb/` 是你项目的 SQL/Cypher 脚手架(各含 `.gitkeep` 保证空目录入库),随代码提交。运行时状态(各实例元数据与数据目录)在 `~/.dctl/projects/<id>/servers/`(实例元数据 `default-ch26.8.json`、数据目录 `default-ch26.8/data/` 等,bind mount 到容器),不落项目目录,无需 gitignore(ADR-0012);旧版落在项目 `.dctl/` 的状态会在首次运行时自动迁入桶。ledger 私钥在全局 `~/.dctl/ledger/dctl_rs.pem`(0600),不在项目目录内。
 
 **多实例命名**:同一名字可有多版本实例(如 `default-ch26.8` 与 `default-ch26.9`、`default-pg18` 与 `default-pg17` 并存),元数据文件名 = `<name>-<engine><version>`;`stop`/`remove` 不带 `--version` 时,单实例直接选中,多实例报错要求指定。
 

@@ -159,6 +159,17 @@ impl Drop for FakeDocker {
     }
 }
 
+/// The per-project state bucket under HOME (ADR-0012), mirrored from the
+/// binary's `~/.dctl/projects/<id>/servers` address for staging and
+/// assertions.
+fn bucket_servers(home: &Path, project: &Path) -> PathBuf {
+    use sha2::{Digest, Sha256};
+    let canonical = project.canonicalize().expect("canonical project path");
+    let digest = Sha256::digest(canonical.display().to_string().as_bytes());
+    let id: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    home.join(".dctl").join("projects").join(id).join("servers")
+}
+
 fn run_invalid_start(args: &[&str]) -> (Output, usize, bool) {
     let project = tempfile::tempdir().expect("create project tempdir");
     let home = tempfile::tempdir().expect("create home tempdir");
@@ -175,11 +186,13 @@ fn run_invalid_start(args: &[&str]) -> (Output, usize, bool) {
         .expect("run dctl");
     let requests = docker.request_count();
     let project_state_created = project.path().join(".dctl").exists();
+    // ADR-0012 keeps the cwd clean, so this guard now also pins that no
+    // legacy directory sneaks back in.
     (output, requests, project_state_created)
 }
 
-fn write_stopped_postgres_metadata(project: &Path, port: u16) {
-    let servers = project.join(".dctl/servers");
+fn write_stopped_postgres_metadata(home: &Path, project: &Path, port: u16) {
+    let servers = bucket_servers(home, project);
     std::fs::create_dir_all(&servers).expect("create servers directory");
     std::fs::write(
         servers.join("default-pg18.json"),
@@ -297,7 +310,7 @@ fn exhausted_auto_port_range_does_not_block_resume() {
     let project = tempfile::tempdir().expect("create project tempdir");
     let home = tempfile::tempdir().expect("create home tempdir");
     let stored_port = 6543;
-    write_stopped_postgres_metadata(project.path(), stored_port);
+    write_stopped_postgres_metadata(home.path(), project.path(), stored_port);
 
     let socket_path = home.path().join("docker.sock");
     let docker = FakeDocker::start(&socket_path);
@@ -322,17 +335,16 @@ fn exhausted_auto_port_range_does_not_block_resume() {
     let body: Value = serde_json::from_slice(&output.stdout).expect("parse start JSON");
     assert_eq!(body["port"], stored_port);
     assert_eq!(body["container_id"], "existing-container");
-    assert_eq!(
-        std::fs::read_to_string(project.path().join(".dctl/.gitignore")).unwrap(),
-        "*\n"
-    );
+    // ADR-0012: runtime state lives in the app-data bucket; the working
+    // directory stays clean with no ignore file to maintain.
+    assert!(!project.path().join(".dctl").exists());
 }
 
 #[test]
 fn password_env_override_reports_stored_settings_on_resume() {
     let project = tempfile::tempdir().expect("create project tempdir");
     let home = tempfile::tempdir().expect("create home tempdir");
-    write_stopped_postgres_metadata(project.path(), 6543);
+    write_stopped_postgres_metadata(home.path(), project.path(), 6543);
 
     let socket_path = home.path().join("docker.sock");
     let _docker = FakeDocker::start(&socket_path);
@@ -413,8 +425,8 @@ fn postgres_lifecycle_and_dotenv_name_forms_select_the_same_instance() {
     ] {
         let project = tempfile::tempdir().unwrap();
         let home = tempfile::tempdir().unwrap();
-        let servers = project.path().join(".dctl/servers");
-        write_stopped_postgres_metadata(project.path(), 6543);
+        let servers = bucket_servers(home.path(), project.path());
+        write_stopped_postgres_metadata(home.path(), project.path(), 6543);
         let original = servers.join("default-pg18.json");
         let selected = servers.join(format!("{name}-pg18.json"));
         let mut metadata: Value =

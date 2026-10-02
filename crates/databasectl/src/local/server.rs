@@ -1,13 +1,16 @@
 use crate::error::{Error, Result};
-use crate::init;
 use crate::local::docker;
+use crate::paths;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
 const METADATA_LOCK_FILE: &str = ".metadata.lock";
 const METADATA_TEMP_PREFIX: &str = ".metadata-";
+const LEGACY_DIR_NAME: &str = ".dctl";
+const BUCKET_PATH_NOTE: &str = "project-path";
 
 const ADJECTIVES: &[&str] = &[
     "bold", "calm", "dark", "fast", "gold", "keen", "loud", "neat", "pale", "red", "slim", "tall",
@@ -47,8 +50,8 @@ fn default_engine() -> Engine {
 /// Metadata saved for each server instance.
 ///
 /// `engine` and `container_id` are post-Postgres-support additions and default
-/// to ClickHouse + None so existing `.dctl/servers/*.json` files keep
-/// deserializing.
+/// to ClickHouse + None so pre-bucket `.dctl/servers/*.json` files keep
+/// deserializing after migration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerInfo {
     /// Disk key: `<name>`, `<name>-pg<major>`, `<name>-fk<version>` or
@@ -99,9 +102,47 @@ pub fn validate_server_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Directory where server tracking files and data live: .dctl/servers/
-fn servers_dir() -> PathBuf {
-    init::local_dir().join("servers")
+/// Directory where server tracking files and data live:
+/// `~/.dctl/projects/<id>/servers/` (ADR-0012). The bucket id keys on the
+/// canonical working directory, so one project always resolves to one bucket
+/// and no runtime-written path lands under the working directory itself.
+fn servers_dir() -> Result<PathBuf> {
+    Ok(project_bucket_dir()?.join("servers"))
+}
+
+/// Pre-ADR-0012 servers directory under the working directory, migrated on
+/// first contact by [`lock_metadata`].
+fn legacy_servers_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?
+        .join(LEGACY_DIR_NAME)
+        .join("servers"))
+}
+
+/// Stable bucket id for a canonical working directory: the first 16 hex
+/// chars of its sha256. Pure so tests can pin stability and separation.
+fn bucket_id_for(canonical_cwd: &str) -> String {
+    let digest = Sha256::digest(canonical_cwd.as_bytes());
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// `~/.dctl/projects/<id>/` for the current working directory. A
+/// `project-path` note records the plain canonical path on first creation so
+/// buckets stay human-auditable.
+fn project_bucket_dir() -> Result<PathBuf> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let dir = paths::base_dir()?
+        .join("projects")
+        .join(bucket_id_for(&cwd.display().to_string()));
+    let note = dir.join(BUCKET_PATH_NOTE);
+    if !note.exists() {
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(&note, format!("{}\n", cwd.display()))?;
+    }
+    Ok(dir)
 }
 
 /// The one project-wide metadata lock. Lifecycle operations hold this lock
@@ -154,7 +195,170 @@ impl MetadataLock {
 }
 
 pub(crate) fn lock_metadata() -> Result<MetadataLock> {
-    MetadataLock::acquire_at(&servers_dir())
+    let lock = MetadataLock::acquire_at(&servers_dir()?)?;
+    migrate_legacy_project_state(&lock)?;
+    Ok(lock)
+}
+
+/// One-shot migration from the legacy working-directory `.dctl/servers/`
+/// into the bucket, run under the bucket lock (ADR-0012). Renames keep
+/// inodes, so live bind mounts ride along on the same filesystem; a
+/// cross-device copy would fork live mounts, so it proceeds only once no
+/// container-backed entry reads as running (fail-closed). The lock file
+/// carries no state and never moves; emptied shells are removed.
+fn migrate_legacy_project_state(lock: &MetadataLock) -> Result<()> {
+    let legacy_dir = legacy_servers_dir()?;
+    if !legacy_dir.is_dir() {
+        return Ok(());
+    }
+    match migrate_state_at(&legacy_dir, &lock.dir, MoveMode::Rename) {
+        Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::CrossesDevices => {
+            migrate_state_at(&legacy_dir, &lock.dir, MoveMode::Copy)?;
+        }
+        other => other?,
+    }
+    cleanup_legacy_shell(&legacy_dir)
+}
+
+/// How [`migrate_state_at`] moves one entry. `Rename` keeps inodes (live
+/// bind mounts ride along); `Copy` is the cross-device fallback guarded by
+/// the live-container check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveMode {
+    Rename,
+    Copy,
+}
+
+fn migration_refusal(detail: String) -> Error {
+    Error::StateMigration(format!(
+        "refusing to migrate project state across filesystems: {detail} \
+         Stop the running servers, then retry the command."
+    ))
+}
+
+/// Move every stateful entry of `legacy` (all but the lock file) into
+/// `target`, then leave shell cleanup to the caller. `Rename` mode switches
+/// to `Copy` semantics only through the caller's CrossesDevices handling.
+fn migrate_state_at(legacy: &Path, target: &Path, mode: MoveMode) -> Result<()> {
+    if mode == MoveMode::Copy {
+        ensure_no_live_containers(legacy)?;
+    }
+    std::fs::create_dir_all(target)?;
+    for entry in std::fs::read_dir(legacy)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == METADATA_LOCK_FILE {
+            continue;
+        }
+        let source = entry.path();
+        let destination = target.join(&name);
+        match mode {
+            MoveMode::Rename => std::fs::rename(&source, &destination)?,
+            MoveMode::Copy => {
+                if source.is_dir() {
+                    copy_dir_recursive(&source, &destination)?;
+                    std::fs::remove_dir_all(&source)?;
+                } else {
+                    std::fs::copy(&source, &destination)?;
+                    std::fs::remove_file(&source)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A cross-device copy of a data directory forks any live bind mount: the
+/// container keeps the old inode while future starts read the copy. Refuse
+/// unless every container-backed entry in `dir` provably reads as stopped.
+/// Unreachable Docker and unreadable metadata are unverifiable, so they
+/// refuse too (fail-closed, ADR-0012). Runs before any entry moves, so
+/// directory iteration order cannot leave an unchecked instance behind.
+fn ensure_no_live_containers(dir: &Path) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
+            continue;
+        };
+        let metadata_path = entry.path();
+        let raw = match std::fs::read_to_string(&metadata_path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let refusal = |detail: String| {
+            migration_refusal(format!("metadata '{}' {detail}.", metadata_path.display()))
+        };
+        let info: ServerInfo = match serde_json::from_str(&raw) {
+            Ok(info) => info,
+            Err(error) => return Err(refusal(format!("is unreadable ({error})"))),
+        };
+        let Some(container_id) = info.container_id.as_deref() else {
+            continue;
+        };
+        let running = docker::is_container_running_blocking(container_id).map_err(|error| {
+            refusal(format!("cannot be verified (Docker unreachable: {error})"))
+        })?;
+        if running {
+            return Err(refusal(format!("instance '{stem}' is still running")));
+        }
+    }
+    Ok(())
+}
+
+/// Copy a directory tree, creating intermediate directories as needed.
+/// Unlike a rename this allocates fresh inodes, which is why callers must
+/// first prove no live bind mounts reference the source.
+fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let destination_child = destination.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir_recursive(&entry.path(), &destination_child)?;
+        } else {
+            std::fs::copy(entry.path(), &destination_child)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove the emptied legacy shells: the lock file and `servers/` directory
+/// once nothing but the lock remains, then `.dctl/` once it holds nothing
+/// but our own `.gitignore`. Anything else in there belongs to the user and
+/// is left in place.
+fn cleanup_legacy_shell(legacy_servers: &Path) -> Result<()> {
+    let only_lock_left = std::fs::read_dir(legacy_servers)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .all(|entry| entry.file_name() == METADATA_LOCK_FILE)
+        })
+        .unwrap_or(false);
+    if !only_lock_left {
+        return Ok(());
+    }
+    let lock_file = legacy_servers.join(METADATA_LOCK_FILE);
+    if lock_file.is_file() {
+        std::fs::remove_file(&lock_file)?;
+    }
+    std::fs::remove_dir(legacy_servers)?;
+
+    if let Some(legacy_root) = legacy_servers.parent() {
+        let only_ignore_left = std::fs::read_dir(legacy_root)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .all(|entry| entry.file_name() == ".gitignore")
+            })
+            .unwrap_or(false);
+        if only_ignore_left {
+            std::fs::remove_file(legacy_root.join(".gitignore"))?;
+            std::fs::remove_dir(legacy_root)?;
+        }
+    }
+    Ok(())
 }
 
 /// Disk identifier for a Postgres instance: `<name>-pg<major>`. Used in the
@@ -166,15 +370,15 @@ pub fn pg_instance_key(name: &str, major: &str) -> String {
 
 /// Join a child name onto the servers directory. Exposed so handlers can
 /// remove a whole `<key>/` wrapper without poking at internals.
-pub fn servers_dir_join(child: &str) -> PathBuf {
-    servers_dir().join(child)
+pub fn servers_dir_join(child: &str) -> Result<PathBuf> {
+    Ok(servers_dir()?.join(child))
 }
 
 /// Data directory for a Postgres instance.
-pub fn pg_data_dir(name: &str, major: &str) -> PathBuf {
-    servers_dir()
+pub fn pg_data_dir(name: &str, major: &str) -> Result<PathBuf> {
+    Ok(servers_dir()?
         .join(pg_instance_key(name, major))
-        .join("data")
+        .join("data"))
 }
 
 /// Disk identifier for a FalkorDB instance: `<name>-fk<version>` (full
@@ -204,10 +408,10 @@ pub(crate) fn is_fk_instance_key(name: &str) -> bool {
 }
 
 /// Data directory for a FalkorDB instance.
-pub fn fk_data_dir(name: &str, version: &str) -> PathBuf {
-    servers_dir()
+pub fn fk_data_dir(name: &str, version: &str) -> Result<PathBuf> {
+    Ok(servers_dir()?
         .join(fk_instance_key(name, version))
-        .join("data")
+        .join("data"))
 }
 
 /// Disk identifier for a Docker-managed ClickHouse instance:
@@ -228,16 +432,16 @@ pub(crate) fn is_ch_instance_key(name: &str) -> bool {
 }
 
 /// Data directory for a Docker-managed ClickHouse instance.
-pub fn ch_data_dir(name: &str, version: &str) -> PathBuf {
-    servers_dir()
+pub fn ch_data_dir(name: &str, version: &str) -> Result<PathBuf> {
+    Ok(servers_dir()?
         .join(ch_instance_key(name, version))
-        .join("data")
+        .join("data"))
 }
 
 /// Ensure the data directory for a ClickHouse instance exists.
 pub fn ensure_ch_data_dir(name: &str, version: &str) -> Result<bool> {
     ensure_servers_dir()?;
-    let instance_dir = servers_dir().join(ch_instance_key(name, version));
+    let instance_dir = servers_dir()?.join(ch_instance_key(name, version));
     let created = match std::fs::create_dir(&instance_dir) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -288,7 +492,7 @@ pub(crate) fn find_ch_instances_locked(name: &str, lock: &MetadataLock) -> Resul
 /// this call created the instance directory, for transactional startup cleanup.
 pub fn ensure_fk_data_dir(name: &str, version: &str) -> Result<bool> {
     ensure_servers_dir()?;
-    let instance_dir = servers_dir().join(fk_instance_key(name, version));
+    let instance_dir = servers_dir()?.join(fk_instance_key(name, version));
     let created = match std::fs::create_dir(&instance_dir) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -341,11 +545,9 @@ pub(crate) fn find_fk_instances_locked(name: &str, lock: &MetadataLock) -> Resul
     Ok(out)
 }
 
-/// Ensure the project-local server and ignore paths exist. Idempotent.
+/// Ensure the bucket servers directory exists. Idempotent.
 fn ensure_servers_dir() -> Result<()> {
-    let dir = servers_dir();
-    std::fs::create_dir_all(&dir)?;
-    init::ensure_runtime_gitignore()?;
+    std::fs::create_dir_all(servers_dir()?)?;
     Ok(())
 }
 
@@ -353,7 +555,7 @@ fn ensure_servers_dir() -> Result<()> {
 /// this call created the instance directory, for transactional startup cleanup.
 pub fn ensure_pg_data_dir(name: &str, major: &str) -> Result<bool> {
     ensure_servers_dir()?;
-    let instance_dir = servers_dir().join(pg_instance_key(name, major));
+    let instance_dir = servers_dir()?.join(pg_instance_key(name, major));
     let created = match std::fs::create_dir(&instance_dir) {
         Ok(()) => true,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -559,7 +761,7 @@ fn load_running_info_locked(name: &str, lock: &MetadataLock) -> Result<Option<Se
 
 /// List all known servers (both running and stopped).
 ///
-/// Scans `.dctl/servers/*.json` for metadata. Each metadata file is one
+/// Scans the bucket's `servers/*.json` for metadata. Each metadata file is one
 /// entry — for ClickHouse the disk id is the user-facing name; for Postgres
 /// it's `<name>-pg<major>`. Also runs process/container discovery so
 /// orphaned instances reappear.
@@ -757,7 +959,7 @@ pub fn now_timestamp() -> String {
 }
 
 /// Recover orphaned engine containers for the current project via Docker
-/// labels: a container whose `.dctl/servers/<key>.json` metadata file is
+/// labels: a container whose bucket `<key>.json` metadata file is
 /// missing gets one written, so the instance shows up in `server list` and
 /// can be stopped/removed normally.
 ///
@@ -1131,5 +1333,162 @@ mod tests {
         let final_info = load_info_locked("default", &lock).unwrap().unwrap();
         assert_eq!(final_info.pid, std::process::id());
         assert_eq!(final_info.version, "restarted");
+    }
+}
+
+#[cfg(test)]
+mod state_bucket_tests {
+    use super::*;
+
+    #[test]
+    fn bucket_id_is_stable_and_separates_projects() {
+        let a = bucket_id_for("/repos/alpha");
+        let a_again = bucket_id_for("/repos/alpha");
+        let b = bucket_id_for("/repos/beta");
+        assert_eq!(a, a_again, "same canonical cwd must map to one bucket");
+        assert_ne!(a, b);
+        assert_eq!(a.len(), 16, "id is the first 16 hex chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "id must be hex: {a}"
+        );
+    }
+
+    #[test]
+    fn rename_migration_moves_state_but_not_the_lock() {
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        std::fs::create_dir_all(legacy.join("default-pg18/data")).unwrap();
+        std::fs::write(legacy.join("default-pg18.json"), b"{}").unwrap();
+        std::fs::write(legacy.join(METADATA_LOCK_FILE), b"stale").unwrap();
+
+        migrate_state_at(&legacy, &target, MoveMode::Rename).unwrap();
+
+        assert!(target.join("default-pg18/data").is_dir());
+        assert!(target.join("default-pg18.json").is_file());
+        assert!(
+            !target.join(METADATA_LOCK_FILE).exists(),
+            "the stateless lock file never moves"
+        );
+        assert!(
+            !legacy.join("default-pg18").exists(),
+            "the moved entry left the legacy directory"
+        );
+    }
+
+    #[test]
+    fn copy_migration_copies_stopped_state_and_removes_source() {
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        // Stopped state: metadata exists but carries no container id, so the
+        // live-container guard passes without a Docker daemon.
+        std::fs::create_dir_all(legacy.join("default-pg18/data")).unwrap();
+        std::fs::write(legacy.join("default-pg18/data/PG_VERSION"), b"18").unwrap();
+        std::fs::write(
+            legacy.join("default-pg18.json"),
+            serde_json::to_vec(&ServerInfo {
+                name: "default-pg18".into(),
+                pid: 0,
+                version: "postgres:18".into(),
+                http_port: 0,
+                tcp_port: 5432,
+                started_at: "test".into(),
+                cwd: "/work".into(),
+                engine: Engine::Postgres,
+                container_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        migrate_state_at(&legacy, &target, MoveMode::Copy).unwrap();
+
+        assert_eq!(
+            std::fs::read(target.join("default-pg18/data/PG_VERSION")).unwrap(),
+            b"18"
+        );
+        assert!(
+            !legacy.join("default-pg18").exists(),
+            "copy mode removes the source so the move is not a fork"
+        );
+    }
+
+    #[test]
+    fn copy_migration_refuses_container_backed_state_without_docker() {
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(
+            legacy.join("default-pg18.json"),
+            serde_json::to_vec(&ServerInfo {
+                name: "default-pg18".into(),
+                pid: 0,
+                version: "postgres:18".into(),
+                http_port: 0,
+                tcp_port: 5432,
+                started_at: "test".into(),
+                cwd: "/work".into(),
+                engine: Engine::Postgres,
+                container_id: Some("live-container".into()),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = migrate_state_at(&legacy, &target, MoveMode::Copy).unwrap_err();
+        assert!(
+            matches!(error, Error::StateMigration(_)),
+            "container-backed state without a reachable daemon must refuse: {error}"
+        );
+        assert!(
+            legacy.join("default-pg18.json").is_file(),
+            "a refused migration leaves the legacy state untouched"
+        );
+    }
+
+    #[test]
+    fn copy_migration_refuses_unreadable_metadata() {
+        let legacy_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let legacy = legacy_root.path().join("servers");
+        let target = target_root.path().join("servers");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("broken.json"), b"not json").unwrap();
+
+        let error = migrate_state_at(&legacy, &target, MoveMode::Copy).unwrap_err();
+        assert!(matches!(error, Error::StateMigration(_)));
+    }
+
+    #[test]
+    fn shell_cleanup_removes_emptied_legacy_skeleton() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy_servers = project.path().join(".dctl/servers");
+        std::fs::create_dir_all(&legacy_servers).unwrap();
+        std::fs::write(legacy_servers.join(METADATA_LOCK_FILE), b"").unwrap();
+        std::fs::write(project.path().join(".dctl/.gitignore"), "*\n").unwrap();
+
+        cleanup_legacy_shell(&legacy_servers).unwrap();
+
+        assert!(!project.path().join(".dctl").exists());
+    }
+
+    #[test]
+    fn shell_cleanup_keeps_user_content() {
+        let project = tempfile::tempdir().unwrap();
+        let legacy_servers = project.path().join(".dctl/servers");
+        std::fs::create_dir_all(&legacy_servers).unwrap();
+        std::fs::write(legacy_servers.join(METADATA_LOCK_FILE), b"").unwrap();
+        // A leftover user file must block removal of both shells.
+        std::fs::write(project.path().join(".dctl/notes.txt"), "mine").unwrap();
+
+        cleanup_legacy_shell(&legacy_servers).unwrap();
+
+        assert!(project.path().join(".dctl/notes.txt").is_file());
     }
 }

@@ -172,8 +172,9 @@ pub enum LocalCommands {
     /// Initialize a project directory for ClickHouse, Postgres and FalkorDB
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  `.dctl/` holds runtime data and is git-ignored; the `clickhouse/`, `postgres/` and
-  `falkordb/` scaffolds are meant to be committed.
+  Runtime state lives in the dctl app-data dir (~/.dctl/projects/), never under the
+  working directory; the `clickhouse/`, `postgres/` and `falkordb/` scaffolds are
+  meant to be committed.
   Idempotent — re-running only creates what is missing.
   Next: `dctl local server start`")]
     Init,
