@@ -48,3 +48,9 @@
 - 根因:resolve_port 的 TcpListener 探测对 iptables-NAT 发布口失明(宿主无 listener),NAT 模式机自动选口在 create 阶段才炸。修:docker::published_host_ports(list all 容器取 public_port),三引擎 resolve_port 注入化(_with 薄壳),explicit 口本地已占走零 daemon 快径。
 - 测试:三引擎注入式单测、fk browser 排除、fake docker published_ports 注入(start 断言 5432 被跳选 5433);「无效输入零 Docker 请求」语义由惰性快径保住(初版无条件拉 published 被该测试抓住)。
 - 顺批:集成脚本 run_case 每 case 隔离 HOME(孤儿桶不再落真实 HOME);ADR-0012 refusal 措辞对齐 G3;REQ-007/009/010/011 四枚状态滞后回填(009 注明 FK/CH 腿未立的边界)。
+
+## 封版批复验补记(v0.7.0)
+
+- lan-linux2 双端全量各 343/0;集成套件清场后 13/15:two_concurrent_servers 由败转绿(c1/c2 并发自动选口实测成立,REQ-0015 生效实证;先前 12/15 那轮混入诊断残留容器污染)。
+- stop_all_engine_scopes 与 non_tty_query 仍败,归因环境:该 daemon 发布口对宿主 loopback 不可达(TCP 127.0.0.1:5432 实测 Connection refused;无 userland-proxy 且 NAT 不覆盖 lo)。CH readiness(宿主 HTTP)与 pg client(宿主 TCP)走 loopback 故必败;pg start 的 readiness 走 docker exec 容器内探所以 pg case 能过。修法在 daemon 配置侧(开 userland-proxy 或 hairpin),非 dctl 侧缺陷;旧机 lan-linux(proxy 模式)历史全绿自洽。
+- 评审快核回执 F1+G1-G4:F1(REQ-0015 文件与索引状态不同步、trace 自称待跑)已清(两份同步 implemented + 双端结果回填);G1(REQ-009 题面宽)采纳:标题与索引改「PG 先行批,FK/CH 腿拆后续 REQ」;G2 采纳:CHANGELOG 未发布节转 v0.7.0(2026-10-02)补两条里程碑;G3 采纳:集成测试 port==5433 钉死改结构断言(!=5432 且 5433..=5532);G4 不动:真调薄壳的旧测试(动态口、连接失败退化空集确定)副作用可接受,不注入 connector。

@@ -14,8 +14,8 @@
 | REQ-008 | implemented | should | Postgres 与 FalkorDB 原生客户端集成(全引擎宿主免装客户端) | native-clients 批;ADR-0009 |
 | REQ-010 | implemented | should | 镜像拉取默认走私仓并可指定自定义仓库 | 私仓优先拉取链 e17a645;ADR-0010 |
 | REQ-011 | implemented | must | 去掉 local 命令前缀层,默认即本地操作 | 39f6573 引擎命令免前缀 |
-| REQ-009 | implemented | should | 三引擎免密密钥身份认证(客户端证书 mTLS) | PG 先行批 f7ffced;FK/CH 腿后续批未立 |
+| REQ-009 | implemented | should | 免密密钥身份认证:PG 先行批(客户端证书 mTLS) | PG 腿 f7ffced;FK/CH 腿拆后续 REQ 另立 |
 | REQ-012 | implemented | must | clickhouse start 增 --bind 旗标,端口可发布到非 loopback 面 | --bind 批 f7a39d2;NSM 部署真机验收 |
 | REQ-013 | implemented | should | skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项 | 剪枝批 4e6834f;实机冒烟收敛两项 |
 | REQ-0014 | implemented | must | 项目作用域状态目录迁入 ~/.dctl 应用数据目录(不随 cwd 漂移) | 三笔 5519267/dceddd0/640c1ac;ADR-0012;评审两轮 CONFIRM |
-| REQ-0015 | draft | must | 端口选择感知 Docker 已发布口(NAT 模式探测失明修复) | 本批实现中;lan-linux2 集成三败归因此缺陷 |
+| REQ-0015 | implemented | must | 端口选择感知 Docker 已发布口(NAT 模式探测失明修复) | 8db8b66;双端 343/0,lan-linux2 two_concurrent 转绿,余两败归因 daemon loopback 环境限制 |

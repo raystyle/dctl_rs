@@ -1,7 +1,9 @@
 # Changelog
 
-## 未发布
+## v0.7.0(2026-10-02)
 
+- **项目状态入应用数据目录(ADR-0012,REQ-0014)**:项目作用域服务器状态迁至 `~/.dctl/projects/<id>/servers/`(id 由仓根目录派生),运行 cwd 零运行态落点;旧 `cwd/.dctl/servers/` 首次运行自动迁移(fail-closed:跨设备且有运行中实例或 Docker 不可达即拒绝并给 docker stop 指引);`dctl init` 收敛为纯脚手架。
+- **端口选择感知 Docker 已发布口(REQ-0015)**:三引擎自动选口在纯 iptables NAT 模式机不再与已发布口相撞(daemon 发布列表参与判定;显式口本地已占仍零 daemon 往返)。
 - **遥测退役(REQ-002,ADR-0003)**:telemetry.rs、failure.rs 与 telemetry 命令族整体删除(约 4300 行);无采集、无上报、`DCTL_TELEMETRY_URL`/`DO_NOT_TRACK` 环境变量随之消失。退出码契约:0 成功、1 错误、2 usage、子进程码经 ChildExit 透传。
 - **ledger 权限收口(REQ-006,总台统一裁)**:`dctl ledger` 移除 `issue close`、`artifact promote` 与 attest 的 `promote/demote/supersede` 类别:本 CLI 只增 issue 与产物及验证类 attest;关闭与删除唯一道走 omc 工位(`omc ledger issue status <repo> <n> <to>` / `omc ledger issue delete`)。自研签名道退役,改为共享 ledger-client crate(v0.1.1)。
 

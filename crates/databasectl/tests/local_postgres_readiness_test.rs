@@ -648,7 +648,12 @@ fn start_steers_around_daemon_published_ports() {
         String::from_utf8_lossy(&output.stderr)
     );
     let body: serde_json::Value = serde_json::from_slice(&output.stdout).expect("start JSON");
-    assert_eq!(body["port"], 5433, "daemon-published 5432 must be skipped");
+    let picked = body["port"].as_u64().expect("port number");
+    assert_ne!(picked, 5432, "daemon-published 5432 must be skipped");
+    assert!(
+        (5433..=5532).contains(&picked),
+        "next candidate in range: {picked}"
+    );
     drop(docker);
 }
 
