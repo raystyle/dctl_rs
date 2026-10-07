@@ -573,6 +573,17 @@ async fn rollback_failed_fresh_start(
                 metadata_display(&metadata_path, &info.name)
             )),
         }
+    } else if container_removed {
+        // The container is gone but the data directory pre-existed this
+        // attempt and is retained: do not write back metadata pointing at
+        // the deleted container — that would dead-end the next `start`
+        // (whose guided exit, `remove`, would delete this data). With no
+        // metadata the next start fresh-creates and reuses the directory.
+        diagnostics.push(
+            "no recovery metadata written; the next start re-creates the container \
+             and reuses the retained data"
+                .to_string(),
+        );
     } else {
         match server::save_server_info_locked(info, metadata_lock) {
             Ok(()) => diagnostics.push(format!(
@@ -694,8 +705,28 @@ async fn resume_existing(
 
     docker::start_existing(docker, &container_id).await?;
 
+    // Refresh the host port from the container's own bindings: a recovered
+    // instance (or one whose metadata predates a port change) can carry 0 or
+    // a stale value, and every later client/dotenv call trusts it (clickhouse
+    // and falkordb resume the same way).
+    let inspected = docker::inspect_container(docker, &container_id)
+        .await
+        .ok()
+        .flatten();
+    // A HostPort of "0" means "not bound here"; keep the prior value rather
+    // than probing an invalid port.
+    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), "5432/tcp")
+        .filter(|port| *port != 0)
+        .unwrap_or(prior.tcp_port);
+    if tcp_port == 0 {
+        return Err(Error::Postgres(format!(
+            "cannot determine the TCP port of container '{container_id}'; \
+             run `dctl local postgres remove {display_name}` and start fresh"
+        )));
+    }
     let info = ServerInfo {
         started_at: server::now_timestamp(),
+        tcp_port,
         ..prior
     };
     if let Err(primary) = server::save_server_info_locked(&info, &metadata_lock) {
@@ -1111,7 +1142,16 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
     }
 
     if let Some(cid) = target.container_id.as_deref() {
-        let _ = docker::stop_and_remove_blocking(cid);
+        // Fail closed: deleting the data directory while the container still
+        // exists would leave a container bind-mounting a deleted path, and
+        // reporting success on top of that misleads. The metadata and data
+        // stay intact, so the remove is retryable once Docker cooperates.
+        docker::stop_and_remove_blocking(cid).map_err(|error| {
+            Error::DockerError(format!(
+                "could not remove container '{cid}'; nothing was deleted — \
+                 retry `dctl local postgres remove {name}` once Docker is reachable: {error}"
+            ))
+        })?;
     }
 
     // Postgres data dir lives at <bucket>/servers/<key>/data/. Remove the

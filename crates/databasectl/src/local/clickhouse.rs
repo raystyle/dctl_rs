@@ -330,7 +330,10 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         // Fresh create.
         let http_port = match explicit_http_port {
             Some(port) => port,
-            None => resolve_port(None, PortKind::Http, bind_face)?,
+            None => match explicit_native_port {
+                Some(native) => resolve_http_port_excluding(native, bind_face)?,
+                None => resolve_port(None, PortKind::Http, bind_face)?,
+            },
         };
         let native_port = match explicit_native_port {
             Some(port) => port,
@@ -527,6 +530,17 @@ async fn rollback_failed_fresh_start(
             Ok(()) => return primary,
             Err(error) => diagnostics.push(format!("failed to remove metadata: {error}")),
         }
+    } else if container_removed {
+        // The container is gone but the data directory pre-existed this
+        // attempt and is retained: do not write back metadata pointing at
+        // the deleted container — that would dead-end the next `start`
+        // (whose guided exit, `remove`, would delete this data). With no
+        // metadata the next start fresh-creates and reuses the directory.
+        diagnostics.push(
+            "no recovery metadata written; the next start re-creates the container \
+             and reuses the retained data"
+                .to_string(),
+        );
     } else {
         match server::save_server_info_locked(info, metadata_lock) {
             Ok(()) => diagnostics.push(format!(
@@ -1021,6 +1035,26 @@ fn resolve_native_port_excluding(
     Err(Error::PortUnavailable(PortKind::Clickhouse))
 }
 
+/// Mirror of [`resolve_native_port_excluding`]: the auto-picked HTTP port
+/// must steer around an explicitly requested native port, or the two would
+/// collide only at Docker bind time after a full pull/create cycle.
+fn resolve_http_port_excluding(
+    native_port: u16,
+    bind_face: Option<std::net::IpAddr>,
+) -> Result<u16> {
+    let published = crate::local::docker::published_host_ports_blocking();
+    let picked = resolve_port_with(None, PortKind::Http, bind_face, &published)?;
+    if picked != native_port {
+        return Ok(picked);
+    }
+    for p in (DEFAULT_CH_HTTP_PORT + 1)..=(DEFAULT_CH_HTTP_PORT + 101) {
+        if p != native_port && port_free_with(p, bind_face, &published) {
+            return Ok(p);
+        }
+    }
+    Err(Error::PortUnavailable(PortKind::Http))
+}
+
 fn generate_password() -> String {
     Alphanumeric.sample_string(&mut rand::rng(), 24)
 }
@@ -1269,8 +1303,11 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
             let legacy = legacy_ch_info_locked(name, &metadata_lock)?
                 .ok_or_else(|| Error::ServerNotFound(name.to_string()))?;
             let legacy_dir = server::servers_dir_join(&legacy.name)?;
-            server::try_remove_server_info_locked(&legacy.name, &metadata_lock)?;
+            // Directory first, metadata second — the main path below uses the
+            // same order so a failure leaves a retryable state (metadata still
+            // points at the leftover directory) instead of an unreachable one.
             docker::remove_host_dir_blocking(&legacy_dir)?;
+            server::try_remove_server_info_locked(&legacy.name, &metadata_lock)?;
             if !json {
                 println!(
                     "Note: removed binary-era metadata for '{}' (no container); \
@@ -1297,7 +1334,16 @@ pub(crate) fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()
     }
 
     if let Some(cid) = target.container_id.as_deref() {
-        let _ = docker::stop_and_remove_blocking(cid);
+        // Fail closed: deleting the data directory while the container still
+        // exists would leave a container bind-mounting a deleted path, and
+        // reporting success on top of that misleads. The metadata and data
+        // stay intact, so the remove is retryable once Docker cooperates.
+        docker::stop_and_remove_blocking(cid).map_err(|error| {
+            Error::DockerError(format!(
+                "could not remove container '{cid}'; nothing was deleted — \
+                 retry `dctl local server remove {name}` once Docker is reachable: {error}"
+            ))
+        })?;
     }
 
     let ch_dir = server::servers_dir_join(&key)?;

@@ -392,7 +392,10 @@ async fn start(
         // Fresh create.
         let host_port = match explicit_host_port {
             Some(port) => port,
-            None => resolve_port(None, PortKind::Falkordb)?,
+            None => match explicit_browser_port {
+                Some(browser) => resolve_host_port_excluding(browser)?,
+                None => resolve_port(None, PortKind::Falkordb)?,
+            },
         };
         let browser_port = match explicit_browser_port {
             Some(port) => port,
@@ -596,6 +599,17 @@ async fn rollback_failed_fresh_start(
                 metadata_display(&metadata_path, &info.name)
             )),
         }
+    } else if container_removed {
+        // The container is gone but the data directory pre-existed this
+        // attempt and is retained: do not write back metadata pointing at
+        // the deleted container — that would dead-end the next `start`
+        // (whose guided exit, `remove`, would delete this data). With no
+        // metadata the next start fresh-creates and reuses the directory.
+        diagnostics.push(
+            "no recovery metadata written; the next start re-creates the container \
+             and reuses the retained data"
+                .to_string(),
+        );
     } else {
         match server::save_server_info_locked(info, metadata_lock) {
             Ok(()) => diagnostics.push(format!(
@@ -1040,7 +1054,7 @@ fn resolve_port(explicit: Option<u16>, kind: PortKind) -> Result<u16> {
 /// a candidate needs a free socket AND no container publishing it.
 fn resolve_port_with(explicit: Option<u16>, kind: PortKind, published: &[u16]) -> Result<u16> {
     let default_port = match kind {
-        PortKind::Http => DEFAULT_FK_BROWSER_PORT,
+        PortKind::FalkordbBrowser => DEFAULT_FK_BROWSER_PORT,
         _ => DEFAULT_FK_PORT,
     };
     let free = |port: u16| {
@@ -1089,6 +1103,26 @@ fn resolve_browser_port_excluding(host_port: u16) -> Result<u16> {
         }
     }
     Err(Error::PortUnavailable(PortKind::FalkordbBrowser))
+}
+
+/// Mirror of [`resolve_browser_port_excluding`]: the auto-picked protocol
+/// port must steer around an explicitly requested Browser port, or the two
+/// would collide only at Docker bind time after a full pull/create cycle.
+fn resolve_host_port_excluding(browser_port: u16) -> Result<u16> {
+    let published = crate::local::docker::published_host_ports_blocking();
+    let picked = resolve_port_with(None, PortKind::Falkordb, &published)?;
+    if picked != browser_port {
+        return Ok(picked);
+    }
+    for p in (DEFAULT_FK_PORT + 1)..=(DEFAULT_FK_PORT + 101) {
+        if p != browser_port
+            && !published.contains(&p)
+            && std::net::TcpListener::bind(("127.0.0.1", p)).is_ok()
+        {
+            return Ok(p);
+        }
+    }
+    Err(Error::PortUnavailable(PortKind::Falkordb))
 }
 
 fn generate_password() -> String {
@@ -1188,7 +1222,16 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
     }
 
     if let Some(cid) = target.container_id.as_deref() {
-        let _ = docker::stop_and_remove_blocking(cid);
+        // Fail closed: deleting the data directory while the container still
+        // exists would leave a container bind-mounting a deleted path, and
+        // reporting success on top of that misleads. The metadata and data
+        // stay intact, so the remove is retryable once Docker cooperates.
+        docker::stop_and_remove_blocking(cid).map_err(|error| {
+            Error::DockerError(format!(
+                "could not remove container '{cid}'; nothing was deleted — \
+                 retry `dctl local falkordb remove {name}` once Docker is reachable: {error}"
+            ))
+        })?;
     }
 
     // FalkorDB data dir lives at <bucket>/servers/<key>/data/. Remove the
@@ -1246,10 +1289,11 @@ async fn client(
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let password = read_fk_password(&docker, container_id).await;
 
-    let interactive = query.is_none()
-        && extra_args.is_empty()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal();
+    // Same shape as the Postgres client: `--`-passthrough arguments reach
+    // redis-cli only in interactive mode, so their presence must not force
+    // the native branch (which would blind-read stdin on a TTY and drop them).
+    let interactive =
+        query.is_none() && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     if interactive {
         // The redis-cli REPL cannot be rebuilt from a library: interactive
         // mode keeps the container's redis-cli over docker exec (ADR-0009),
@@ -1417,9 +1461,16 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     } else {
         format!("http://127.0.0.1:{}", info.http_port)
     };
+    // Same policy for the protocol port: an empty value says "unknown"
+    // more honestly than 0, which a consumer would try to dial.
+    let tcp_port = if info.tcp_port == 0 {
+        String::new()
+    } else {
+        info.tcp_port.to_string()
+    };
     let vars: Vec<(&str, String)> = vec![
         ("FALKORDB_HOST", "127.0.0.1".to_string()),
-        ("FALKORDB_PORT", info.tcp_port.to_string()),
+        ("FALKORDB_PORT", tcp_port),
         ("FALKORDB_PASSWORD", password),
         ("FALKORDB_BROWSER_URL", browser_url),
     ];
@@ -1501,6 +1552,15 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn browser_port_auto_pick_defaults_to_3000() {
+        // The auto-picked Browser port must come from the FalkordbBrowser arm
+        // (3000), not the Redis protocol default (6379): the docs promise
+        // "3000 if free" for an omitted --browser-port.
+        let picked = resolve_port_with(None, PortKind::FalkordbBrowser, &[]).unwrap();
+        assert_eq!(picked, DEFAULT_FK_BROWSER_PORT);
     }
 
     struct FakeReadinessProbe {
@@ -1696,9 +1756,6 @@ mod tests {
         assert_eq!(tag_from_stored_version("falkordb:latest"), "latest");
         assert_eq!(tag_from_stored_version("falkordb:v4.20.6"), "4.20.6");
     }
-
-    #[test]
-    fn user_names_strip_the_fk_suffix() {}
 
     #[test]
     fn instance_keys_and_metadata_names_agree() {

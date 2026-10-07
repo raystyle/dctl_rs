@@ -1492,13 +1492,16 @@ pub async fn start_existing(docker: &Docker, id: &str) -> Result<()> {
         .map_err(|e| Error::DockerError(e.to_string()))
 }
 
-/// Host ports that any container (running or stopped) has published. A
-/// pure-iptables NAT daemon (userland-proxy off) publishes ports without a
-/// host listener, so socket probing alone cannot see them and an
-/// auto-selected port collides at container-create time. Port pickers feed
-/// this list into their "free" judgment. Unreachable Docker yields an empty
-/// set: the picker then degrades to socket probing alone, and the start's
-/// own Docker step surfaces the outage.
+/// Host ports that any **running** container has published. The list API
+/// omits `Ports` for stopped containers (moby clears the field on stop), so
+/// ports a stopped container still declares are an accepted residual gap:
+/// they resurface as a bind conflict only if that container is later
+/// resumed. A pure-iptables NAT daemon (userland-proxy off) publishes
+/// ports without a host listener, so socket probing alone cannot see them
+/// and an auto-selected port collides at container-create time. Port
+/// pickers feed this list into their "free" judgment. Unreachable Docker
+/// yields an empty set: the picker then degrades to socket probing alone,
+/// and the start's own Docker step surfaces the outage.
 pub async fn published_host_ports(docker: &Docker) -> Vec<u16> {
     use bollard::query_parameters::ListContainersOptionsBuilder;
 
