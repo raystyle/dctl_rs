@@ -7,22 +7,16 @@ pub fn canonical_project_dir() -> Result<PathBuf> {
     Ok(std::env::current_dir()?.canonicalize()?)
 }
 
-pub fn project_dir() -> PathBuf {
-    std::env::current_dir()
-        .expect("failed to get current directory")
-        .join("clickhouse")
+pub fn project_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("clickhouse"))
 }
 
-pub fn postgres_project_dir() -> PathBuf {
-    std::env::current_dir()
-        .expect("failed to get current directory")
-        .join("postgres")
+pub fn postgres_project_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("postgres"))
 }
 
-pub fn falkordb_project_dir() -> PathBuf {
-    std::env::current_dir()
-        .expect("failed to get current directory")
-        .join("falkordb")
+pub fn falkordb_project_dir() -> Result<PathBuf> {
+    Ok(std::env::current_dir()?.join("falkordb"))
 }
 
 /// Which project-local paths `init()` created during this invocation. The
@@ -40,15 +34,15 @@ pub struct InitResult {
 /// directory beyond the scaffolds themselves.
 pub fn init() -> Result<InitResult> {
     let clickhouse_scaffold_created = create_project_scaffold(
-        project_dir(),
+        project_dir()?,
         &["tables", "materialized_views", "queries", "seed"],
     )?;
     let postgres_scaffold_created = create_project_scaffold(
-        postgres_project_dir(),
+        postgres_project_dir()?,
         &["tables", "views", "functions", "queries", "seed"],
     )?;
     let falkordb_scaffold_created =
-        create_project_scaffold(falkordb_project_dir(), &["queries", "seed"])?;
+        create_project_scaffold(falkordb_project_dir()?, &["queries", "seed"])?;
 
     Ok(InitResult {
         clickhouse_scaffold_created,
@@ -61,11 +55,20 @@ fn create_project_scaffold(dir: PathBuf, subdirs: &[&str]) -> Result<bool> {
     let mut created = false;
     for subdir in subdirs {
         let path = dir.join(subdir);
-        if !path.exists() {
-            std::fs::create_dir_all(&path)?;
-            std::fs::write(path.join(".gitkeep"), "")?;
-            created = true;
+        if path.is_dir() {
+            continue;
         }
+        // A non-directory where the scaffold belongs would silently skip
+        // the scaffold and still report success; say so instead.
+        if path.exists() {
+            return Err(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} exists but is not a directory", path.display()),
+            )));
+        }
+        std::fs::create_dir_all(&path)?;
+        std::fs::write(path.join(".gitkeep"), "")?;
+        created = true;
     }
 
     Ok(created)

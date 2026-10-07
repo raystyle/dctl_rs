@@ -57,6 +57,11 @@ const AGENT_SKILLS_REPO: &str = "https://github.com/ClickHouse/agent-skills";
 const AGENT_SKILLS_ARCHIVE_URL: &str =
     "https://codeload.github.com/ClickHouse/agent-skills/tar.gz/refs/heads/main";
 const UNIVERSAL_AGENT_KEY: &str = "agents";
+/// Ownership marker planted in every skill directory dctl installs. The
+/// prune pass deletes by upstream name; without the marker it cannot tell a
+/// dctl-installed directory from a user's hand-made skill that happens to
+/// share the name, and deleting the latter is data loss.
+const INSTALLED_MARKER: &str = ".dctl-installed";
 const UNIVERSAL_COVERAGE: &[&str] = &["Amp", "Cline", "Codex", "Cursor", "OpenCode"];
 
 /// The upstream archive carries skills aimed at other CLIs, cloud services,
@@ -314,7 +319,16 @@ fn create_temp_artifact(prefix: &str, suffix: &str, is_dir: bool) -> Result<Temp
 }
 
 async fn download_agent_skills_archive() -> Result<TempArtifact> {
-    let response = reqwest::get(AGENT_SKILLS_ARCHIVE_URL).await?;
+    // The one outbound HTTP here must go through the shared client_builder
+    // (uniform User-Agent and agent headers — the http.rs module contract)
+    // and carry an explicit timeout: the default client has none, so a
+    // stalled peer would hang `dctl skills` forever.
+    let response = crate::http::client_builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()?
+        .get(AGENT_SKILLS_ARCHIVE_URL)
+        .send()
+        .await?;
     if !response.status().is_success() {
         return Err(Error::Skills(format!(
             "Failed to download {}: HTTP {}",
@@ -424,8 +438,10 @@ fn upstream_skill_slugs(extracted_root: &Path) -> Result<Vec<String>> {
 }
 
 /// Remove skill directories that came from the upstream archive but are not
-/// in the retained set. Directories not present in the archive (the user's
-/// own skills) are left alone.
+/// in the retained set. Only directories carrying the dctl ownership marker
+/// are eligible: a name match alone would also delete a user's hand-made
+/// skill that happens to share an upstream slug. Directories not present in
+/// the archive are left alone either way.
 fn prune_non_retained_upstream_skills(
     install_root: &Path,
     upstream_slugs: &[String],
@@ -442,7 +458,10 @@ fn prune_non_retained_upstream_skills(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if upstream_slugs.iter().any(|slug| slug == &name) && !is_retained_skill(&name) {
+        if upstream_slugs.iter().any(|slug| slug == &name)
+            && !is_retained_skill(&name)
+            && entry.path().join(INSTALLED_MARKER).is_file()
+        {
             fs::remove_dir_all(entry.path())?;
             pruned += 1;
         }
@@ -749,6 +768,19 @@ fn install_into_agent(
         }
     }
 
+    // Plant the dctl ownership marker in every upstream skill directory this
+    // run touched, so the prune pass can tell them apart from a user's
+    // hand-made skill that shares the name.
+    let install_root = root.join(agent.install_dir);
+    let mut installed_dirs: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    for file in skill_files {
+        installed_dirs.insert(install_root.join(&file.skill_slug));
+    }
+    for dir in installed_dirs {
+        std::fs::write(dir.join(INSTALLED_MARKER), "")?;
+    }
+
     Ok(summary)
 }
 
@@ -915,10 +947,13 @@ impl TerminalUi {
             return Err(io::Error::last_os_error().into());
         }
 
-        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
-        stdout.flush()?;
+        // The terminal is raw from this line on; the guard (whose Drop
+        // restores the original settings) must exist before any fallible
+        // IO, or an early `?` would leak raw mode — no echo, Ctrl-C dead.
+        let this = Self { fd, original, json };
+        write!(stdout, "\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H").and_then(|()| stdout.flush())?;
 
-        Ok(Self { fd, original, json })
+        Ok(this)
     }
 }
 
@@ -1245,15 +1280,23 @@ mod tests {
     }
 
     #[test]
-    fn prune_removes_upstream_non_retained_but_keeps_user_skills() {
+    fn prune_removes_marked_upstream_non_retained_but_keeps_user_skills() {
         let install_root = tempfile::tempdir().unwrap();
         write_skill(install_root.path(), "clickhouse-best-practices", "retained");
         write_skill(install_root.path(), "chdb-sql", "stale upstream");
         write_skill(install_root.path(), "my-own-skill", "user skill");
+        // A user's hand-made skill that shares an upstream slug but was
+        // never installed by dctl (no ownership marker): must survive.
+        write_skill(install_root.path(), "user-copied-slug", "user copy");
+
+        for slug in ["clickhouse-best-practices", "chdb-sql"] {
+            std::fs::write(install_root.path().join(slug).join(INSTALLED_MARKER), "").unwrap();
+        }
 
         let upstream = vec![
             "chdb-sql".to_string(),
             "clickhouse-best-practices".to_string(),
+            "user-copied-slug".to_string(),
         ];
         let pruned = prune_non_retained_upstream_skills(install_root.path(), &upstream).unwrap();
 
@@ -1265,6 +1308,7 @@ mod tests {
                 .is_dir()
         );
         assert!(install_root.path().join("my-own-skill").is_dir());
+        assert!(install_root.path().join("user-copied-slug").is_dir());
         assert!(!install_root.path().join("chdb-sql").exists());
     }
 

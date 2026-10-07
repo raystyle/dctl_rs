@@ -17,6 +17,13 @@ use error::{Error, Result};
 
 #[tokio::main]
 async fn main() {
+    // Restore the default SIGPIPE disposition: the Rust runtime ignores it,
+    // so any write to a closed pipe (`dctl local server list | head`) would
+    // panic with "failed printing to stdout" and exit 101. Standard CLI
+    // behavior is to die quietly of SIGPIPE, like every other filter.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     // rustls: multiple crypto providers come in from different dependency
     // paths (reqwest pulls ring, tokio-postgres-rustls pulls aws-lc-rs);
     // pin the process default so TLS never panics at connect time.

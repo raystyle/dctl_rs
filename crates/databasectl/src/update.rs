@@ -240,6 +240,9 @@ pub async fn perform_update(json: bool) -> Result<UpdateResult> {
     // Write to a temporary file next to the binary, then atomic-rename
     let tmp_path = actual_path.with_extension("tmp-update");
     fs::write(&tmp_path, &binary_bytes).map_err(|e| {
+        // Same cleanup contract as the two arms below: a failed write may
+        // leave a partial file next to the binary.
+        let _ = fs::remove_file(&tmp_path);
         Error::Download(format!(
             "Failed to write update to {}: {}. Check file permissions.",
             tmp_path.display(),
