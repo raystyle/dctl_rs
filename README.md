@@ -141,7 +141,7 @@ $ dctl postgres stop [NAME]
 
 Postgres 实例默认以证书面起(ADR-0011):dctl 本地 CA(`~/.dctl/ca/`)给容器签服务器证书、给 `client`/`dotenv` 出客户端证书,`--auth password` 显式回落口令面。证书面的 `dotenv` 写 `PGSSLMODE=verify-full` 与三个证书路径,不再写口令;旧实例 resume 保持其原有认证面。
 
-停止保留容器以便恢复;remove 删除容器。生成的密码由 start 打印一次,之后经 `dotenv` 重读。
+停止保留容器以便恢复;remove 删除容器。口令面的生成密码由 start 打印一次,之后经 `dotenv` 重读;证书面连接零口令。
 
 ### FalkorDB 图数据库与 Docker
 

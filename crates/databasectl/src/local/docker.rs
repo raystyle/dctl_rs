@@ -601,18 +601,25 @@ pub async fn upload_postgres_tls_material(
     let opts = UploadToContainerOptionsBuilder::default()
         .path("/var/lib/postgresql")
         .build();
-    docker
+    match docker
         .upload_to_container(
             container_id,
             Some(opts),
             bollard::body_full(bytes::Bytes::from(tar_bytes)),
         )
         .await
-        .map_err(|e| {
-            Error::DockerError(format!(
-                "could not upload TLS material into container '{container_id}': {e}"
-            ))
-        })
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Human-visible diagnostic; the machine envelope carries only
+            // the self-composed sentence (daemon text stays out of parity).
+            eprintln!("TLS material upload failed: {error}");
+            Err(Error::PostgresUsage(format!(
+                "could not upload the TLS material into container '{container_id}'; \
+                 nothing was started and the next start clears the leftover container"
+            )))
+        }
+    }
 }
 
 /// If a container with one of our managed names (`dctl-pg-<name>-<major>` or

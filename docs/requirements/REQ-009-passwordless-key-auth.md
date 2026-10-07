@@ -3,7 +3,7 @@ id: REQ-009
 title: 免密密钥身份认证:PG 先行批(客户端证书 mTLS;FK/CH 腿拆后续 REQ)
 status: draft
 priority: should
-trace: 客户端基建落地(f7ffced:本地 CA + 客户端证书签发 + PG client Prefer 先试);服务端腿未接——容器 ssl=on/pg_hba cert/`--auth password` 旋钮/dotenv 证书道均不在码,用户可见行为仍为口令道(ADR-0011 追注 2026-10-08,健康评审修正)。服务端腿另立 REQ 时从本 REQ 迁出判据清单。
+trace: PG 腿全落地(客户端基建 f7ffced + 服务端面 REQ-0016,lan-linux2 实弹 11/11,ADR-0011 两则追注);FK/CH 腿未做,draft 状态由其撑着。
 ---
 
 # 三引擎免密密钥身份认证

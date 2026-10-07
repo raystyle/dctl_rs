@@ -780,7 +780,8 @@ CONTEXT FOR AGENTS:
   An existing stopped instance for the same (name, major) is resumed with its stored settings, so
   --port/--user/--password/--database/-e/--auth are ignored on a resume.
   Without --version, an existing instance selects the major; two majors under one name error.
-  The generated password is printed once by start — re-read connection details later with
+  Fresh starts default to the certificate face (ADR-0011): no usable TCP password. The printed
+  password matters only on --auth password instances; connection details come from
   `postgres dotenv` or `postgres client`.
   A failed fresh start rolls back the container and data it created; pre-existing data is kept.")]
     Start {
@@ -907,13 +908,13 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Managed mode (the default; NAME selects one) connects with dctl's native Postgres client
-  over the container's published port; the stored credentials authenticate; no psql needed.
+  over the published port: certificate instances authenticate with the ~/.dctl/ca/ material
+  (no password), --auth password instances use the stored password.
   Direct mode (--host/--port) connects to any Postgres as user/database \"postgres\" with no
-  password (ADR-0009).
-  --query takes SQL (multi-statement fine), --queries-file or piped stdin likewise;
-  results render as aligned psql-style tables, non-row statements print nothing.
-  Put wrapper options before `--`; arguments after it reach psql in interactive mode only.
-  Interactive, --query and --queries-file output stays native, even with --json or a coding agent.")]
+  password (ADR-0009). --query takes SQL (multi-statement fine), --queries-file or piped
+  stdin likewise; results render as aligned psql-style tables, non-row statements print
+  nothing. Put wrapper options before `--`; arguments after it reach psql interactively.
+  Interactive, --query and --queries-file output stays native, even with --json or an agent.")]
     Client {
         /// Managed instance to connect to (default: "default")
         #[arg(value_name = "NAME", conflicts_with_all = ["name_flag", "host", "port"])]
@@ -968,10 +969,12 @@ CONTEXT FOR AGENTS:
     /// Write Postgres connection env vars to a .env file
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Writes POSTGRES_HOST, POSTGRES_PORT, POSTGRES_USER, POSTGRES_PASSWORD, POSTGRES_DATABASE.
-  The instance must be running.
-  Managed POSTGRES_* keys are replaced in place; other lines in the file are preserved.
-  Contains the password in plaintext — prefer --local and keep it out of version control.")]
+  The face decides the shape (ADR-0011): certificate instances get POSTGRES_HOST/PORT/USER/
+  DATABASE plus PGSSLMODE=verify-full and the PGSSLROOTCERT/PGSSLCERT/PGSSLKEY material
+  paths, with no password; --auth password instances get POSTGRES_PASSWORD instead.
+  The instance must be running. POSTGRES_* keys and the PGSSL* quartet are managed lines:
+  they are rewritten per run (export prefixes on them are not preserved); other lines stay.
+  Password-bearing output belongs in --local, out of version control.")]
     Dotenv {
         /// Instance name (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
