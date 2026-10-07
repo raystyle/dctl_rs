@@ -60,8 +60,21 @@ fn registry_credentials() -> Result<Credentials> {
                 "no home directory for the registry archive: {error}"
             ))
         })?;
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return Ok(Credentials::Anonymous);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Credentials::Anonymous);
+        }
+        Err(error) => {
+            // Not silently anonymous: an unreadable auth file would surface
+            // later as an unexplained 401 from the registry instead of this.
+            eprintln!(
+                "warning: could not read the registry auth file {}: {error}; \
+                 continuing anonymously",
+                path.display()
+            );
+            return Ok(Credentials::Anonymous);
+        }
     };
     warn_if_insecure(&path);
     parse_credentials(text.trim())
@@ -127,7 +140,7 @@ pub(crate) fn registry_base() -> String {
 /// Strip any embedded `user:pass@` from an endpoint override: the knob is
 /// endpoint-only by ADR-0008, and credentials embedded in it would echo
 /// back through output and error text, breaking the zero-log boundary.
-fn strip_userinfo(endpoint: &str) -> String {
+pub(crate) fn strip_userinfo(endpoint: &str) -> String {
     let Some(scheme_at) = endpoint.find("://") else {
         return endpoint.to_string();
     };
@@ -546,12 +559,19 @@ pub(crate) async fn run(cmd: crate::local::cli::RegistryCommands, json: bool) ->
             let digest =
                 pull_named_to_layout_with(&docker, &name, &tag, true, registry.as_deref()).await?;
             if json {
+                // The envelope must report where this pull actually came
+                // from — the per-invocation override when given — and stay
+                // inside the zero-log boundary (no embedded credentials).
+                let source = registry
+                    .as_deref()
+                    .map(strip_userinfo)
+                    .unwrap_or_else(registry_base);
                 println!(
                     "{}",
                     serde_json::json!({
                         "image": display_reference(&name, &tag),
                         "digest": digest,
-                        "source": registry_base(),
+                        "source": source,
                     })
                 );
             } else {

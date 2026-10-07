@@ -721,7 +721,7 @@ async fn resume_existing(
 
     // The readiness probe authenticates, so the password must be read before
     // the container starts (inspect works on stopped containers too).
-    let password = read_fk_password(docker, &container_id).await;
+    let password = read_fk_password(docker, &container_id).await?;
 
     docker::start_existing(docker, &container_id).await?;
 
@@ -1152,16 +1152,22 @@ fn password_from_redis_args(value: &str) -> String {
 }
 
 /// Read the provisioned password from the container's effective env so a
-/// resume keeps using the credential the data was created with.
-async fn read_fk_password(docker: &bollard::Docker, id: &str) -> String {
-    let inspect = docker.inspect_container(id, None).await.ok();
-    inspect
-        .and_then(|c| c.config)
+/// resume keeps using the credential the data was created with. Fails
+/// loudly when the container cannot be inspected: an empty password would
+/// fail authentication later with a message pointing at the wrong cause.
+async fn read_fk_password(docker: &bollard::Docker, id: &str) -> Result<String> {
+    let inspect = docker.inspect_container(id, None).await.map_err(|error| {
+        Error::DockerError(format!(
+            "could not read the credentials of container '{id}': {error}"
+        ))
+    })?;
+    Ok(inspect
+        .config
         .and_then(|c| c.env)
         .unwrap_or_default()
         .iter()
         .find_map(|e| e.strip_prefix("REDIS_ARGS=").map(password_from_redis_args))
-        .unwrap_or_default()
+        .unwrap_or_default())
 }
 
 async fn stop(name: &str, version: Option<&str>, json: bool) -> Result<()> {
@@ -1287,7 +1293,7 @@ async fn client(
         .container_id
         .as_deref()
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
-    let password = read_fk_password(&docker, container_id).await;
+    let password = read_fk_password(&docker, container_id).await?;
 
     // Same shape as the Postgres client: `--`-passthrough arguments reach
     // redis-cli only in interactive mode, so their presence must not force
@@ -1309,7 +1315,8 @@ async fn client(
         // stream is part of the ADR-0009 breaking change).
         None => {
             let mut buffer = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer);
+            // An unreadable stdin is not an empty query.
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer).map_err(Error::Io)?;
             buffer
         }
     };
@@ -1321,6 +1328,23 @@ async fn client(
         &cypher,
     )
     .await
+}
+
+/// Percent-encode every byte outside the URL unreserved set. The redis URL
+/// parser decodes the userinfo component back, so this is what keeps a
+/// password containing `%`, `/`, `#`, `?`, `@` … intact across the URL
+/// round-trip instead of silently changing the credential.
+fn percent_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// The native Cypher leg (ADR-0009): connect with the official falkordb
@@ -1338,7 +1362,14 @@ async fn run_native_cypher(
 
     let url = match password {
         // The redis URL grammar carries the password with an empty username.
-        Some(password) => format!("redis://:{password}@{host}:{port}"),
+        // Every byte outside the unreserved set is percent-encoded: the URL
+        // parser decodes them back on the other side, so a literal `%` or
+        // delimiter in the password would otherwise silently change the
+        // credential (or truncate the authority).
+        Some(password) => format!(
+            "redis://:{}@{host}:{port}",
+            percent_encode_component(password)
+        ),
         None => format!("redis://{host}:{port}"),
     };
     let connection_info = url
@@ -1451,7 +1482,7 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     // credentials, like the Postgres dotenv does.
     let password = docker::block_on(read_fk_password_for_dotenv(
         info.container_id.as_deref().unwrap_or_default(),
-    ));
+    ))?;
 
     // A recovered instance can carry an unknown (0) browser port; writing
     // http://127.0.0.1:0 into a user's .env would be a lie. Clobber any
@@ -1489,7 +1520,7 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
             + "\n"
     };
 
-    std::fs::write(path, &content)?;
+    crate::local::write_dotenv_file(path, &content)?;
 
     let out = output::FalkorDotenvOutput {
         file: filename.to_string(),
@@ -1506,14 +1537,14 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     Ok(())
 }
 
-async fn read_fk_password_for_dotenv(container_id: &str) -> String {
+async fn read_fk_password_for_dotenv(container_id: &str) -> Result<String> {
     if container_id.is_empty() {
-        return String::new();
+        return Ok(String::new());
     }
-    match docker::connect().await {
-        Ok(d) => read_fk_password(&d, container_id).await,
-        Err(_) => String::new(),
-    }
+    // A failed connect must not degrade into an empty password: the dotenv
+    // file would carry it with a success exit code.
+    let docker = docker::connect().await?;
+    read_fk_password(&docker, container_id).await
 }
 
 #[cfg(test)]
@@ -1561,6 +1592,21 @@ mod tests {
         // "3000 if free" for an omitted --browser-port.
         let picked = resolve_port_with(None, PortKind::FalkordbBrowser, &[]).unwrap();
         assert_eq!(picked, DEFAULT_FK_BROWSER_PORT);
+    }
+
+    #[test]
+    fn percent_encoded_password_is_url_safe() {
+        // The URL grammar percent-decodes the userinfo component (redis 1.7
+        // decodes it back), so every delimiter must be encoded on the way in
+        // or the credential silently changes (F-21). The expected string is
+        // the RFC 3986 unreserved-set encoding: everything else becomes
+        // %XX, which the URL parser reverses losslessly.
+        assert_eq!(
+            percent_encode_component("p@ss%41/#?"),
+            "p%40ss%2541%2F%23%3F"
+        );
+        // Unreserved characters pass through untouched.
+        assert_eq!(percent_encode_component("aZ09-._~"), "aZ09-._~");
     }
 
     struct FakeReadinessProbe {

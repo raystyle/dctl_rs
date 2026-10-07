@@ -230,6 +230,23 @@ fn extract_dotenv_key<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// Write a dotenv file atomically (tmp + rename in the target's directory)
+/// with owner-only permissions: the file carries live credentials, so a
+/// crash mid-write must not truncate the user's other variables and the
+/// world must not read it.
+pub(crate) fn write_dotenv_file(path: &std::path::Path, content: &str) -> std::io::Result<()> {
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match dir {
+        Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+    std::io::Write::write_all(&mut tmp, content.as_bytes())?;
+    // NamedTempFile is created 0o600 on Unix; persist renames onto the
+    // target, so the final file keeps those permissions.
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
+}
+
 /// Update an existing .env file: replace `<prefix>*` vars in-place, append any
 /// missing ones. Lines for the same prefix that aren't in `vars` are preserved
 /// (e.g. a manually-set CLICKHOUSE_PASSWORD survives a host/port-only update).

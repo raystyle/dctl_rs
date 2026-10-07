@@ -751,7 +751,7 @@ async fn resume_existing(
         return Err(error);
     }
 
-    let (user, password, database) = read_pg_env(docker, &container_id).await;
+    let (user, password, database) = read_pg_env(docker, &container_id).await?;
 
     let out = output::PostgresStartOutput {
         name: display_name,
@@ -1203,7 +1203,7 @@ async fn client(
         .container_id
         .as_deref()
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
-    let (user, password, database) = read_pg_env(&docker, container_id).await;
+    let (user, password, database) = read_pg_env(&docker, container_id).await?;
 
     let explicit_input = query.is_some() || queries_file.is_some();
     let interactive =
@@ -1236,20 +1236,23 @@ fn gather_sql_input(query: Option<String>, queries_file: Option<String>) -> Resu
     }
     if let Some(file) = queries_file {
         if file == "-" {
-            return Ok(read_stdin_to_string());
+            return read_stdin_to_string();
         }
         return std::fs::read_to_string(&file).map_err(|error| Error::SqlInputOpen {
             path: file.into(),
             source: error,
         });
     }
-    Ok(read_stdin_to_string())
+    read_stdin_to_string()
 }
 
-fn read_stdin_to_string() -> String {
+fn read_stdin_to_string() -> Result<String> {
     let mut buffer = String::new();
-    let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer);
-    buffer
+    // An unreadable stdin is a broken pipe, not an empty script: failing
+    // here keeps the error pointing at the real cause instead of a later
+    // server-side syntax complaint about an empty string.
+    std::io::Read::read_to_string(&mut std::io::stdin(), &mut buffer)?;
+    Ok(buffer)
 }
 
 /// One simple-protocol result set: column names plus row values (None is
@@ -1397,22 +1400,25 @@ async fn query_and_render(client: tokio_postgres::Client, sql: &str) -> Result<(
 }
 
 /// Read POSTGRES_USER/PASSWORD/DB from the container's effective env so we
-/// don't lose track of user-provided values across recoveries.
-async fn read_pg_env(docker: &bollard::Docker, id: &str) -> (String, String, String) {
-    let inspect = docker.inspect_container(id, None).await.ok();
-    let env: Vec<String> = inspect
-        .and_then(|c| c.config)
-        .and_then(|c| c.env)
-        .unwrap_or_default();
+/// don't lose track of user-provided values across recoveries. Fails loudly
+/// when the container cannot be inspected: fabricating the defaults instead
+/// would silently connect (and write .env files) with a wrong identity.
+async fn read_pg_env(docker: &bollard::Docker, id: &str) -> Result<(String, String, String)> {
+    let inspect = docker.inspect_container(id, None).await.map_err(|error| {
+        Error::DockerError(format!(
+            "could not read the credentials of container '{id}': {error}"
+        ))
+    })?;
+    let env: Vec<String> = inspect.config.and_then(|c| c.env).unwrap_or_default();
     let get = |k: &str| -> Option<String> {
         env.iter()
             .find_map(|e| e.strip_prefix(&format!("{k}=")).map(|s| s.to_string()))
     };
-    (
+    Ok((
         get("POSTGRES_USER").unwrap_or_else(|| DEFAULT_USER.into()),
         get("POSTGRES_PASSWORD").unwrap_or_default(),
         get("POSTGRES_DB").unwrap_or_else(|| DEFAULT_DATABASE.into()),
-    )
+    ))
 }
 
 fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool) -> Result<()> {
@@ -1428,7 +1434,7 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     // Read user/password/db from the container env so we always emit accurate creds.
     let (user, password, database) = docker::block_on(read_pg_env_for_dotenv(
         info.container_id.as_deref().unwrap_or_default(),
-    ));
+    ))?;
 
     let vars: Vec<(&str, String)> = vec![
         ("POSTGRES_HOST", "127.0.0.1".to_string()),
@@ -1452,7 +1458,7 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
             + "\n"
     };
 
-    std::fs::write(path, &content)?;
+    crate::local::write_dotenv_file(path, &content)?;
 
     let out = output::PostgresDotenvOutput {
         file: filename.to_string(),
@@ -1469,14 +1475,14 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     Ok(())
 }
 
-async fn read_pg_env_for_dotenv(container_id: &str) -> (String, String, String) {
+async fn read_pg_env_for_dotenv(container_id: &str) -> Result<(String, String, String)> {
     if container_id.is_empty() {
-        return (DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into());
+        return Ok((DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into()));
     }
-    match docker::connect().await {
-        Ok(d) => read_pg_env(&d, container_id).await,
-        Err(_) => (DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into()),
-    }
+    // A failed connect must not degrade into fabricated credentials: the
+    // dotenv file would carry them with a success exit code.
+    let docker = docker::connect().await?;
+    read_pg_env(&docker, container_id).await
 }
 
 #[cfg(test)]

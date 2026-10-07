@@ -94,6 +94,27 @@ impl LocalArgs {
     /// the owning client subcommand as a usage error (exit 2).
     pub(crate) fn client_usage_validation_error(&self, interactive: bool) -> Option<String> {
         match &self.command {
+            LocalCommands::Client {
+                user,
+                password,
+                host,
+                port,
+                ..
+            } => {
+                // Direct-mode credentials are meaningless in managed mode,
+                // which authenticates with the instance's stored identity;
+                // silently ignoring them would mislead.
+                if (user.is_some() || password.is_some()) && host.is_none() && port.is_none() {
+                    return Some(
+                        "--user/--password are direct-mode flags; add --host/--port to connect \
+                         directly, or drop them to use the managed instance's credentials"
+                            .into(),
+                    );
+                }
+                if user.is_some() != password.is_some() {
+                    return Some("--user and --password go together; pass both or neither".into());
+                }
+            }
             LocalCommands::Postgres {
                 command:
                     PostgresCommands::Client {
@@ -879,7 +900,7 @@ CONTEXT FOR AGENTS:
         port: Option<u16>,
 
         /// Execute a single SQL query
-        #[arg(long, short)]
+        #[arg(long, short, conflicts_with = "queries_file")]
         #[arg(display_order = 4)]
         query: Option<String>,
 

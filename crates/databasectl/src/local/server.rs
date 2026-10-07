@@ -718,7 +718,11 @@ pub(crate) fn try_remove_server_info_locked(name: &str, lock: &MetadataLock) -> 
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(metadata_write_error(&path, error)),
     }
-    sync_directory(&lock.dir, &path)
+    // The remove has committed at this point; mirroring the save path
+    // (see save_server_info_at), a directory sync error must not turn an
+    // already-deleted entry into a reported failure.
+    let _ = sync_directory(&lock.dir, &path);
+    Ok(())
 }
 
 /// Mark a ClickHouse server as stopped without discarding its metadata.
@@ -955,8 +959,13 @@ fn server_entry_locked_policy(
     if !running && info.engine == Engine::Clickhouse && info.pid != 0 {
         before_stale_write();
         mark_server_stopped_locked(name, info.pid, lock)?;
-        info =
-            load_info_locked(name, lock)?.ok_or_else(|| Error::ServerNotFound(name.to_string()))?;
+        // The entry may have been removed externally between the write and
+        // this reload; absence is not corruption (see the read_dir path
+        // below for the same policy), so skip instead of failing the listing.
+        info = match load_info_locked(name, lock)? {
+            Some(info) => info,
+            None => return Ok(None),
+        };
         running = is_alive(&info)?;
     }
 

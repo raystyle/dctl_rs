@@ -325,9 +325,16 @@ pub async fn pull_image(
 ) -> Result<()> {
     // An explicit --registry bypasses the chain: that source, then cache.
     if let Some(endpoint) = registry_override {
+        // Echo the endpoint only after stripping embedded credentials — the
+        // same zero-log boundary strip_userinfo exists for (ADR-0008).
+        let endpoint = crate::local::registry::strip_userinfo(endpoint);
         eprintln!("pulling {image_ref} from {endpoint}");
-        return match crate::local::registry::pull_via_registry_from(docker, image_ref, endpoint)
-            .await
+        return match crate::local::registry::pull_via_registry_from(
+            docker,
+            image_ref,
+            endpoint.as_str(),
+        )
+        .await
         {
             Ok(()) => Ok(()),
             Err(reason) => {

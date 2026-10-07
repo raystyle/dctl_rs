@@ -73,9 +73,18 @@ fn run_issue(cmd: IssueCommands, json: bool) -> Result<()> {
         }
         IssueCommands::List { limit, before } => {
             let ledger = read_client();
-            let page = ledger
-                .issue_list(limit, before.and_then(|before| before.parse().ok()))
-                .map_err(map_ledger_error)?;
+            // A malformed cursor must fail loudly: silently degrading to the
+            // first page would make has_more-driven pagination loop forever.
+            let before = before
+                .map(|before| {
+                    before.parse::<u64>().map_err(|_| {
+                        Error::Ledger(format!(
+                            "invalid --before value '{before}': expected an issue number"
+                        ))
+                    })
+                })
+                .transpose()?;
+            let page = ledger.issue_list(limit, before).map_err(map_ledger_error)?;
             let rows = page["rows"].as_array().cloned().unwrap_or_default();
             let count = rows.len();
             let has_more = page["has_more"].as_bool().unwrap_or(false);

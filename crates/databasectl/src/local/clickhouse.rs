@@ -646,7 +646,7 @@ async fn resume_existing(
     // dotenv and client read — so a resume reports what is actually
     // provisioned, not the defaults. The password is intentionally not
     // reprinted (it is recoverable via `dotenv`).
-    let (user, _password, database) = read_ch_env(docker, &container_id).await;
+    let (user, _password, database) = read_ch_env(docker, &container_id).await?;
 
     docker::start_existing(docker, &container_id).await?;
 
@@ -1071,6 +1071,13 @@ pub(crate) async fn http_query(
     sql: &str,
 ) -> Result<String> {
     let url = format!("http://{host}:{port}/");
+    // Half-supplied credentials would silently send no auth header at all
+    // (or none where one is expected) — fail the usage instead.
+    if user.is_some() != password.is_some() {
+        return Err(Error::ClickhouseUsage(
+            "--user and --password go together; pass both or neither".into(),
+        ));
+    }
     let mut request = crate::http::client_builder()
         .timeout(Duration::from_secs(120))
         .no_proxy()
@@ -1106,21 +1113,25 @@ pub(crate) async fn http_query(
 }
 
 /// Read the provisioned credentials from the container's effective env.
-async fn read_ch_env(docker: &bollard::Docker, id: &str) -> (String, String, String) {
-    let inspect = docker.inspect_container(id, None).await.ok();
-    let env: Vec<String> = inspect
-        .and_then(|c| c.config)
-        .and_then(|c| c.env)
-        .unwrap_or_default();
+/// Fails loudly when the container cannot be inspected: fabricating the
+/// defaults instead would silently connect (and write .env files) with a
+/// wrong identity.
+async fn read_ch_env(docker: &bollard::Docker, id: &str) -> Result<(String, String, String)> {
+    let inspect = docker.inspect_container(id, None).await.map_err(|error| {
+        Error::DockerError(format!(
+            "could not read the credentials of container '{id}': {error}"
+        ))
+    })?;
+    let env: Vec<String> = inspect.config.and_then(|c| c.env).unwrap_or_default();
     let get = |k: &str| -> Option<String> {
         env.iter()
             .find_map(|e| e.strip_prefix(&format!("{k}=")).map(str::to_string))
     };
-    (
+    Ok((
         get("CLICKHOUSE_USER").unwrap_or_else(|| DEFAULT_USER.into()),
         get("CLICKHOUSE_PASSWORD").unwrap_or_default(),
         get("CLICKHOUSE_DB").unwrap_or_else(|| DEFAULT_DATABASE.into()),
-    )
+    ))
 }
 
 /// Direct-mode (`--host/--port`) credentials; managed mode reads them from
@@ -1187,7 +1198,7 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
         .container_id
         .as_deref()
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
-    let (user, password, db) = read_ch_env(&docker, container_id).await;
+    let (user, password, db) = read_ch_env(&docker, container_id).await?;
 
     if query.is_some() || queries_file.is_some() {
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
@@ -1374,7 +1385,7 @@ pub(crate) fn dotenv(
 
     let (user, password, database) = docker::block_on(read_ch_env_for_dotenv(
         info.container_id.as_deref().unwrap_or_default(),
-    ));
+    ))?;
 
     let vars: Vec<(&str, String)> = vec![
         ("CLICKHOUSE_HOST", "127.0.0.1".to_string()),
@@ -1399,7 +1410,7 @@ pub(crate) fn dotenv(
             + "\n"
     };
 
-    std::fs::write(path, &content)?;
+    crate::local::write_dotenv_file(path, &content)?;
 
     let out = output::ClickhouseDotenvOutput {
         file: filename.to_string(),
@@ -1416,14 +1427,14 @@ pub(crate) fn dotenv(
     Ok(())
 }
 
-async fn read_ch_env_for_dotenv(container_id: &str) -> (String, String, String) {
+async fn read_ch_env_for_dotenv(container_id: &str) -> Result<(String, String, String)> {
     if container_id.is_empty() {
-        return (DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into());
+        return Ok((DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into()));
     }
-    match docker::connect().await {
-        Ok(d) => read_ch_env(&d, container_id).await,
-        Err(_) => (DEFAULT_USER.into(), String::new(), DEFAULT_DATABASE.into()),
-    }
+    // A failed connect must not degrade into fabricated credentials: the
+    // dotenv file would carry them with a success exit code.
+    let docker = docker::connect().await?;
+    read_ch_env(&docker, container_id).await
 }
 
 #[cfg(test)]

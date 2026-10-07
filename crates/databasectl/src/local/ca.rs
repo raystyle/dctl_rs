@@ -8,6 +8,7 @@
 
 use crate::error::{Error, Result};
 use rcgen::{CertificateParams, DistinguishedName, DnType, Issuer, KeyPair};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 const CA_CN: &str = "dctl-local-ca";
@@ -30,10 +31,42 @@ pub(crate) fn ca_dir() -> Result<PathBuf> {
     Ok(crate::paths::base_dir()?.join("ca"))
 }
 
+/// Advisory lock over the CA directory: two concurrent first runs must not
+/// interleave their writes into a mismatched key/cert pair.
+struct CaLock {
+    _file: File,
+}
+
+impl CaLock {
+    fn acquire(dir: &Path) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join(".lock"))
+            .map_err(|e| ca_err("lock open", e))?;
+        file.lock().map_err(|e| ca_err("lock acquire", e))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Atomic (tmp + rename) write; the tempfile is created 0o600 on Unix, so
+/// private keys never appear world-readable at any instant, and a killed
+/// process cannot leave a truncated half-file behind.
+fn write_atomic(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(|e| ca_err("write", e))?;
+    std::io::Write::write_all(&mut tmp, contents.as_bytes()).map_err(|e| ca_err("write", e))?;
+    tmp.persist(path).map_err(|e| ca_err("write", e.error))?;
+    Ok(())
+}
+
 /// Idempotently ensure the CA exists; return the CA certificate path.
 pub(crate) fn ensure_ca() -> Result<PathBuf> {
     let dir = ca_dir()?;
     std::fs::create_dir_all(&dir)?;
+    let _lock = CaLock::acquire(&dir)?;
     let key_path = dir.join("ca.key");
     let cert_path = dir.join("ca.crt");
     if key_path.is_file() && cert_path.is_file() {
@@ -43,9 +76,8 @@ pub(crate) fn ensure_ca() -> Result<PathBuf> {
     let cert = ca_params()
         .self_signed(&key_pair)
         .map_err(|e| ca_err("self-sign", e))?;
-    write_secret(&key_path, &key_pair.serialize_pem())?;
-    std::fs::write(&cert_path, cert.pem())
-        .map_err(|e| Error::Postgres(format!("CA write: {e}")))?;
+    write_atomic(&key_path, &key_pair.serialize_pem())?;
+    write_atomic(&cert_path, &cert.pem())?;
     Ok(cert_path)
 }
 
@@ -70,18 +102,6 @@ pub(crate) fn issue(cn: &str) -> Result<(String, String)> {
     Ok((cert.pem(), leaf_key.serialize_pem()))
 }
 
-fn write_secret(path: &Path, contents: &str) -> Result<()> {
-    std::fs::write(path, contents)
-        .map_err(|e| Error::Postgres(format!("CA write {}: {e}", path.display())))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .map_err(|e| Error::Postgres(format!("CA chmod {}: {e}", path.display())))?;
-    }
-    Ok(())
-}
-
 /// The dctl client certificate paths (CN = the DB username); issued lazily.
 pub(crate) fn client_cert(user: &str) -> Result<(PathBuf, PathBuf)> {
     let dir = ca_dir()?;
@@ -91,8 +111,10 @@ pub(crate) fn client_cert(user: &str) -> Result<(PathBuf, PathBuf)> {
         return Ok((cert_path, key_path));
     }
     let (cert_pem, key_pem) = issue(user)?;
-    let _ = std::fs::write(&cert_path, &cert_pem);
-    write_secret(&key_path, &key_pem)?;
+    // Both writes propagate: a cert that silently failed to land would make
+    // the next read report "no such file" instead of the real write error.
+    write_atomic(&cert_path, &cert_pem)?;
+    write_atomic(&key_path, &key_pem)?;
     Ok((cert_path, key_path))
 }
 

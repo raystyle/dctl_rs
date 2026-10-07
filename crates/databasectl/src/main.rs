@@ -109,19 +109,23 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
         if let Some(message) = args.client_usage_validation_error(
             std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
         ) {
-            let client = cmd
+            let local = cmd
                 .find_subcommand_mut("local")
-                .and_then(|local| match &args.command {
-                    crate::local::cli::LocalCommands::Postgres { .. } => {
-                        local.find_subcommand_mut("postgres")
-                    }
-                    crate::local::cli::LocalCommands::Falkordb { .. } => {
-                        local.find_subcommand_mut("falkordb")
-                    }
-                    _ => None,
-                })
-                .and_then(|engine| engine.find_subcommand_mut("client"))
-                .expect("engine client command must exist");
+                .expect("local command must exist");
+            let client = match &args.command {
+                crate::local::cli::LocalCommands::Postgres { .. } => local
+                    .find_subcommand_mut("postgres")
+                    .and_then(|engine| engine.find_subcommand_mut("client"))
+                    .expect("postgres client command must exist"),
+                crate::local::cli::LocalCommands::Falkordb { .. } => local
+                    .find_subcommand_mut("falkordb")
+                    .and_then(|engine| engine.find_subcommand_mut("client"))
+                    .expect("falkordb client command must exist"),
+                crate::local::cli::LocalCommands::Client { .. } => local
+                    .find_subcommand_mut("client")
+                    .expect("local client command must exist"),
+                _ => unreachable!("client_usage_validation_error only fires for client commands"),
+            };
             return Err(client.error(ErrorKind::ArgumentConflict, message));
         }
         let Some(message) = args
@@ -326,6 +330,54 @@ mod tests {
             assert!(message.contains(diagnostic), "{message}");
             assert!(message.contains("dctl local postgres start"), "{message}");
         }
+    }
+
+    #[test]
+    fn clickhouse_client_direct_credentials_are_usage_errors() {
+        // Managed mode never reads direct credentials — rejecting them
+        // beats silently ignoring an explicitly supplied identity.
+        let error = parse_and_validate(&["dctl", "local", "client", "--user", "app"])
+            .err()
+            .expect("managed mode must reject direct-mode credentials");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(
+            message.contains("--user/--password are direct-mode flags"),
+            "{message}"
+        );
+        assert!(message.contains("dctl local client"), "{message}");
+
+        // Half-supplied credentials would send no auth header at all.
+        let error =
+            parse_and_validate(&["dctl", "local", "client", "--host", "db", "--user", "app"])
+                .err()
+                .expect("half-supplied credentials must fail validation");
+        assert_eq!(error.exit_code(), 2);
+        assert!(
+            error
+                .to_string()
+                .contains("--user and --password go together"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn postgres_client_query_and_queries_file_conflict() {
+        let error = Cli::try_parse_from([
+            "dctl",
+            "local",
+            "postgres",
+            "client",
+            "--query",
+            "SELECT 1",
+            "--queries-file",
+            "seed.sql",
+        ])
+        .err()
+        .expect("--query and --queries-file are mutually exclusive");
+        assert_eq!(error.exit_code(), 2);
     }
 
     #[test]

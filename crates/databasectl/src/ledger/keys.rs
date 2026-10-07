@@ -30,11 +30,18 @@ pub(crate) fn key_id() -> String {
 /// path, or a raw 64-hex seed.
 const KEY_ENV: &str = "DCTL_LEDGER_KEY";
 
-fn archive_path() -> std::path::PathBuf {
-    crate::paths::base_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("~/.dctl"))
+fn archive_path() -> Result<std::path::PathBuf> {
+    // No `~` literal fallback: it would not expand and would resolve to a
+    // `<cwd>/~` directory, pointing users (and lookups) at the wrong place.
+    // If the home directory cannot be resolved, that error is the story.
+    Ok(crate::paths::base_dir()
+        .map_err(|error| {
+            Error::Ledger(format!(
+                "could not resolve the home directory for the ledger key archive: {error}"
+            ))
+        })?
         .join("ledger")
-        .join("dctl_rs.pem")
+        .join("dctl_rs.pem"))
 }
 
 /// Resolve the signing identity from env/archive into the shared client's
@@ -43,8 +50,19 @@ pub(crate) fn load_key_pair() -> Result<ledger_client::KeyPair> {
     if let Some(text) = std::env::var(KEY_ENV).ok().filter(|s| !s.is_empty()) {
         return key_pair_from_text(&text, KEY_ENV);
     }
-    let path = archive_path();
-    let bytes = std::fs::read(&path).map_err(|_| key_error(&path))?;
+    let path = archive_path()?;
+    let bytes = std::fs::read(&path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            key_error(&path)
+        } else {
+            // A present-but-unreadable key is a different story than a
+            // missing one; conflating them sends users to regenerate.
+            Error::Ledger(format!(
+                "could not read the ledger private key at {}: {error}",
+                path.display()
+            ))
+        }
+    })?;
     warn_if_insecure(&path);
     let text = String::from_utf8_lossy(&bytes).into_owned();
     key_pair_from_text(&text, &path.display().to_string())
@@ -59,6 +77,14 @@ fn key_error(path: &std::path::Path) -> Error {
 }
 
 fn key_pair_from_text(text: &str, source: &str) -> Result<ledger_client::KeyPair> {
+    key_pair_from_text_at_depth(text, source, 0)
+}
+
+fn key_pair_from_text_at_depth(
+    text: &str,
+    source: &str,
+    depth: u8,
+) -> Result<ledger_client::KeyPair> {
     let trimmed = text.trim();
     let seed_hex = if trimmed.starts_with(pem_begin_marker()) {
         pem_seed_hex(trimmed, source)?
@@ -68,9 +94,16 @@ fn key_pair_from_text(text: &str, source: &str) -> Result<ledger_client::KeyPair
         // The env form may carry a PATH to the PEM (vault/CI injection) —
         // same material, resolved one hop away. The inner error names the
         // file, so "unreadable path" and "readable but invalid content"
-        // stay distinguishable. Recursion is bounded by the filesystem: a
-        // path whose target is itself a path fails the material checks.
-        return key_pair_from_text(&content, trimmed);
+        // stay distinguishable. The filesystem admits cycles (a file whose
+        // content is a path back to it), so recursion carries an explicit
+        // bound instead of the (false) "bounded by the filesystem" claim.
+        if depth >= 4 {
+            return Err(Error::Ledger(format!(
+                "the ledger key in {source} resolves through too many path indirections; \
+                 expected a PEM block, a 64-hex seed, or a direct path to one"
+            )));
+        }
+        return key_pair_from_text_at_depth(&content, trimmed, depth + 1);
     } else {
         return Err(Error::Ledger(format!(
             "the ledger key in {source} is neither a PEM block, a 64-hex seed, \
