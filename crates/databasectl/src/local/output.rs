@@ -48,6 +48,11 @@ enum LocalErrorCode {
     FalkorError,
     /// A Docker-managed ClickHouse validation or state error.
     ClickhouseError,
+    /// Self-composed cleanup guidance around a Docker operation (e.g. a
+    /// remove that refuses to delete data while the container survives).
+    /// Distinct from [`Self::DockerError`], whose foreign daemon text is
+    /// redacted; here the text is ours and renders verbatim.
+    CleanupFailed,
     SqlInputOpenFailed,
     /// A managed server metadata file contains invalid JSON. The structured
     /// body names the file and gives conservative recovery guidance without
@@ -277,12 +282,12 @@ impl LocalErrorOutput {
             Error::Http(_) => {
                 Mapping::redacted(LocalErrorCode::NetworkError, "HTTP request failed")
             }
-            Error::Download(_) => {
-                Mapping::redacted(LocalErrorCode::DownloadFailed, "Download failed")
-            }
-            Error::Extract(_) => {
-                Mapping::redacted(LocalErrorCode::DownloadFailed, "Extraction failed")
-            }
+            // Download/Extract texts are self-composed (the updater's
+            // checksum verdicts and size limits, fetch failures with the
+            // URL context); agents on the machine face need exactly this
+            // detail, so the Display text rides verbatim.
+            Error::Download(_) => Mapping::parity(LocalErrorCode::DownloadFailed),
+            Error::Extract(_) => Mapping::parity(LocalErrorCode::DownloadFailed),
 
             // ── Docker ──────────────────────────────────────────────────────
             // The unavailability text is built from a classified failure kind
@@ -292,6 +297,9 @@ impl LocalErrorOutput {
             Error::DockerError(_) => {
                 Mapping::redacted(LocalErrorCode::DockerError, "Docker operation failed")
             }
+            // Cleanup guidance around Docker operations is ours, with the
+            // recovery command spelled out; render it verbatim.
+            Error::Cleanup(_) => Mapping::parity(LocalErrorCode::CleanupFailed),
             // Self-composed name-conflict guidance, unlike the daemon text
             // above.
             Error::ContainerNameConflict(_) => {
@@ -338,20 +346,19 @@ impl LocalErrorOutput {
             Error::StateMigration(_) => Mapping::parity(LocalErrorCode::StateMigration),
 
             // ── bounded fallback ────────────────────────────────────────────
-            // Subprocess text and `Postgres` (OS text from a failed psql
-            // exec) are foreign output. `Skills` and `Ledger` ride the same
-            // envelope (their failures reach it since the health review) and
-            // name their own surface instead of masquerading as local;
-            // `ChildExit` passes the child's status through without an error
-            // object at all.
-            Error::Postgres(_) | Error::ChildExit(_) => {
+            // `Postgres` texts are self-composed validation/state errors and
+            // recovery guidance (e.g. a resume that cannot determine the
+            // port), so they render verbatim under the Postgres code.
+            // `Skills` and `Ledger` reach this envelope since the health
+            // review; their texts are ours too and carry the real detail
+            // (checksum cursor rules, archive boundaries), not a fixed
+            // sentence. Only `ChildExit` stays reduced: it passes the
+            // child's status through without an error object at all.
+            Error::Postgres(_) => Mapping::parity(LocalErrorCode::PostgresError),
+            Error::Skills(_) => Mapping::parity(LocalErrorCode::LocalError),
+            Error::Ledger(_) => Mapping::parity(LocalErrorCode::LocalError),
+            Error::ChildExit(_) => {
                 Mapping::redacted(LocalErrorCode::LocalError, "Local command failed")
-            }
-            Error::Skills(_) => {
-                Mapping::redacted(LocalErrorCode::LocalError, "Skills command failed")
-            }
-            Error::Ledger(_) => {
-                Mapping::redacted(LocalErrorCode::LocalError, "Ledger command failed")
             }
         };
         Self {
@@ -1067,6 +1074,27 @@ mod tests {
                 Error::ClickhouseUsage("raw clickhouse guidance".into()),
                 "clickhouse_error",
             ),
+            // Since the machine envelope also carries skills/ledger/update
+            // failures, their self-composed detail (checksum verdicts, cursor
+            // rules, recovery commands) must reach agents verbatim.
+            (
+                Error::Postgres("cannot determine the TCP port of container 'x'".into()),
+                "postgres_error",
+            ),
+            (
+                Error::Cleanup("could not remove container 'x'; nothing was deleted".into()),
+                "cleanup_failed",
+            ),
+            (Error::Skills("raw skills guidance".into()), "local_error"),
+            (Error::Ledger("raw ledger guidance".into()), "local_error"),
+            (
+                Error::Download("checksum mismatch: expected a, got b".into()),
+                "download_failed",
+            ),
+            (
+                Error::Extract("release archive entry exceeds the limit".into()),
+                "download_failed",
+            ),
         ] {
             let json = error_json(&error);
             assert_eq!(json["error"]["code"], expected, "{error}");
@@ -1081,18 +1109,6 @@ mod tests {
     #[test]
     fn errors_carrying_foreign_output_stay_summarized() {
         for (error, expected) in [
-            (
-                Error::Postgres("psql: connection refused".into()),
-                "local_error",
-            ),
-            (
-                Error::Download("raw download details".into()),
-                "download_failed",
-            ),
-            (
-                Error::Extract("raw extraction details".into()),
-                "download_failed",
-            ),
             (
                 Error::StartupExit {
                     kind: crate::error::StartupKind::ClickHouse,

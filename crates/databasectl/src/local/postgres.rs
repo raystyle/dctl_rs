@@ -1147,7 +1147,7 @@ fn remove(name: &str, version: Option<&str>, json: bool) -> Result<()> {
         // reporting success on top of that misleads. The metadata and data
         // stay intact, so the remove is retryable once Docker cooperates.
         docker::stop_and_remove_blocking(cid).map_err(|error| {
-            Error::DockerError(format!(
+            Error::Cleanup(format!(
                 "could not remove container '{cid}'; nothing was deleted — \
                  retry `dctl local postgres remove {name}` once Docker is reachable: {error}"
             ))

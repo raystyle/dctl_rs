@@ -246,6 +246,14 @@ pub enum Error {
     #[allow(clippy::enum_variant_names)]
     DockerError(String),
 
+    /// Self-composed cleanup guidance around a Docker operation (e.g. a
+    /// remove that refuses to delete data while the container survives).
+    /// Kept separate from [`Error::DockerError`], whose payload is daemon
+    /// text and is redacted, so structured output can render this recovery
+    /// guidance verbatim.
+    #[error("Cleanup: {0}")]
+    Cleanup(String),
+
     /// A container name held by a container dctl does not manage.
     /// Kept separate from [`Error::DockerError`], whose payload is daemon text,
     /// so structured output can render this self-composed guidance verbatim.

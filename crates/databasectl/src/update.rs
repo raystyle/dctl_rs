@@ -150,6 +150,10 @@ async fn verify_release_checksum(
     let sums_url = format!("{}/{}/SHA256SUMS", RELEASES_BASE_URL, tag);
     let response = client.get(&sums_url).send().await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
+        // Transition policy, not a permanent one: once a release with
+        // SHA256SUMS exists, add a version floor (or drop this arm) so a
+        // missing asset can never again mean "skip verification" (fix-review
+        // G1). Transport errors are not 404 and are not passed through.
         eprintln!(
             "warning: release {tag} publishes no SHA256SUMS asset; \
              continuing without integrity verification"
