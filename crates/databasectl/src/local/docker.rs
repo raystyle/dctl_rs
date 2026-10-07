@@ -615,8 +615,8 @@ pub async fn upload_postgres_tls_material(
             // the self-composed sentence (daemon text stays out of parity).
             eprintln!("TLS material upload failed: {error}");
             Err(Error::PostgresUsage(format!(
-                "could not upload the TLS material into container '{container_id}'; \
-                 nothing was started and the next start clears the leftover container"
+                "could not upload the TLS material into container '{container_id}'; the \
+                 failed attempt was rolled back and nothing was started"
             )))
         }
     }
