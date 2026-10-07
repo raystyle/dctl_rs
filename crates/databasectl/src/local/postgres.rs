@@ -733,8 +733,7 @@ async fn resume_existing(
         // driver text).
         return Err(Error::PostgresUsage(format!(
             "cannot determine the TCP port of container '{container_id}'; \
-             run `dctl local postgres remove {display_name}` and start fresh, \
-             or `docker rm` the stopped container by hand to keep the data directory"
+             run `dctl local postgres remove {display_name}` and start fresh"
         )));
     }
     let info = ServerInfo {

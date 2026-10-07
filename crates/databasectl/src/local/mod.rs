@@ -596,27 +596,27 @@ mod tests {
     }
 
     #[test]
-    fn write_dotenv_file_accepts_a_bare_relative_name() {
-        // A bare filename has no usable parent dir; the helper must stage
-        // its tempfile in the current directory (the target's own), not in
-        // the system temp, whose device can differ (EXDEV on rename).
+    fn write_dotenv_file_replaces_atomically_with_owner_only_permissions() {
+        // Absolute-path coverage: content lands, an existing file is
+        // replaced atomically, and the file is owner-only (it carries live
+        // credentials). The bare-relative-name branch (tempfile staged in
+        // the current directory to avoid a cross-device rename) cannot be
+        // pinned here without switching the process cwd mid-test, which
+        // would race every other cwd-sensitive test; its correctness rests
+        // on the code comment and review.
         let sandbox = tempfile::tempdir().unwrap();
-        let previous = std::env::current_dir().unwrap();
-        std::env::set_current_dir(sandbox.path()).unwrap();
-        let result = write_dotenv_file(std::path::Path::new(".env"), "KEY=value\n");
-        std::env::set_current_dir(previous).unwrap();
-        result.expect("bare relative names must work");
-        assert_eq!(
-            std::fs::read_to_string(sandbox.path().join(".env")).unwrap(),
-            "KEY=value\n"
+        let target = sandbox.path().join(".env");
+        write_dotenv_file(&target, "OLD=1\n").unwrap();
+        write_dotenv_file(&target, "KEY=value\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "KEY=value\n");
+        assert!(
+            sandbox.path().read_dir().unwrap().count() == 1,
+            "the temp file must not linger next to the target"
         );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(sandbox.path().join(".env"))
-                .unwrap()
-                .permissions()
-                .mode();
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-only");
         }
     }

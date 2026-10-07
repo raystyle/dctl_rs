@@ -752,8 +752,7 @@ async fn resume_existing(
     if tcp_port == 0 {
         return Err(Error::FalkorUsage(format!(
             "cannot determine the TCP port of container '{container_id}'; \
-             run `dctl local falkordb remove {display_name}` and start fresh, \
-             or `docker rm` the stopped container by hand to keep the data directory"
+             run `dctl local falkordb remove {display_name}` and start fresh"
         )));
     }
     let info = ServerInfo {

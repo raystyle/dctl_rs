@@ -673,8 +673,7 @@ async fn resume_existing(
     if http_port == 0 {
         return Err(Error::ClickhouseUsage(format!(
             "cannot determine the HTTP port of container '{container_id}'; \
-             run `dctl local server remove {display_name}` and start fresh, \
-             or `docker rm` the stopped container by hand to keep the data directory"
+             run `dctl local server remove {display_name}` and start fresh"
         )));
     }
     let info = ServerInfo {
