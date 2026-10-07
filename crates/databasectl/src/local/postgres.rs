@@ -719,7 +719,11 @@ async fn resume_existing(
         .filter(|port| *port != 0)
         .unwrap_or(prior.tcp_port);
     if tcp_port == 0 {
-        return Err(Error::Postgres(format!(
+        // PostgresUsage, not Postgres: this is self-composed recovery
+        // guidance and must ride the machine envelope verbatim, while the
+        // Postgres variant stays summarized (its other payloads are foreign
+        // driver text).
+        return Err(Error::PostgresUsage(format!(
             "cannot determine the TCP port of container '{container_id}'; \
              run `dctl local postgres remove {display_name}` and start fresh"
         )));

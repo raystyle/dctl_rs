@@ -282,10 +282,11 @@ impl LocalErrorOutput {
             Error::Http(_) => {
                 Mapping::redacted(LocalErrorCode::NetworkError, "HTTP request failed")
             }
-            // Download/Extract texts are self-composed (the updater's
-            // checksum verdicts and size limits, fetch failures with the
-            // URL context); agents on the machine face need exactly this
-            // detail, so the Display text rides verbatim.
+            // Download/Extract payloads are self-composed (the updater's
+            // checksum verdicts, size limits, fetch failures with URL
+            // context); the one caller that wrapped bollard's daemon text
+            // here was rerouted to DockerError below. Agents on the machine
+            // face need this detail verbatim.
             Error::Download(_) => Mapping::parity(LocalErrorCode::DownloadFailed),
             Error::Extract(_) => Mapping::parity(LocalErrorCode::DownloadFailed),
 
@@ -346,15 +347,18 @@ impl LocalErrorOutput {
             Error::StateMigration(_) => Mapping::parity(LocalErrorCode::StateMigration),
 
             // ── bounded fallback ────────────────────────────────────────────
-            // `Postgres` texts are self-composed validation/state errors and
-            // recovery guidance (e.g. a resume that cannot determine the
-            // port), so they render verbatim under the Postgres code.
-            // `Skills` and `Ledger` reach this envelope since the health
-            // review; their texts are ours too and carry the real detail
-            // (checksum cursor rules, archive boundaries), not a fixed
-            // sentence. Only `ChildExit` stays reduced: it passes the
-            // child's status through without an error object at all.
-            Error::Postgres(_) => Mapping::parity(LocalErrorCode::PostgresError),
+            // `Postgres` payloads are foreign (tokio-postgres driver text,
+            // rcgen/rustls sources via ca.rs), so the arm stays summarized;
+            // self-composed Postgres guidance goes through `PostgresUsage`
+            // (parity) or `Cleanup`. `Skills` and `Ledger` reach this
+            // envelope since the health review; their texts are ours and
+            // carry the real detail (checksum cursor rules, archive
+            // boundaries), not a fixed sentence. Only `ChildExit` stays
+            // reduced: it passes the child's status through without an
+            // error object at all.
+            Error::Postgres(_) => {
+                Mapping::redacted(LocalErrorCode::LocalError, "Local command failed")
+            }
             Error::Skills(_) => Mapping::parity(LocalErrorCode::LocalError),
             Error::Ledger(_) => Mapping::parity(LocalErrorCode::LocalError),
             Error::ChildExit(_) => {
@@ -1076,9 +1080,11 @@ mod tests {
             ),
             // Since the machine envelope also carries skills/ledger/update
             // failures, their self-composed detail (checksum verdicts, cursor
-            // rules, recovery commands) must reach agents verbatim.
+            // rules, recovery commands) must reach agents verbatim. The
+            // resume port guidance rides PostgresUsage; Postgres itself
+            // stays summarized (foreign driver text).
             (
-                Error::Postgres("cannot determine the TCP port of container 'x'".into()),
+                Error::PostgresUsage("cannot determine the TCP port of container 'x'".into()),
                 "postgres_error",
             ),
             (
@@ -1109,6 +1115,10 @@ mod tests {
     #[test]
     fn errors_carrying_foreign_output_stay_summarized() {
         for (error, expected) in [
+            (
+                Error::Postgres("psql: connection refused".into()),
+                "local_error",
+            ),
             (
                 Error::StartupExit {
                     kind: crate::error::StartupKind::ClickHouse,

@@ -400,7 +400,11 @@ async fn hub_pull(docker: &Docker, image_ref: &str, structured_output: bool) -> 
             Ok(info) => info,
             Err(error) => {
                 reporter.fail(&mut stderr.lock());
-                return Err(Error::Download(error.to_string()));
+                // DockerError, not Download: the payload is bollard's own
+                // text (daemon/registry body), which the machine envelope
+                // summarizes; Download stays parity for the updater's
+                // self-composed verdicts.
+                return Err(Error::DockerError(error.to_string()));
             }
         };
         reporter.event(&info, &mut stderr.lock());
