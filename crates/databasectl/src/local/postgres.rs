@@ -440,6 +440,7 @@ async fn start(
                     &server_cert,
                     &server_key,
                     &ca_cert,
+                    &tag,
                 )
                 .await?;
             }

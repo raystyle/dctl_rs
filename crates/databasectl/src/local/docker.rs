@@ -548,11 +548,14 @@ pub async fn create_postgres(docker: &Docker, opts: PostgresRunOpts<'_>) -> Resu
     Ok(created.id)
 }
 
-/// The postgres user's uid/gid in the official image. The uploaded key must
-/// be owned by the server user with mode 0600 — a bind mount cannot express
-/// that from a host user, which is why the material rides in as a tar whose
-/// entries carry these ids.
-const POSTGRES_UID_GID: u64 = 999;
+/// The postgres user's uid/gid in the official images: 999 on the Debian
+/// base, 70 on the Alpine base. The uploaded key must be owned by the
+/// server user with mode 0600 — a bind mount cannot express that from a
+/// host user, which is why the material rides in as a tar whose entries
+/// carry these ids.
+fn postgres_uid_for_tag(tag: &str) -> u64 {
+    if tag.contains("alpine") { 70 } else { 999 }
+}
 
 /// Build the in-memory tar carrying the certificate face into the container:
 /// server cert/key, the CA, and the dctl-managed hba file, all under
@@ -561,6 +564,7 @@ fn build_postgres_tls_tar(
     server_cert_pem: &str,
     server_key_pem: &str,
     ca_cert_pem: &str,
+    uid: u64,
 ) -> Result<Vec<u8>> {
     let mut builder = tar::Builder::new(Vec::new());
     let entries: [(&str, &str, u32); 4] = [
@@ -573,8 +577,8 @@ fn build_postgres_tls_tar(
         let mut header = tar::Header::new_gnu();
         header.set_size(contents.len() as u64);
         header.set_mode(mode);
-        header.set_uid(POSTGRES_UID_GID);
-        header.set_gid(POSTGRES_UID_GID);
+        header.set_uid(uid);
+        header.set_gid(uid);
         header.set_entry_type(tar::EntryType::Regular);
         header.set_cksum();
         builder
@@ -595,9 +599,15 @@ pub async fn upload_postgres_tls_material(
     server_cert_pem: &str,
     server_key_pem: &str,
     ca_cert_pem: &str,
+    tag: &str,
 ) -> Result<()> {
     use bollard::query_parameters::UploadToContainerOptionsBuilder;
-    let tar_bytes = build_postgres_tls_tar(server_cert_pem, server_key_pem, ca_cert_pem)?;
+    let tar_bytes = build_postgres_tls_tar(
+        server_cert_pem,
+        server_key_pem,
+        ca_cert_pem,
+        postgres_uid_for_tag(tag),
+    )?;
     let opts = UploadToContainerOptionsBuilder::default()
         .path("/var/lib/postgresql")
         .build();
@@ -1825,7 +1835,7 @@ mod tests {
     fn postgres_tls_tar_carries_container_ownership_and_modes() {
         // The uploaded key must land postgres-owned and owner-only inside
         // the container; Docker honors the tar entry ids/modes on extract.
-        let bytes = build_postgres_tls_tar("CERT", "KEY", "CA").unwrap();
+        let bytes = build_postgres_tls_tar("CERT", "KEY", "CA", 999).unwrap();
         let mut archive = tar::Archive::new(&bytes[..]);
         let mut seen: Vec<(String, u64, u64, u32, String)> = Vec::new();
         for entry in archive.entries().unwrap() {
@@ -1845,6 +1855,15 @@ mod tests {
         for (_, uid, gid, _, _) in &seen {
             assert_eq!((*uid, *gid), (999, 999), "every entry is postgres-owned");
         }
+        // The Alpine base runs postgres as uid 70; the entries follow the tag.
+        let alpine = build_postgres_tls_tar("CERT", "KEY", "CA", 70).unwrap();
+        let mut archive = tar::Archive::new(&alpine[..]);
+        let mut alpine_uids = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            alpine_uids.push(entry.header().uid().unwrap());
+        }
+        assert!(alpine_uids.iter().all(|uid| *uid == 70));
         let key = seen
             .iter()
             .find(|(path, ..)| path == "tls/server.key")

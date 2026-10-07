@@ -153,7 +153,9 @@ case_per_version_isolation() {
 
 # ── 5. dotenv reflects the actual container password (post-restart) ──
 case_dotenv_password_consistency() {
-    "$CTL" local postgres start --name e --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
+    # This case pins the password face's dotenv contract; fresh starts
+    # default to the certificate face (ADR-0011 / REQ-0016).
+    "$CTL" local postgres start --name e --version 18-alpine --auth password >/dev/null 2>&1 || { die "start"; return 1; }
     local pw_meta; pw_meta=$("$CTL" local postgres dotenv --name e 2>/dev/null \
         | grep POSTGRES_PASSWORD= | cut -d= -f2)
     [[ -n "$pw_meta" ]] || { die "no password emitted"; return 1; }
@@ -231,7 +233,7 @@ case_port_zero_rejected() {
 
 # ── 12. Non-TTY query path returns query result ──
 case_non_tty_query() {
-    "$CTL" local postgres start --name q --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
+    "$CTL" local postgres start --name q --version 18-alpine --auth password >/dev/null 2>&1 || { die "start"; return 1; }
     # Wait for pg to be query-ready (up to ~5s); the first start already waits
     # for the container, but pg itself takes a moment to accept queries.
     local cid; cid=$(jq -r .container_id "$(servers "$real_dir")/q-pg18.json")
@@ -250,7 +252,7 @@ case_non_tty_query() {
 
 # ── 13. dotenv preserves unmanaged vars and replaces in-place ──
 case_dotenv_preserves_other_vars() {
-    "$CTL" local postgres start --name r --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
+    "$CTL" local postgres start --name r --version 18-alpine --auth password >/dev/null 2>&1 || { die "start"; return 1; }
     cat > .env <<EOF
 DATABASE_URL=postgres://existing
 CLICKHOUSE_HOST=ch.example.com
@@ -261,6 +263,24 @@ EOF
     grep -q "POSTGRES_HOST=127.0.0.1" .env || { die "no POSTGRES_HOST"; return 1; }
     "$CTL" local postgres stop r >/dev/null 2>&1
     "$CTL" local postgres remove r >/dev/null 2>&1
+}
+
+# ── 13b. Certificate face: no password in dotenv, TLS client works ──
+case_cert_face_end_to_end() {
+    "$CTL" local postgres start --name c --version 18-alpine >/dev/null 2>&1 || { die "start"; return 1; }
+    "$CTL" local postgres dotenv --name c >/dev/null 2>&1 || { die "dotenv"; return 1; }
+    grep -q "^PGSSLMODE=verify-full" .env || { die "no PGSSLMODE"; return 1; }
+    grep -q "^PGSSLROOTCERT=" .env || { die "no PGSSLROOTCERT"; return 1; }
+    if grep -q "^POSTGRES_PASSWORD=" .env; then die "cert face emitted a password"; return 1; fi
+    local cid; cid=$(jq -r .container_id "$(servers "$real_dir")/c-pg18.json")
+    for _ in {1..50}; do
+        docker exec "$cid" pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+        sleep 0.2
+    done
+    local out; out=$("$CTL" local postgres client --name c --query "select 9 as nine" 2>&1)
+    echo "$out" | grep -q "9" || { die "cert client did not return 9: $out"; return 1; }
+    "$CTL" local postgres stop c >/dev/null 2>&1
+    "$CTL" local postgres remove c >/dev/null 2>&1
 }
 
 # ── 14. remove of running postgres is rejected ──
@@ -325,6 +345,7 @@ run_case stop_all_engine_scopes         case_stop_all_engine_scopes
 run_case port_zero_rejected             case_port_zero_rejected
 run_case non_tty_query                  case_non_tty_query
 run_case dotenv_preserves_other_vars    case_dotenv_preserves_other_vars
+run_case cert_face_end_to_end         case_cert_face_end_to_end
 run_case remove_running_rejected        case_remove_running_rejected
 run_case majors_start_and_serve         case_majors_start_and_serve
 run_case unsupported_majors             case_unsupported_majors
