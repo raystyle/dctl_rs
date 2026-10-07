@@ -972,9 +972,9 @@ CONTEXT FOR AGENTS:
   The face decides the shape (ADR-0011): certificate instances get POSTGRES_HOST/PORT/USER/
   DATABASE plus PGSSLMODE=verify-full and the PGSSLROOTCERT/PGSSLCERT/PGSSLKEY material
   paths, with no password; --auth password instances get POSTGRES_PASSWORD instead.
-  The instance must be running. POSTGRES_* keys and the PGSSL* quartet are managed lines:
-  they are rewritten per run (export prefixes on them are not preserved); other lines stay.
-  Password-bearing output belongs in --local, out of version control.")]
+  The instance must be running. POSTGRES_* keys are replaced in place (export prefixes
+  preserved); the PGSSL* quartet is rewritten per run without export prefixes; other
+  lines stay. Password-bearing output belongs in --local, out of version control.")]
     Dotenv {
         /// Instance name (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
