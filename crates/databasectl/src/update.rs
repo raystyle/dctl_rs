@@ -137,6 +137,63 @@ async fn fetch_latest_release(timeout: std::time::Duration) -> Result<GitHubRele
 /// The release workflow packages the binary at
 /// `dctl-<target>-v<version>/dctl` inside the tarball, so we
 /// match on the entry's file name rather than the full path.
+/// Verify the downloaded archive against the release's SHA256SUMS asset.
+/// Mismatch (or a sums file without an entry for this asset) is a hard
+/// failure; a 404 means a pre-checksum-era release and degrades to a
+/// warning so the update path stays usable across the transition.
+async fn verify_release_checksum(
+    client: &reqwest::Client,
+    tag: &str,
+    archive_name: &str,
+    archive_bytes: &[u8],
+) -> Result<()> {
+    let sums_url = format!("{}/{}/SHA256SUMS", RELEASES_BASE_URL, tag);
+    let response = client.get(&sums_url).send().await?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        eprintln!(
+            "warning: release {tag} publishes no SHA256SUMS asset; \
+             continuing without integrity verification"
+        );
+        return Ok(());
+    }
+    let response = response
+        .error_for_status()
+        .map_err(|e| Error::Download(format!("Could not fetch SHA256SUMS: {}", e)))?;
+    let sums = response.text().await?;
+    let expected = find_expected_digest(&sums, archive_name).ok_or_else(|| {
+        Error::Download(format!(
+            "SHA256SUMS for {tag} has no entry for {archive_name}; refusing to update"
+        ))
+    })?;
+    use sha2::{Digest, Sha256};
+    let actual_hex: String = Sha256::digest(archive_bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if actual_hex != expected {
+        return Err(Error::Download(format!(
+            "checksum mismatch for {archive_name}: expected {expected}, got {actual_hex}; \
+             refusing to update"
+        )));
+    }
+    Ok(())
+}
+
+/// Find this asset's line in a `sha256sum`-format sums file (digest, two
+/// spaces, filename); the digest comes back lowercased.
+fn find_expected_digest(sums: &str, archive_name: &str) -> Option<String> {
+    sums.lines().find_map(|line| {
+        let (digest, name) = line.split_once(char::is_whitespace)?;
+        name.trim()
+            .eq_ignore_ascii_case(archive_name)
+            .then(|| digest.trim().to_ascii_lowercase())
+    })
+}
+
+/// Upper bound on the decompressed binary the updater will accept; a
+/// malformed or bomb archive fails here instead of exhausting memory.
+const MAX_EXTRACTED_BINARY_BYTES: u64 = 256 * 1024 * 1024;
+
 fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>> {
     let decoder = GzDecoder::new(Cursor::new(archive_bytes));
     let mut archive = Archive::new(decoder);
@@ -154,10 +211,23 @@ fn extract_binary_from_archive(archive_bytes: &[u8]) -> Result<Vec<u8>> {
             .path()
             .map_err(|e| Error::Extract(format!("Failed to read archive entry path: {}", e)))?;
         if path.file_name().and_then(|n| n.to_str()) == Some("dctl") {
+            if entry.header().size().unwrap_or(u64::MAX) > MAX_EXTRACTED_BINARY_BYTES {
+                return Err(Error::Extract(format!(
+                    "release archive entry exceeds the {} byte limit; refusing to extract",
+                    MAX_EXTRACTED_BINARY_BYTES
+                )));
+            }
             let mut buf = Vec::new();
-            io::copy(&mut entry, &mut buf).map_err(|e| {
+            let mut limited = std::io::Read::take(&mut entry, MAX_EXTRACTED_BINARY_BYTES + 1);
+            io::copy(&mut limited, &mut buf).map_err(|e| {
                 Error::Extract(format!("Failed to extract binary from archive: {}", e))
             })?;
+            if buf.len() as u64 > MAX_EXTRACTED_BINARY_BYTES {
+                return Err(Error::Extract(
+                    "release archive entry exceeds the extraction limit; refusing to extract"
+                        .into(),
+                ));
+            }
             return Ok(buf);
         }
     }
@@ -224,6 +294,13 @@ pub async fn perform_update(json: bool) -> Result<UpdateResult> {
         .map_err(|e| Error::Download(format!("Download failed: {}", e)))?;
 
     let archive_bytes = response.bytes().await?;
+
+    // Integrity: the release carries a SHA256SUMS asset next to the
+    // archives. A present-but-mismatched checksum aborts before anything is
+    // extracted or written; releases from before the checksum era (no asset
+    // at all) proceed with a loud warning rather than bricking `dctl update`.
+    verify_release_checksum(&client, latest, &archive_name, &archive_bytes).await?;
+
     let binary_bytes = extract_binary_from_archive(&archive_bytes)?;
 
     // Get the path to the currently running binary
@@ -390,6 +467,29 @@ pub async fn force_refresh_update_cache() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sha256sums_entry_lookup_matches_this_asset_only() {
+        let sums = "\
+b3a1… dctl-x86_64-unknown-linux-musl-v0.8.0.tar.gz\n\
+7f09d1c2aa  dctl-aarch64-apple-darwin-v0.8.0.tar.gz\n\
+0000  dctl-x86_64-pc-windows-gnu-v0.8.0.zip\n";
+        assert_eq!(
+            find_expected_digest(sums, "dctl-aarch64-apple-darwin-v0.8.0.tar.gz"),
+            Some("7f09d1c2aa".to_string()),
+            "the asset's own line wins regardless of separators"
+        );
+        assert_eq!(
+            find_expected_digest(sums, "DCTL-X86_64-UNKNOWN-LINUX-MUSL-V0.8.0.TAR.GZ"),
+            Some("b3a1…".to_string()),
+            "name matching is case-insensitive"
+        );
+        assert_eq!(
+            find_expected_digest(sums, "dctl-sparc-unknown-linux-gnu-v0.8.0.tar.gz"),
+            None,
+            "an absent asset yields no digest (hard failure upstream)"
+        );
+    }
 
     #[test]
     fn json_update_check_preserves_the_current_and_actual_latest_versions() {

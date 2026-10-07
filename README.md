@@ -41,7 +41,7 @@ $ git clone https://github.com/raystyle/dctl_rs
 $ cargo build --release -p databasectl
 ```
 
-直接下载见 [GitHub Releases](https://github.com/raystyle/dctl_rs/releases),归档命名 `dctl-<target>-v<version>.tar.gz`。
+直接下载见 [GitHub Releases](https://github.com/raystyle/dctl_rs/releases),归档命名 `dctl-<target>-v<version>.tar.gz`;每个 release 附 `SHA256SUMS`,`dctl update` 下载后会先对账再落盘(校验和不符即拒装;无该资产的过渡期 release 打警告放行)。
 
 `dctl update` 自更新到最新 GitHub release,`dctl update --check` 仅检查不安装。没有 crates.io、npm、PyPI 渠道;GitHub Releases 是唯一分发点。
 

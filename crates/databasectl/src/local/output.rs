@@ -339,11 +339,19 @@ impl LocalErrorOutput {
 
             // ── bounded fallback ────────────────────────────────────────────
             // Subprocess text and `Postgres` (OS text from a failed psql
-            // exec) are foreign output. `Skills` and `Ledger` belong to other
-            // command surfaces and are never printed through this envelope; `ChildExit` passes the child's status through
-            // without an error object at all.
-            Error::Postgres(_) | Error::Skills(_) | Error::Ledger(_) | Error::ChildExit(_) => {
+            // exec) are foreign output. `Skills` and `Ledger` ride the same
+            // envelope (their failures reach it since the health review) and
+            // name their own surface instead of masquerading as local;
+            // `ChildExit` passes the child's status through without an error
+            // object at all.
+            Error::Postgres(_) | Error::ChildExit(_) => {
                 Mapping::redacted(LocalErrorCode::LocalError, "Local command failed")
+            }
+            Error::Skills(_) => {
+                Mapping::redacted(LocalErrorCode::LocalError, "Skills command failed")
+            }
+            Error::Ledger(_) => {
+                Mapping::redacted(LocalErrorCode::LocalError, "Ledger command failed")
             }
         };
         Self {

@@ -187,9 +187,14 @@ async fn run_parsed(cli: Cli) -> i32 {
     // Decide whether to surface the update notice before `run` consumes the
     // command. Shown on every command that does not emit machine-readable JSON.
     let show_notice = should_show_update_notice(&cli.command);
-    let local_json = match &cli.command {
+    // The machine-readable error envelope applies to every command that can
+    // emit JSON (flag or agent detection), not just `local`: README promises
+    // "errors as stable machine-readable envelopes" without scoping it.
+    let machine_json = match &cli.command {
         Commands::Local(args) => json_output(args.json),
-        _ => false,
+        Commands::Skills(args) => json_output(args.json),
+        Commands::Update(args) => json_output(args.json),
+        Commands::Ledger(args) => json_output(args.json),
     };
 
     let result = run(cli.command).await;
@@ -207,7 +212,7 @@ async fn run_parsed(cli: Cli) -> i32 {
             let is_child_exit = matches!(&e, Error::ChildExit(_));
             if !is_child_exit {
                 match &e {
-                    _ if local_json => local::output::print_error(&e),
+                    _ if machine_json => local::output::print_error(&e),
                     _ => {
                         use std::io::Write;
                         // Not `eprintln!`, which panics on a closed stderr.

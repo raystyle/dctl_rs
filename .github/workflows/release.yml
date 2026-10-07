@@ -150,6 +150,10 @@ jobs:
           for dir in artifacts/dctl-*-v*/; do
             cp "$dir"/*.tar.gz release/
           done
+          # Integrity anchor for `dctl update` (health review F-06): the
+          # updater verifies the archive digest against this file and
+          # refuses a mismatch before extracting anything.
+          cd release && sha256sum *.tar.gz > SHA256SUMS
           ls -l release/
 
       - name: Create GitHub Release
