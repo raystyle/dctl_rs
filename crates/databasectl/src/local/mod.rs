@@ -84,7 +84,6 @@ async fn install_postgres(
     if !force && docker::image_exists(&docker, &image_ref).await? {
         let out = output::InstallOutput {
             version: format!("postgres@{tag}"),
-            set_as_default: false,
         };
         if !json {
             eprintln!("postgres:{tag} is already pulled");
@@ -97,7 +96,6 @@ async fn install_postgres(
 
     let out = output::InstallOutput {
         version: format!("postgres@{tag}"),
-        set_as_default: false,
     };
     output::print_output(&out, json);
     Ok(())
@@ -115,7 +113,6 @@ async fn install_falkordb(
     if !force && docker::image_exists(&docker, &image_ref).await? {
         let out = output::InstallOutput {
             version: format!("falkordb@{tag}"),
-            set_as_default: false,
         };
         if !json {
             eprintln!("{image_ref} is already pulled");
@@ -128,7 +125,6 @@ async fn install_falkordb(
 
     let out = output::InstallOutput {
         version: format!("falkordb@{tag}"),
-        set_as_default: false,
     };
     output::print_output(&out, json);
     Ok(())
@@ -165,7 +161,6 @@ async fn install_clickhouse(
     if !force && docker::image_exists(&docker, &image_ref).await? {
         let out = output::InstallOutput {
             version: format!("clickhouse@{tag}"),
-            set_as_default: false,
         };
         if !json {
             eprintln!("{image_ref} is already pulled");
@@ -176,7 +171,6 @@ async fn install_clickhouse(
     docker::pull_image(&docker, &image_ref, json, registry_override).await?;
     let out = output::InstallOutput {
         version: format!("clickhouse@{tag}"),
-        set_as_default: false,
     };
     output::print_output(&out, json);
     Ok(())
@@ -470,7 +464,10 @@ where
         .iter()
         .map(|server| {
             let (name, version) = match server.engine {
-                server::Engine::Clickhouse => (server.name.clone(), None),
+                server::Engine::Clickhouse => (
+                    clickhouse::ch_user_name_from_key(&server.name).to_string(),
+                    Some(server.version.clone()),
+                ),
                 server::Engine::Postgres => (
                     postgres::user_name_from_key(&server.name).to_string(),
                     Some(server.version.clone()),
@@ -549,7 +546,11 @@ mod tests {
         assert_eq!(output.servers.len(), 3);
         assert_eq!(output.servers[0].name, "default");
         assert_eq!(output.servers[0].engine, "clickhouse");
-        assert_eq!(output.servers[0].version, None);
+        assert_eq!(
+            output.servers[0].version.as_deref(),
+            Some("clickhouse:26.8"),
+            "CH entries carry the stored version like pg/fk, not the disk key"
+        );
         assert!(!output.servers[0].stopped);
         assert_eq!(
             output.servers[0].error.as_deref(),

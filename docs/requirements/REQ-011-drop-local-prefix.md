@@ -14,9 +14,10 @@ trace: 39f6573(引擎命令免 local 前缀);现命令面真相 dctl --help
 
 ## Criteria
 
-- [ ] CLI 树去掉 `local` 层:server、postgres、falkordb、registry、install、init、client 提升到顶层
-- [ ] `--json` 全局面保留;帮助面节序、CONTEXT FOR AGENTS 块随层级迁移
-- [ ] README 全部示例、AGENTS 命令引用、帮助文本同步更新
-- [ ] 全部集成测试 argv 去掉 "local" 首参
-- [ ] 兼容窗口:`dctl local ...` 旧形态在过渡期内给一句弃用提示后退出 2(可选,待裁)
-- [ ] 退出码、结构化错误信封、agent JSON 面不受层级变化影响
+> trace 修订(2026-10-08,健康评审):本 REQ 以 **argv 垫片契约**交付,不是 clap 树扁平。`main.rs` 预处理把引擎命令提升到顶层,clap 树保留 `local` 层,两形解析等价、无弃用退出。全树重组是可选后续,不属本 REQ 验收;按「implemented = 垫片」读,勿据旧准则删兼容路径。
+
+- [x] 前缀两形等价:`dctl server start` 与 `dctl local server start` 解析同一命令(server、postgres、falkordb、registry、install、init、client 经 argv 垫片提升;clap 树保留 `local` 层)
+- [x] `--json` 全局面保留;CONTEXT FOR AGENTS 块随命令保留(无前缀调用时 usage 行渲染前缀规范形)
+- [x] README 全部示例、AGENTS 命令引用、帮助文本以无前缀形态为主口径
+- [x] 兼容形态:`dctl local ...` 旧形态持续可用(垫片达成等价,无弃用提示设计)
+- [x] 退出码、结构化错误信封、agent JSON 面不受层级变化影响

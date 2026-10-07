@@ -63,7 +63,6 @@ NON_INSTALL_EXACT_PATHS = frozenset(
         "crates/databasectl/tests/local_falkor_client_usage_test.rs",
         "crates/databasectl/tests/ledger_request_test.rs",
         "crates/databasectl/tests/local_clickhouse_client_test.rs",
-        "crates/databasectl/tests/local_clickhouse_docker_test.rs",
         "crates/databasectl/tests/local_falkor_readiness_test.rs",
         "crates/databasectl/tests/skills_usage_test.rs",
     }

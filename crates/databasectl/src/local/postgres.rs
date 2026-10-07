@@ -1346,9 +1346,11 @@ async fn run_native_query(
     run_native_query_tls(host, port, user, password, database, sql, false).await
 }
 
-/// `prefer_tls`: try the mTLS certificate leg first (managed instances,
-/// where dctl knows the server speaks TLS); direct mode connects to
-/// arbitrary servers and goes cleartext.
+/// `prefer_tls`: try the mTLS certificate leg first. The server-side leg of
+/// ADR-0011 is not wired up yet — managed containers do not speak TLS — so
+/// the attempt degrades in-band to the password leg; direct mode skips the
+/// attempt and goes cleartext. The shape stays so the certificate leg lights
+/// up unchanged when the server side lands.
 async fn run_native_query_tls(
     host: &str,
     port: u16,

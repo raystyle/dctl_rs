@@ -20,7 +20,7 @@ tags: [client, engines]
 1. **Postgres 选 tokio-postgres**:一次性 CLI 查询用不上 sqlx 的连接池与编译期校验(后者还需构建期 DATABASE_URL),diesel 的 ORM 面与 CLI 无关;tokio-postgres 是纯 Rust 低层驱动,与仓内 tokio 栈同频,scram/md5 认证齐备。同步封装 postgres 与全 async 仓逆流,不取。
 2. **FalkorDB 选官方 falkordb crate(v0.10,tokio feature)**:官方维护、类型化参数与按列名读结果、同步/异步双面;历史社区库不取。**`-q` 语义升为 Cypher 级**(接 Cypher 语句,不再透传 GRAPH.QUERY 等裸 redis 命令),属破坏性变更,README 出迁移注;raw 命令道不保留(用户裁定单通道)。
 3. **连接面**:两引擎经容器发布端口(5432/6379)从宿主直连;凭据复用实例元数据(start 时生成/存储的口令),不经 argv 不入日志,与既有边界同纪律。
-4. **查询道切分**:程序化道(-q、--queries-file、stdin)全原生;交互式 REPL(无 -q)保留 docker exec 进容器内 psql/redis-cli,库不重建 REPL。
+4. **查询道切分**:程序化道全原生(Postgres:-q、--queries-file、stdin;FalkorDB:-q 与单条 stdin,无 --queries-file 旗标);交互式 REPL(无 -q)保留 docker exec 进容器内 psql/redis-cli,库不重建 REPL。
 5. **输出契约**:人类面表格式渲染由 dctl 自绘(列对齐、NULL 显示),纪律对齐 ClickHouse client(查询输出保持原生语义、--json 出结构化面);退出码失败 1、usage 2 不变。
 6. **依赖面**:tokio-postgres 默认无 TLS(localhost 容器面不需要,rustls feature 留旋钮);falkordb 依赖 redis crate 纯 Rust;musl 静态发布不受影响。
 

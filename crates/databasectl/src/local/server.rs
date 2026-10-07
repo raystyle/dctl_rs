@@ -233,7 +233,7 @@ fn migration_refusal(detail: String) -> Error {
     Error::StateMigration(format!(
         "refusing to migrate project state across filesystems: {detail} \
          Resolve it outside dctl (locate the containers with \
-         `docker ps --filter label=created_by=dctl` and `docker stop` them, or \
+         `docker ps --filter label=created_by` and `docker stop` them, or \
          make Docker reachable), then retry the command."
     ))
 }

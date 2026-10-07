@@ -7,9 +7,10 @@
 //! (`~/.dctl/registry/auth`) or the `DCTL_REGISTRY_AUTH` carrier — never
 //! from argv, never logged.
 //!
-//! Pulls flow through the fallback chain decided in the ADR: daemon pull
-//! from Docker Hub first, then this client against registry.ohmygh.com,
-//! then the local cache tar. Successful private pulls refresh the cache.
+//! Pulls flow through the fallback chain decided in the ADR: this client
+//! against registry.ohmygh.com first, then a daemon pull from Docker Hub,
+//! then the local cache tar (ADR-0010 flipped the first two). Successful
+//! private pulls refresh the cache.
 
 use crate::error::{Error, Result};
 use oci_client::client::{ClientConfig, ClientProtocol};

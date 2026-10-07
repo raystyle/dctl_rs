@@ -431,16 +431,11 @@ pub fn print_error(error: &Error) {
 #[derive(Debug, Clone, Serialize)]
 pub struct InstallOutput {
     pub version: String,
-    pub set_as_default: bool,
 }
 
 impl fmt::Display for InstallOutput {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Installed version {}", self.version)?;
-        if self.set_as_default {
-            write!(f, " (set as default)")?;
-        }
-        Ok(())
+        write!(f, "Installed version {}", self.version)
     }
 }
 
@@ -885,7 +880,7 @@ impl fmt::Display for ServerStopOutput {
 #[derive(Debug, Clone, Serialize)]
 pub struct ServerStopEntry {
     pub name: String,
-    /// "clickhouse" or "postgres".
+    /// "clickhouse", "postgres", or "falkordb".
     pub engine: String,
     /// Postgres image version, used to distinguish same-name major versions.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1150,11 +1145,9 @@ mod tests {
     fn install_output_renders_engine_and_tag() {
         let out = InstallOutput {
             version: "clickhouse@26.8".into(),
-            set_as_default: false,
         };
         let json = serde_json::to_value(&out).unwrap();
         assert_eq!(json["version"], "clickhouse@26.8");
-        assert_eq!(json["set_as_default"], false);
     }
 
     #[test]

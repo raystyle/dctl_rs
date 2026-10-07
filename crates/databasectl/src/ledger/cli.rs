@@ -55,6 +55,10 @@ CONTEXT FOR AGENTS:
 #[derive(Subcommand, Debug)]
 pub enum IssueCommands {
     /// Open a new issue (bug or improvement task)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  The acceptance text is the merge bar - future reviewers judge against it.
+  Writing is signed: needs DCTL_LEDGER_KEY or ~/.dctl/ledger/dctl_rs.pem.")]
     New {
         /// One-line title of the task
         #[arg(long)]
@@ -70,6 +74,10 @@ pub enum IssueCommands {
     },
 
     /// List issues (family pagination: limit 100 + before cursor)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  One page per call; when has_more is set, pass the last row's id as
+  --before on the next call. Reads need no credentials.")]
     List {
         /// Page size (the service caps at 100)
         #[arg(long, default_value_t = 100)]
@@ -81,6 +89,9 @@ pub enum IssueCommands {
     },
 
     /// Show one issue with its event history
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Reads need no credentials; the number is the plain issue id.")]
     Show {
         /// Issue number
         number: String,
@@ -139,6 +150,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Attach a verification attestation to an artifact
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Kinds map to the pipeline: attest_dev, attest_prod, verification_failed.
+  Writes are signed like every ledger mutation.")]
     Attest {
         /// Artifact id
         id: String,

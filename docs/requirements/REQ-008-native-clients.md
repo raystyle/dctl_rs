@@ -10,7 +10,7 @@ trace: native-clients 批;ADR-0009
 
 ## Scenario
 
-宿主未装 psql/redis-cli 时,`dctl local postgres client` 与 `dctl local falkordb client` 的程序化查询道退化为容器内执行;用户令(2026-09-21 深夜裁定)要求把「client 内置集成」做成三引擎实态:Postgres 走 tokio-postgres,FalkorDB 走官方 falkordb crate,程序化查询(-q、--queries-file、stdin)全原生化,交互式 REPL 保留 docker exec。
+宿主未装 psql/redis-cli 时,`dctl local postgres client` 与 `dctl local falkordb client` 的程序化查询道退化为容器内执行;用户令(2026-09-21 深夜裁定)要求把「client 内置集成」做成三引擎实态:Postgres 走 tokio-postgres,FalkorDB 走官方 falkordb crate,程序化查询全原生化(Postgres:-q、--queries-file、stdin;FalkorDB:-q 与单条 stdin),交互式 REPL 保留 docker exec。
 
 ## Criteria
 

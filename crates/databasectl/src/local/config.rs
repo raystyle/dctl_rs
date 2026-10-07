@@ -2,11 +2,12 @@
 //!
 //! Users drop named ClickHouse config files into `~/.dctl/configs/` and
 //! reference them by name with `dctl local server start --config
-//! <NAME>`. The file is staged into the server's `config.d/` directory, so it
-//! is merged as an overlay on ClickHouse's built-in defaults; the launcher
-//! still forces `--path=./` and the ports as command-line overrides (which beat
-//! config-file values), so the managed server lifecycle is preserved regardless
-//! of what the config file contains.
+//! <NAME>`. The file is bind-mounted read-only into the container's
+//! `/etc/clickhouse-server/config.d/`, so it is merged as an overlay on the
+//! image's built-in defaults; ports and credentials are managed through
+//! container env and Docker port bindings, which the config overlay does
+//! not touch, so the managed server lifecycle is preserved regardless of
+//! what the config file contains.
 
 use crate::error::{Error, Result};
 use crate::paths;
@@ -131,11 +132,6 @@ pub fn list_configs() -> Result<Vec<String>> {
     Ok(list_configs_in(&paths::configs_dir()?))
 }
 
-/// Stages (or clears) the dctl-managed config overlay in `<data_dir>/config.d/`.
-///
-/// ClickHouse merges files in the `config.d/` directory next to its working
-/// directory with its built-in defaults, so a partial override file takes
-/// effect without replacing the whole config. We own a single file there named
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -31,12 +31,16 @@ impl FromStr for InstallVersionArg {
             .strip_prefix("postgres@")
             .or_else(|| input.strip_prefix("postgres:"))
         {
+            // Same clap-time validation as the ClickHouse arm below: an
+            // invalid tag is a usage error (exit 2), not a runtime one.
+            crate::local::postgres::validate_pg_tag(tag).map_err(|e| e.to_string())?;
             return Ok(Self::Postgres(tag.to_string()));
         }
         if let Some(version) = input
             .strip_prefix("falkordb@")
             .or_else(|| input.strip_prefix("falkordb:"))
         {
+            crate::local::falkordb::validate_fk_tag(version).map_err(|e| e.to_string())?;
             return Ok(Self::Falkordb(version.to_string()));
         }
 
@@ -305,12 +309,12 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Native registry v2 client with an offline fallback chain; engine installs
-  and starts already use the chain transparently (Docker Hub, then this
-  registry, then the local cache tar). These commands force the private
-  path: `pull` fetches an image as an OCI layout and loads it into the
-  daemon (refreshing the ~/.dctl/registry/cache tar); `catalog` lists the
-  registry's repositories. Credentials come from ~/.dctl/registry/auth or
-  the DCTL_REGISTRY_AUTH carrier - never from argv.")]
+  and starts already use the chain transparently (this registry first, then
+  Docker Hub, then the local cache tar - ADR-0010). These commands force
+  the private path: `pull` fetches an image as an OCI layout and loads it
+  into the daemon (refreshing the ~/.dctl/registry/cache tar); `catalog`
+  lists the registry's repositories. Credentials come from
+  ~/.dctl/registry/auth or the DCTL_REGISTRY_AUTH carrier - never from argv.")]
     Registry {
         #[command(subcommand)]
         command: RegistryCommands,
@@ -351,6 +355,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// List repositories in the private registry
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Anonymous reads work without credentials; configured ones ride along.
+  The endpoint defaults to registry.ohmygh.com (DCTL_REGISTRY_URL overrides).")]
     Catalog,
 }
 
@@ -360,8 +368,9 @@ pub enum FalkorCommands {
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Ports: 6379 (Redis protocol) and 3000 (Browser UI); auto-picked when busy, never the same port.
-  --query content is a redis command; quote the Cypher, e.g.
-  `falkordb client -q 'GRAPH.QUERY g \"MATCH (n) RETURN n\"'`.
+  The client's --query takes one Cypher statement, e.g.
+  `falkordb client -q 'MATCH (n) RETURN n'`; redis-command passthrough
+  retired 2026-09-22 (ADR-0009).
   FALKORDB_ARGS (module tuning) may be set with --env; REDIS_ARGS is managed.")]
     Start {
         /// Server name (default: "default", or random if default is already running)
@@ -420,6 +429,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Stop a running FalkorDB instance
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Keeps the container and stored password for resume; idempotent.
+  Stop-all lives at `local server stop-all` (all engines) or here (FalkorDB only).")]
     Stop {
         /// Name of the instance to stop (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -440,6 +453,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Stop all FalkorDB instances in this project
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Idempotent per instance; containers and passwords survive for resume.
+  Partial failures are reported per instance (--json carries stopped flags).")]
     StopAll,
 
     /// Remove a stopped FalkorDB instance and its data
@@ -576,7 +593,11 @@ CONTEXT FOR AGENTS:
   A failed fresh start rolls back container and data; pre-existing data is kept.")]
     Start {
         /// Server name (default: "default", or random if default is already running)
-        #[arg(value_name = "NAME", conflicts_with = "name_flag")]
+        #[arg(
+            value_name = "NAME",
+            conflicts_with = "name_flag",
+            value_parser = parse_server_name_arg
+        )]
         name: Option<String>,
 
         /// Compatibility form for the server name; prefer positional NAME
@@ -584,7 +605,8 @@ CONTEXT FOR AGENTS:
             long = "name",
             value_name = "NAME",
             conflicts_with = "name",
-            hide = true
+            hide = true,
+            value_parser = parse_server_name_arg
         )]
         name_flag: Option<String>,
 
@@ -652,6 +674,10 @@ CONTEXT FOR AGENTS:
     Configs,
 
     /// List all server instances (running and stopped)
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Covers every engine in this project, running and stopped.
+  Scoped to the exact working directory; state lives under ~/.dctl/projects/.")]
     List,
 
     /// Stop a running server
@@ -678,6 +704,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Stop all servers of every engine in this project
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Idempotent per instance; data and credentials survive for resume.
+  Partial failures are reported per instance (--json carries stopped flags).")]
     StopAll,
 
     /// Remove a stopped server and its data
@@ -806,6 +836,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Stop a running Postgres instance
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Keeps the container for resume with its stored settings; idempotent.
+  Stop-all lives at `local server stop-all` (all engines) or here (Postgres only).")]
     Stop {
         /// Name of the instance to stop (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -826,6 +860,10 @@ CONTEXT FOR AGENTS:
     },
 
     /// Stop all Postgres instances in this project
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Idempotent per instance; data and credentials survive for resume.
+  Partial failures are reported per instance (--json carries stopped flags).")]
     StopAll,
 
     /// Remove a stopped Postgres instance and its data
@@ -1041,8 +1079,8 @@ mod tests {
                 InstallVersionArg::Falkordb("latest".to_string()),
             ),
             (
-                "  postgres@16  ",
-                InstallVersionArg::Postgres("16".to_string()),
+                "  postgres@17  ",
+                InstallVersionArg::Postgres("17".to_string()),
             ),
         ] {
             let LocalCommands::Install { version, .. } = local_command(&["install", input]) else {
@@ -1326,7 +1364,9 @@ mod tests {
     #[test]
     fn server_start_help_renders_default_name_without_escaped_quotes() {
         let help = rendered_help(&["server", "start", "--help"]);
-        assert!(help.contains(r#"(default: "default""#), "{help}");
+        // Structural rendering property: quoted words from doc comments
+        // appear literally, never as escaped sequences.
+        assert!(help.contains(r#""default""#), "{help}");
         assert!(!help.contains(r#"\"default\""#), "{help}");
     }
 

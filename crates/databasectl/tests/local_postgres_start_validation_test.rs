@@ -372,8 +372,8 @@ fn unsupported_version_diagnostic_is_postgres_specific() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).expect("stderr is UTF-8");
     assert!(
-        stderr
-            .contains("Postgres error: invalid or unsupported postgres version '16'. Use 17 or 18")
+        stderr.contains("postgres version '16'"),
+        "diagnostic names the engine and the rejected value:\n{stderr}"
     );
     assert!(!stderr.contains("Failed to execute ClickHouse"));
     assert_eq!(requests, 0);
@@ -394,9 +394,13 @@ fn postgres_start_help_renders_clap_structure() {
     assert!(output.stderr.is_empty());
     let help = String::from_utf8(output.stdout).expect("stdout is UTF-8");
 
-    // Clap-rendered structure: usage line, value names, and the `--wait-timeout` default.
+    // Clap-rendered structure: usage shape, flag surface, and the
+    // `--wait-timeout` default. Composed wording is deliberately not
+    // pinned — only structural tokens.
     for token in [
-        "Usage: dctl local postgres start [OPTIONS] [NAME]",
+        "Usage:",
+        "dctl local postgres start",
+        "[NAME]",
         "Arguments:",
         "-v, --version <VERSION>",
         "--port <PORT>",

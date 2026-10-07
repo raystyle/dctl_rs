@@ -135,10 +135,14 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
             };
             return Err(client.error(ErrorKind::ArgumentConflict, message));
         }
-        let Some(message) = args
+        let start_error = args
             .postgres_start_validation_error()
-            .or_else(|| args.clickhouse_start_validation_error())
-        else {
+            .map(|message| ("postgres", message))
+            .or_else(|| {
+                args.clickhouse_start_validation_error()
+                    .map(|message| ("server", message))
+            });
+        let Some((engine, message)) = start_error else {
             if let Some(message) = args.falkor_start_validation_error() {
                 let start = cmd
                     .find_subcommand_mut("local")
@@ -149,11 +153,16 @@ fn validate_post_parse(cli: &Cli, cmd: &mut clap::Command) -> std::result::Resul
             }
             return Ok(());
         };
+        // The usage line must point at the command whose flags are at fault;
+        // mounting a ClickHouse conflict on `postgres start` misleads both
+        // humans and agents reading the error.
         let start = cmd
             .find_subcommand_mut("local")
-            .and_then(|local| local.find_subcommand_mut("postgres"))
-            .and_then(|postgres| postgres.find_subcommand_mut("start"))
-            .expect("local postgres start command must exist");
+            .and_then(|local| local.find_subcommand_mut(engine))
+            .and_then(|engine_cmd| engine_cmd.find_subcommand_mut("start"))
+            .unwrap_or_else(|| {
+                panic!("local {engine} start command must exist");
+            });
         return Err(start.error(ErrorKind::ArgumentConflict, message));
     }
 
@@ -385,6 +394,41 @@ mod tests {
         .err()
         .expect("--query and --queries-file are mutually exclusive");
         assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn clickhouse_start_validation_error_mounts_on_server_start() {
+        // The usage line must point at the command whose flags are at fault;
+        // postgres and clickhouse starts produce mutually exclusive errors.
+        let error = parse_and_validate(&[
+            "dctl", "local", "server", "start", "--env", "FOO=1", "--env", "FOO=2",
+        ])
+        .err()
+        .expect("duplicate --env keys must fail validation");
+        assert_eq!(error.kind(), ErrorKind::ArgumentConflict);
+        assert_eq!(error.exit_code(), 2);
+        let message = error.to_string();
+        assert!(message.contains("dctl local server start"), "{message}");
+        assert!(!message.contains("postgres"), "{message}");
+    }
+
+    #[test]
+    fn clickhouse_start_rejects_invalid_names_at_clap_time() {
+        // Same exit code as the Postgres/FalkorDB starts: usage error (2).
+        let error = Cli::try_parse_from(["dctl", "local", "server", "start", "../unsafe"])
+            .err()
+            .expect("an invalid server name must fail parsing");
+        assert_eq!(error.exit_code(), 2);
+    }
+
+    #[test]
+    fn install_selector_validates_pg_and_fk_tags_at_clap_time() {
+        for selector in ["postgres@16", "falkordb@1.2"] {
+            let error = Cli::try_parse_from(["dctl", "local", "install", selector])
+                .err()
+                .unwrap_or_else(|| panic!("invalid selector {selector} must fail parsing"));
+            assert_eq!(error.exit_code(), 2);
+        }
     }
 
     #[test]

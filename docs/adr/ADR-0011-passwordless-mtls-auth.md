@@ -29,3 +29,5 @@ tags: [auth, tls, certificates]
 - TLS-only 意味着明文口令不再出现在 dotenv 输出(密码字段变证书路径)。
 - 每实例 start 多一步证书签发(毫秒级 rcgen,可忽略)。
 - FK 内嵌基座版本是最大不确定性,留实测闸门。
+
+> 追注(2026-10-08,健康评审):落地进度修正。现行码只含客户端基建(`~/.dctl/ca/` 本地 CA、客户端证书签发、PG client 的 Prefer 先试再带内降级);决策 3 的服务端面(容器 ssl=on、pg_hba cert 法)与决策 4 的 `--auth` 旋钮、dotenv 证书道均未接入,用户可见行为仍为口令道。REQ-009 状态已同步修正为 draft;服务端腿另立 REQ 时从其判据清单迁出。

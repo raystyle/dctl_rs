@@ -254,10 +254,10 @@ impl std::fmt::Display for ArtifactListOutput {
             .to_string();
         writeln!(f, "{table}")?;
         write!(f, "count {} (this page)", self.count)?;
-        if self.has_more
-            && let Some(id) = &self.next_before
-        {
-            write!(f, ", more available: rerun with --before {id}")?;
+        if self.has_more && self.next_before.is_some() {
+            // Artifact listing is single-page today (no --before flag), so
+            // the hint must not send users to a flag that does not exist.
+            write!(f, ", more available beyond this page")?;
         }
         Ok(())
     }

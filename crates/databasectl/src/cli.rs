@@ -57,6 +57,10 @@ CONTEXT FOR AGENTS:
     Skills(SkillsArgs),
 
     /// Update dctl to the latest version
+    #[command(after_help = "\
+CONTEXT FOR AGENTS:
+  Fetches the latest GitHub release and replaces the running binary.
+  --check only reports the decision; a plain update installs it.")]
     Update(UpdateArgs),
 }
 
@@ -218,6 +222,12 @@ mod tests {
                         ));
                     }
                 }
+            } else if !command.has_subcommands() {
+                // README promises the block on every command's --help; a
+                // leaf without one silently breaks that contract.
+                failures.push(format!(
+                    "{path}: every leaf command must carry a CONTEXT FOR AGENTS after_help block"
+                ));
             }
         });
         assert!(failures.is_empty(), "{}", failures.join("\n"));

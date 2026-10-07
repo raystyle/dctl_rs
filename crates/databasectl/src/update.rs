@@ -332,7 +332,8 @@ fn cache_is_stale(cache: Option<(u64, String)>, now: u64) -> bool {
 }
 
 /// Print an update notice from cached data only. No network, no async.
-/// Called synchronously before the command runs so output never interleaves.
+/// Called at the very end of the command, after its output, so the notice
+/// never interleaves with command output or JSON.
 pub fn print_cached_update_notice() {
     if let Some((_, cached_version)) = read_update_check() {
         let current = env!("CARGO_PKG_VERSION");
