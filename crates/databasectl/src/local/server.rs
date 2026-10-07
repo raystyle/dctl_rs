@@ -76,6 +76,12 @@ pub struct ServerInfo {
     pub engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
+    /// Postgres authentication face (ADR-0011): `Some(true)` = certificate
+    /// (mTLS) instances, `Some(false)` = explicit `--auth password`, and
+    /// `None` = metadata predating the split (password behavior). Other
+    /// engines leave it `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<bool>,
 }
 
 /// A server entry shown in list output — may or may not be running.
@@ -1096,6 +1102,7 @@ mod fk_key_tests {
             cwd: "/tmp".into(),
             engine,
             container_id: Some("cid".into()),
+            tls: None,
         }
     }
 
@@ -1180,6 +1187,7 @@ mod tests {
             cwd: "/tmp/project".into(),
             engine: Engine::Clickhouse,
             container_id: None,
+            tls: None,
         }
     }
 
@@ -1224,6 +1232,7 @@ mod tests {
             cwd: "/tmp/proj".into(),
             engine: Engine::Postgres,
             container_id: Some("abc123".into()),
+            tls: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: ServerInfo = serde_json::from_str(&json).unwrap();
@@ -1519,6 +1528,7 @@ mod state_bucket_tests {
                 cwd: "/work".into(),
                 engine: Engine::Postgres,
                 container_id: None,
+                tls: None,
             })
             .unwrap(),
         )
@@ -1596,6 +1606,7 @@ mod state_bucket_tests {
             cwd: "/work".into(),
             engine: Engine::Postgres,
             container_id: Some("live-container".into()),
+            tls: None,
         })
         .unwrap()
     }

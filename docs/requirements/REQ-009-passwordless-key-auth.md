@@ -17,12 +17,12 @@ trace: 客户端基建落地(f7ffced:本地 CA + 客户端证书签发 + PG clie
 ### PG 先行批(本批)
 
 - [x] dctl 本地 CA(rcgen,`~/.dctl/ca/` 全局单份,密钥 0600)幂等生成(健康评审批补目录锁与原子写)
-- [ ] 实例 start 签发服务器证书与 dctl 客户端证书(CN=DB 用户名),挂载进容器(客户端证书签发已有,服务器证书与容器挂载未接)
-- [ ] PostgreSQL 配置 TLS(ssl=on + 证书三元组)+ pg_hba `hostssl ... cert` 法
-- [ ] client 走 tokio-postgres-rustls(客户端证书连接,免口令)(tls_config 与 Prefer 先试已有,降级腿仍是口令,「免口令」未达)
-- [ ] 口令道保留为显式回落(`--auth password` 旋钮,迁移不断路)
-- [ ] dotenv 出证书路径(免密形态)
-- [ ] 测试:CA 幂等性、证书形状、TLS 连接真机实弹(lan-linux)
+- [x] 实例 start 签发服务器证书与 dctl 客户端证书(CN=DB 用户名),挂载进容器(REQ-0016 落地,tar 注入容器层)
+- [x] PostgreSQL 配置 TLS(ssl=on + 证书三元组)+ pg_hba `hostssl ... cert` 法(REQ-0016 落地)
+- [x] client 走 tokio-postgres-rustls(客户端证书连接,免口令)(证书面免口令实证;宿主回环面受测试机 daemon 限制)
+- [x] 口令道保留为显式回落(`--auth password` 旋钮,迁移不断路)(REQ-0016 落地)
+- [x] dotenv 出证书路径(免密形态)(PGSSLMODE/PGSSLROOTCERT/PGSSLCERT/PGSSLKEY)
+- [x] 测试:CA 幂等性、证书形状、TLS 连接真机实弹(lan-linux2 实弹 11/11)
 
 ### FK/CH 后续批(另立)
 

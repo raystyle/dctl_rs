@@ -83,6 +83,30 @@ pub(crate) fn ensure_ca() -> Result<PathBuf> {
 
 /// Issue a certificate signed by the CA; returns (cert_pem, key_pem).
 pub(crate) fn issue(cn: &str) -> Result<(String, String)> {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, cn);
+    params.distinguished_name = dn;
+    issue_with(params)
+}
+
+/// Issue a server certificate for a managed container (ADR-0011): the CN is
+/// the container name for humans, and the SAN set carries the loopback
+/// faces a published-port client actually connects through — rustls
+/// verifies the SAN, not the CN.
+pub(crate) fn issue_server_cert(container_name: &str) -> Result<(String, String)> {
+    let mut params = CertificateParams::default();
+    let mut dn = DistinguishedName::new();
+    dn.push(DnType::CommonName, container_name);
+    params.distinguished_name = dn;
+    params.subject_alt_names = vec![
+        rcgen::SanType::IpAddress(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+        rcgen::SanType::IpAddress(std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)),
+    ];
+    issue_with(params)
+}
+
+fn issue_with(params: CertificateParams) -> Result<(String, String)> {
     let dir = ca_dir()?;
     ensure_ca()?;
     let ca_key_pem = std::fs::read_to_string(dir.join("ca.key"))
@@ -91,10 +115,6 @@ pub(crate) fn issue(cn: &str) -> Result<(String, String)> {
     let params_ca = ca_params();
 
     let leaf_key = KeyPair::generate().map_err(|e| ca_err("leaf keygen", e))?;
-    let mut params = CertificateParams::default();
-    let mut dn = DistinguishedName::new();
-    dn.push(DnType::CommonName, cn);
-    params.distinguished_name = dn;
     let issuer = Issuer::from_params(&params_ca, &ca_key);
     let cert = params
         .signed_by(&leaf_key, &issuer)
@@ -149,4 +169,19 @@ pub(crate) fn tls_config(user: &str) -> Result<rustls::ClientConfig> {
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .map_err(|e| ca_err("TLS config", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_cert_issuance_returns_a_pem_pair() {
+        // SAN verification (loopback faces) is exercised on the lan-linux2
+        // real-Docker pass; here we pin the issuance shape without writing
+        // armored marker literals into the source.
+        let (cert, key) = issue_server_cert("dctl-pg-default-18").unwrap();
+        assert!(cert.contains("CERTIFICATE"));
+        assert!(key.contains("PRIVATE KEY"));
+    }
 }

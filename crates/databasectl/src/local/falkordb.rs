@@ -435,6 +435,7 @@ async fn start(
             cwd: project_cwd.clone(),
             engine: Engine::Falkordb,
             container_id: Some(container_id.clone()),
+            tls: None,
         };
         let startup_result = async {
             docker::start_existing(&docker, &container_id).await?;

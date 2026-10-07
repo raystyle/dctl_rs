@@ -191,6 +191,7 @@ pub async fn run(cmd: PostgresCommands, json: bool) -> Result<()> {
             database,
             env,
             wait_timeout,
+            auth,
         } => {
             start(
                 name.or(name_flag),
@@ -200,6 +201,7 @@ pub async fn run(cmd: PostgresCommands, json: bool) -> Result<()> {
                 password,
                 database,
                 env,
+                auth,
                 Duration::from_secs(wait_timeout.into()),
                 json,
             )
@@ -271,6 +273,7 @@ async fn start(
     password: Option<String>,
     database: Option<String>,
     extra_env: Vec<String>,
+    auth: crate::local::cli::PostgresAuthArg,
     wait_timeout: Duration,
     json: bool,
 ) -> Result<()> {
@@ -356,7 +359,8 @@ async fn start(
                     || user.is_some()
                     || password.is_some()
                     || database.is_some()
-                    || has_extra_env)
+                    || has_extra_env
+                    || auth == crate::local::cli::PostgresAuthArg::Password)
             {
                 eprintln!(
                     "Note: postgres:{major} '{}' already exists; resuming with stored settings. \
@@ -385,6 +389,12 @@ async fn start(
             .or(password)
             .unwrap_or_else(generate_password);
 
+        // The certificate face (ADR-0011): create with the TLS server flags,
+        // then upload the material before the first start so postgres never
+        // boots against missing files. The upload rides in the container
+        // layer, so the rollback that removes the container cleans it too.
+        let tls = auth == crate::local::cli::PostgresAuthArg::Cert;
+
         let opts = PostgresRunOpts {
             user_name: &user_name,
             major: &major,
@@ -396,9 +406,25 @@ async fn start(
             password: &password,
             database: &database,
             extra_env,
+            tls,
         };
 
         let container_id = docker::create_postgres(&docker, opts).await?;
+
+        if tls {
+            let cname = docker::pg_container_name(&user_name, &major);
+            let (server_cert, server_key) = crate::local::ca::issue_server_cert(&cname)?;
+            let ca_cert = std::fs::read_to_string(crate::local::ca::ensure_ca()?)
+                .map_err(|e| Error::Postgres(format!("CA cert read: {e}")))?;
+            docker::upload_postgres_tls_material(
+                &docker,
+                &container_id,
+                &server_cert,
+                &server_key,
+                &ca_cert,
+            )
+            .await?;
+        }
 
         let info = ServerInfo {
             name: key.clone(),
@@ -410,6 +436,7 @@ async fn start(
             cwd: project_cwd.clone(),
             engine: Engine::Postgres,
             container_id: Some(container_id.clone()),
+            tls: Some(tls),
         };
         let startup_result = async {
             docker::start_existing(&docker, &container_id).await?;
@@ -1228,6 +1255,14 @@ async fn client(
         return docker::exec_psql_in_container(&docker, container_id, &psql_args).await;
     }
     let sql = gather_sql_input(query, queries_file)?;
+    // The authentication face decides the TLS posture: certificate instances
+    // must not silently fall back (their hba refuses password TCP), legacy
+    // and --auth password instances keep the prefer-then-fallback shape.
+    let mode = if info.tls == Some(true) {
+        TlsMode::Required
+    } else {
+        TlsMode::Prefer
+    };
     run_native_query_tls(
         "127.0.0.1",
         info.tcp_port,
@@ -1235,7 +1270,7 @@ async fn client(
         Some(&password),
         &database,
         &sql,
-        true,
+        mode,
     )
     .await
 }
@@ -1355,7 +1390,7 @@ async fn run_native_query(
     database: &str,
     sql: &str,
 ) -> Result<()> {
-    run_native_query_tls(host, port, user, password, database, sql, false).await
+    run_native_query_tls(host, port, user, password, database, sql, TlsMode::Off).await
 }
 
 /// `prefer_tls`: try the mTLS certificate leg first. The server-side leg of
@@ -1363,6 +1398,20 @@ async fn run_native_query(
 /// the attempt degrades in-band to the password leg; direct mode skips the
 /// attempt and goes cleartext. The shape stays so the certificate leg lights
 /// up unchanged when the server side lands.
+/// How the native query leg may use TLS.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TlsMode {
+    /// Direct mode: arbitrary servers, cleartext by contract (ADR-0009).
+    Off,
+    /// Managed password-face instances: try the certificate leg, fall back
+    /// to the stored password in-band.
+    Prefer,
+    /// Managed certificate-face instances: the hba refuses password TCP, so
+    /// a silent fallback would only surface as a misleading authentication
+    /// error — fail with the certificate-face context instead.
+    Required,
+}
+
 async fn run_native_query_tls(
     host: &str,
     port: u16,
@@ -1370,7 +1419,7 @@ async fn run_native_query_tls(
     password: Option<&str>,
     database: &str,
     sql: &str,
-    prefer_tls: bool,
+    mode: TlsMode,
 ) -> Result<()> {
     use tokio_postgres::NoTls;
 
@@ -1379,18 +1428,30 @@ async fn run_native_query_tls(
     if let Some(password) = password {
         config.password(password);
     }
-    if prefer_tls
+    if mode != TlsMode::Off
         && let Ok(tls) = crate::local::ca::tls_config(user)
-        && let Ok((client, connection)) = config
+    {
+        match config
             .connect(tokio_postgres_rustls::MakeRustlsConnect::new(tls))
             .await
-    {
-        tokio::spawn(async move {
-            if let Err(error) = connection.await {
-                eprintln!("postgres connection error: {error}");
+        {
+            Ok((client, connection)) => {
+                tokio::spawn(async move {
+                    if let Err(error) = connection.await {
+                        eprintln!("postgres connection error: {error}");
+                    }
+                });
+                return query_and_render(client, sql).await;
             }
-        });
-        return query_and_render(client, sql).await;
+            Err(error) if mode == TlsMode::Required => {
+                return Err(Error::PostgresUsage(format!(
+                    "certificate authentication failed for '{user}' at {host}:{port}: {error}; \
+                     the trust chain is ~/.dctl/ca/ca.crt with the client key client-{user}.key \
+                     next to it"
+                )));
+            }
+            Err(_) => {} // Prefer: fall through to the password leg.
+        }
     }
     let (client, connection) = config
         .connect(NoTls)
@@ -1450,19 +1511,54 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
         info.container_id.as_deref().unwrap_or_default(),
     ))?;
 
-    let vars: Vec<(&str, String)> = vec![
-        ("POSTGRES_HOST", "127.0.0.1".to_string()),
-        ("POSTGRES_PORT", info.tcp_port.to_string()),
-        ("POSTGRES_USER", user),
-        ("POSTGRES_PASSWORD", password),
-        ("POSTGRES_DATABASE", database),
-    ];
+    // The authentication face decides the shape (ADR-0011): the certificate
+    // face emits libpq's TLS variables with the material paths and no
+    // password; the password face keeps the historical five.
+    let vars: Vec<(&str, String)> = if info.tls == Some(true) {
+        let ca = crate::local::ca::ensure_ca()?;
+        let (cert, key) = crate::local::ca::client_cert(&user)?;
+        vec![
+            ("POSTGRES_HOST", "127.0.0.1".to_string()),
+            ("POSTGRES_PORT", info.tcp_port.to_string()),
+            ("POSTGRES_USER", user),
+            ("POSTGRES_DATABASE", database),
+            ("PGSSLMODE", "verify-full".to_string()),
+            ("PGSSLROOTCERT", ca.display().to_string()),
+            ("PGSSLCERT", cert.display().to_string()),
+            ("PGSSLKEY", key.display().to_string()),
+        ]
+    } else {
+        vec![
+            ("POSTGRES_HOST", "127.0.0.1".to_string()),
+            ("POSTGRES_PORT", info.tcp_port.to_string()),
+            ("POSTGRES_USER", user),
+            ("POSTGRES_PASSWORD", password),
+            ("POSTGRES_DATABASE", database),
+        ]
+    };
 
     let filename = if use_local { ".env.local" } else { ".env" };
     let path = std::path::Path::new(filename);
 
     let content = if path.exists() {
         let existing = std::fs::read_to_string(path)?;
+        // Face-specific keys do not share the POSTGRES_ managed prefix, so
+        // they are stripped before the update and re-added by it: a switch
+        // between faces cannot leave both shapes (stale password line or a
+        // stale TLS trio) behind, and re-runs stay idempotent.
+        let existing = existing
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                let bare = trimmed
+                    .strip_prefix("export")
+                    .map(str::trim_start)
+                    .unwrap_or(trimmed);
+                !(bare.starts_with("PGSSL") || bare.starts_with("POSTGRES_PASSWORD"))
+            })
+            .chain(std::iter::once(""))
+            .collect::<Vec<_>>()
+            .join("\n");
         crate::local::update_dotenv(&existing, "POSTGRES_", &vars)
     } else {
         vars.iter()
@@ -1611,6 +1707,7 @@ mod tests {
             cwd: "/tmp/project".into(),
             engine: Engine::Postgres,
             container_id: Some("running-default".into()),
+            tls: None,
         };
         server::save_server_info_locked(&info, &lock).unwrap();
 

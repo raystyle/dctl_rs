@@ -438,7 +438,26 @@ pub struct PostgresRunOpts<'a> {
     pub password: &'a str,
     pub database: &'a str,
     pub extra_env: Vec<String>,
+    /// Certificate face (ADR-0011): start postgres with TLS and the
+    /// dctl-managed hba file. The material itself is uploaded separately
+    /// after create (see [`upload_postgres_tls_material`]).
+    pub tls: bool,
 }
+
+/// Where the TLS material lives inside the container. Under the data mount's
+/// parent, so it never collides with PGDATA.
+pub(crate) const PG_TLS_DIR_IN_CONTAINER: &str = "/var/lib/postgresql/tls";
+
+/// The dctl-managed hba for the certificate face: the image entrypoint
+/// works over the local socket, TCP requires a client certificate, and
+/// plaintext TCP is refused outright.
+const PG_TLS_HBA: &str = concat!(
+    "# dctl-managed (ADR-0011): entrypoint over the local socket,\n",
+    "# certificate authentication for TCP, plaintext TCP refused.\n",
+    "local all all trust\n",
+    "hostssl all all all cert\n",
+    "host all all all reject\n",
+);
 
 /// Create a Postgres container without starting it; return its ID.
 ///
@@ -490,9 +509,29 @@ pub async fn create_postgres(docker: &Docker, opts: PostgresRunOpts<'_>) -> Resu
     labels.insert(LABEL_PROJECT.into(), opts.project_cwd.into());
     labels.insert(LABEL_CREATED_BY.into(), created_by_value());
 
+    // The certificate face starts postgres with TLS and the dctl-managed
+    // hba file; the material itself rides in via upload after create, so
+    // the container never starts against missing files.
+    let cmd = opts.tls.then(|| {
+        vec![
+            "postgres".to_string(),
+            "-c".to_string(),
+            "ssl=on".to_string(),
+            "-c".to_string(),
+            format!("ssl_cert_file={PG_TLS_DIR_IN_CONTAINER}/server.crt"),
+            "-c".to_string(),
+            format!("ssl_key_file={PG_TLS_DIR_IN_CONTAINER}/server.key"),
+            "-c".to_string(),
+            format!("ssl_ca_file={PG_TLS_DIR_IN_CONTAINER}/ca.crt"),
+            "-c".to_string(),
+            format!("hba_file={PG_TLS_DIR_IN_CONTAINER}/pg_hba.conf"),
+        ]
+    });
+
     let container_config = ContainerCreateBody {
         image: Some(format!("postgres:{}", opts.tag)),
         env: Some(env),
+        cmd,
         host_config: Some(host_config),
         labels: Some(labels),
         ..Default::default()
@@ -507,6 +546,73 @@ pub async fn create_postgres(docker: &Docker, opts: PostgresRunOpts<'_>) -> Resu
         .await
         .map_err(|e| Error::DockerError(e.to_string()))?;
     Ok(created.id)
+}
+
+/// The postgres user's uid/gid in the official image. The uploaded key must
+/// be owned by the server user with mode 0600 — a bind mount cannot express
+/// that from a host user, which is why the material rides in as a tar whose
+/// entries carry these ids.
+const POSTGRES_UID_GID: u64 = 999;
+
+/// Build the in-memory tar carrying the certificate face into the container:
+/// server cert/key, the CA, and the dctl-managed hba file, all under
+/// `tls/` with container-side ownership and modes.
+fn build_postgres_tls_tar(
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    ca_cert_pem: &str,
+) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let entries: [(&str, &str, u32); 4] = [
+        ("tls/server.crt", server_cert_pem, 0o644),
+        ("tls/server.key", server_key_pem, 0o600),
+        ("tls/ca.crt", ca_cert_pem, 0o644),
+        ("tls/pg_hba.conf", PG_TLS_HBA, 0o644),
+    ];
+    for (path, contents, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_uid(POSTGRES_UID_GID);
+        header.set_gid(POSTGRES_UID_GID);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .map_err(|e| Error::DockerError(format!("could not build TLS material tar: {e}")))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| Error::DockerError(format!("could not finish TLS material tar: {e}")))
+}
+
+/// Upload the certificate face into a (created, not started) container.
+/// Docker honors the tar entries' uid/gid and mode on extraction, so the
+/// key lands postgres-owned and owner-only without any host-side chown.
+pub async fn upload_postgres_tls_material(
+    docker: &Docker,
+    container_id: &str,
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    ca_cert_pem: &str,
+) -> Result<()> {
+    use bollard::query_parameters::UploadToContainerOptionsBuilder;
+    let tar_bytes = build_postgres_tls_tar(server_cert_pem, server_key_pem, ca_cert_pem)?;
+    let opts = UploadToContainerOptionsBuilder::default()
+        .path("/var/lib/postgresql")
+        .build();
+    docker
+        .upload_to_container(
+            container_id,
+            Some(opts),
+            bollard::body_full(bytes::Bytes::from(tar_bytes)),
+        )
+        .await
+        .map_err(|e| {
+            Error::DockerError(format!(
+                "could not upload TLS material into container '{container_id}': {e}"
+            ))
+        })
 }
 
 /// If a container with one of our managed names (`dctl-pg-<name>-<major>` or
@@ -1579,6 +1685,18 @@ pub fn recover_project_postgres_blocking(
                 continue;
             }
             ensure_pg_data_dir(&c.user_name, &c.major)?;
+            // The authentication face lives in the container's Cmd (the
+            // certificate face starts postgres with the TLS flags); an
+            // orphan must resume in kind or the client would authenticate
+            // against the wrong hba. An un-inspectable container is left
+            // for the next recovery pass instead of being misclassified.
+            let tls = match docker.inspect_container(&c.container_id, None).await {
+                Ok(inspect) => inspect.config.and_then(|cfg| {
+                    cfg.cmd
+                        .map(|cmd| cmd.iter().any(|arg| arg.starts_with("ssl_cert_file=")))
+                }),
+                Err(_) => continue,
+            };
             let info = ServerInfo {
                 name: key,
                 pid: 0,
@@ -1589,6 +1707,7 @@ pub fn recover_project_postgres_blocking(
                 cwd: cwd_owned.clone(),
                 engine: Engine::Postgres,
                 container_id: Some(c.container_id.clone()),
+                tls,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -1631,6 +1750,7 @@ pub fn recover_project_clickhouse_blocking(
                 cwd: cwd_owned.clone(),
                 engine: Engine::Clickhouse,
                 container_id: Some(c.container_id.clone()),
+                tls: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -1681,6 +1801,7 @@ pub fn recover_project_falkor_blocking(
                 cwd: cwd_owned.clone(),
                 engine: Engine::Falkordb,
                 container_id: Some(c.container_id.clone()),
+                tls: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -1692,6 +1813,44 @@ pub fn recover_project_falkor_blocking(
 mod tests {
     use super::*;
     use bollard::models::{CreateImageInfo, ProgressDetail};
+
+    #[test]
+    fn postgres_tls_tar_carries_container_ownership_and_modes() {
+        // The uploaded key must land postgres-owned and owner-only inside
+        // the container; Docker honors the tar entry ids/modes on extract.
+        let bytes = build_postgres_tls_tar("CERT", "KEY", "CA").unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut seen: Vec<(String, u64, u64, u32, String)> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            use std::io::Read as _;
+            let mut entry = entry.unwrap();
+            let path = entry.path().unwrap().display().to_string();
+            let header = entry.header();
+            let ids = (
+                header.uid().unwrap(),
+                header.gid().unwrap(),
+                header.mode().unwrap(),
+            );
+            let mut contents = String::new();
+            entry.read_to_string(&mut contents).unwrap();
+            seen.push((path, ids.0, ids.1, ids.2, contents));
+        }
+        for (_, uid, gid, _, _) in &seen {
+            assert_eq!((*uid, *gid), (999, 999), "every entry is postgres-owned");
+        }
+        let key = seen
+            .iter()
+            .find(|(path, ..)| path == "tls/server.key")
+            .unwrap();
+        assert_eq!(key.3, 0o600, "the server key is owner-only");
+        let hba = seen
+            .iter()
+            .find(|(path, ..)| path == "tls/pg_hba.conf")
+            .unwrap();
+        assert!(hba.4.contains("hostssl all all all cert"));
+        assert!(hba.4.contains("host all all all reject"));
+        assert_eq!(seen.len(), 4, "exactly the four face files");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

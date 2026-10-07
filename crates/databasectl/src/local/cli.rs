@@ -764,13 +764,21 @@ CONTEXT FOR AGENTS:
     },
 }
 
+/// The Postgres authentication face (ADR-0011): certificate mTLS by
+/// default, password as the explicit migration fallback.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PostgresAuthArg {
+    Cert,
+    Password,
+}
+
 #[derive(Subcommand)]
 pub enum PostgresCommands {
     /// Start a Postgres instance
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   An existing stopped instance for the same (name, major) is resumed with its stored settings, so
-  --port/--user/--password/--database/-e are ignored on a resume.
+  --port/--user/--password/--database/-e/--auth are ignored on a resume.
   Without --version, an existing instance selects the major; two majors under one name error.
   The generated password is printed once by start — re-read connection details later with
   `postgres dotenv` or `postgres client`.
@@ -833,6 +841,11 @@ CONTEXT FOR AGENTS:
             value_parser = clap::value_parser!(u16).range(1..=600)
         )]
         wait_timeout: u16,
+
+        /// Authentication face: certificate mTLS (default, ADR-0011) or
+        /// password. Ignored on resume; existing instances keep their face.
+        #[arg(long, value_enum, default_value_t = PostgresAuthArg::Cert)]
+        auth: PostgresAuthArg,
     },
 
     /// Stop a running Postgres instance
@@ -1052,6 +1065,29 @@ mod tests {
     }
 
     // ── install selectors ────────────────────────────────────────────────
+
+    #[test]
+    fn postgres_start_auth_face_parses_with_cert_default() {
+        let LocalCommands::Postgres {
+            command: PostgresCommands::Start { auth, .. },
+        } = local_command(&["postgres", "start"])
+        else {
+            panic!("expected postgres start");
+        };
+        assert_eq!(
+            auth,
+            PostgresAuthArg::Cert,
+            "certificate face is the default"
+        );
+
+        let LocalCommands::Postgres {
+            command: PostgresCommands::Start { auth, .. },
+        } = local_command(&["postgres", "start", "--auth", "password"])
+        else {
+            panic!("expected postgres start");
+        };
+        assert_eq!(auth, PostgresAuthArg::Password);
+    }
 
     #[test]
     fn install_selectors_parse_by_engine() {

@@ -269,6 +269,14 @@ impl FakeDocker {
                             )
                         }
                     }
+                    // The certificate face uploads TLS material into the
+                    // created container (ADR-0011); accept and record it so
+                    // the default-start scenarios keep flowing.
+                    ("PUT", path)
+                        if path.starts_with("/containers/") && path.contains("/archive?") =>
+                    {
+                        write_response(&mut stream, 200, "application/json", b"")
+                    }
                     _ => panic!("unexpected fake Docker request: {request:?}"),
                 }
                 let _ = stream.shutdown(Shutdown::Both);
@@ -517,12 +525,141 @@ fn run_start(
     (output, requests, project, home, docker)
 }
 
+/// Like [`run_start`], with extra argv for the start command (e.g.
+/// `--auth password` for the password-face scenarios).
+fn run_start_extra(
+    scenario: DockerScenario,
+    extra: &[&str],
+) -> (
+    Output,
+    Vec<DockerRequest>,
+    tempfile::TempDir,
+    tempfile::TempDir,
+    FakeDocker,
+) {
+    let home = tempfile::tempdir().expect("create home tempdir");
+    let project = tempfile::tempdir().expect("create project tempdir");
+    let socket_path = home.path().join("docker.sock");
+    let docker = FakeDocker::start(&socket_path, home.path(), project.path(), scenario);
+    let output =
+        run_start_command_extra(home.path(), project.path(), &socket_path, false, 2, extra);
+    let requests = docker.requests();
+    (output, requests, project, home, docker)
+}
+
+#[test]
+fn cert_face_default_start_uploads_tls_material_and_sets_server_flags() {
+    let (output, requests, _project, _home, _docker) = run_start_extra(
+        DockerScenario {
+            existing: false,
+            outcome: ContainerOutcome::Running,
+            start_statuses: vec![204],
+            remove_statuses: vec![],
+            readiness_exit_codes: vec![0],
+            readiness_create_errors: 0,
+            logs: vec![],
+            write_partial_data: false,
+            create_metadata_directory_on_start: false,
+            published_ports: vec![],
+        },
+        &[],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The create body carries the TLS server flags (ADR-0011 certificate
+    // face is the default for fresh starts).
+    let create = requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path.starts_with("/containers/create"))
+        .expect("create request");
+    let body: serde_json::Value = serde_json::from_str(&create.body).expect("create body JSON");
+    let cmd = body["Cmd"].as_array().expect("Cmd array");
+    let cmd_text = cmd
+        .iter()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(cmd_text.contains("ssl=on"), "Cmd: {cmd_text}");
+    assert!(cmd_text.contains("hba_file="), "Cmd: {cmd_text}");
+    // The TLS material is uploaded into the created container before start.
+    let upload = requests
+        .iter()
+        .find(|request| request.method == "PUT" && request.path.contains("/archive?"))
+        .expect("TLS material upload request");
+    assert!(
+        upload.path.contains("path=%2Fvar%2Flib%2Fpostgresql"),
+        "upload targets the data mount parent: {}",
+        upload.path
+    );
+    let tar = &upload.body;
+    assert!(tar.contains("tls/server.key"), "tar carries the server key");
+    assert!(
+        tar.contains("hostssl all all all cert"),
+        "tar carries the certificate hba"
+    );
+}
+
+#[test]
+fn password_face_start_skips_the_tls_material() {
+    let (output, requests, _project, _home, _docker) = run_start_extra(
+        DockerScenario {
+            existing: false,
+            outcome: ContainerOutcome::Running,
+            start_statuses: vec![204],
+            remove_statuses: vec![],
+            readiness_exit_codes: vec![0],
+            readiness_create_errors: 0,
+            logs: vec![],
+            write_partial_data: false,
+            create_metadata_directory_on_start: false,
+            published_ports: vec![],
+        },
+        &["--auth", "password"],
+    );
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|request| request.method == "PUT" && request.path.contains("/archive?")),
+        "the password face must not upload TLS material"
+    );
+    let create = requests
+        .iter()
+        .find(|request| request.method == "POST" && request.path.starts_with("/containers/create"))
+        .expect("create request");
+    let body: serde_json::Value = serde_json::from_str(&create.body).expect("create body JSON");
+    assert!(
+        body["Cmd"].is_null(),
+        "the password face keeps the image default command: {body}"
+    );
+}
+
 fn run_start_command(
     home: &Path,
     project: &Path,
     socket_path: &Path,
     resumed: bool,
     wait_timeout: u16,
+) -> Output {
+    run_start_command_extra(home, project, socket_path, resumed, wait_timeout, &[])
+}
+
+fn run_start_command_extra(
+    home: &Path,
+    project: &Path,
+    socket_path: &Path,
+    resumed: bool,
+    wait_timeout: u16,
+    extra: &[&str],
 ) -> Output {
     let _guard = START_COMMAND_LOCK
         .lock()
@@ -548,6 +685,7 @@ fn run_start_command(
     } else {
         command.args(["--port", &port, "--password", "fresh-secret"]);
     }
+    command.args(extra);
     // Bound hangs after acquiring the fixture lock, independently of the
     // readiness deadline under test. Capturing on another thread also drains
     // both pipes while the child runs.

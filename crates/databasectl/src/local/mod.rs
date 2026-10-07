@@ -525,6 +525,7 @@ mod tests {
             cwd: "/tmp/project".to_string(),
             engine,
             container_id: None,
+            tls: None,
         }
     }
 

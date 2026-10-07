@@ -133,10 +133,13 @@ start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以�
 
 ```console
 $ dctl postgres start [NAME] [--user U --database D]
+$ dctl postgres start --auth password   # 口令道回落;默认证书 mTLS(ADR-0011),连接零口令
 $ dctl postgres client -q 'SELECT 1;'
 $ dctl postgres dotenv            # 写入 .env 连接变量
 $ dctl postgres stop [NAME]
 ```
+
+Postgres 实例默认以证书面起(ADR-0011):dctl 本地 CA(`~/.dctl/ca/`)给容器签服务器证书、给 `client`/`dotenv` 出客户端证书,`--auth password` 显式回落口令面。证书面的 `dotenv` 写 `PGSSLMODE=verify-full` 与三个证书路径,不再写口令;旧实例 resume 保持其原有认证面。
 
 停止保留容器以便恢复;remove 删除容器。生成的密码由 start 打印一次,之后经 `dotenv` 重读。
 
