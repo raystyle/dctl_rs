@@ -702,8 +702,18 @@ async fn pull_named_to_layout_with(
     if refresh_cache && let Ok(cache) = cache_tar(&format!("{name}:{tag}")) {
         // The cache directory is created here, not at copy time: without
         // it the refresh fails with ENOENT and the offline fallback dies.
-        let refreshed = std::fs::create_dir_all(cache.parent().unwrap_or(Path::new("")))
-            .and_then(|()| std::fs::copy(&tar_path, &cache));
+        // The refresh is tmp+rename (not a direct copy): a crash or two
+        // concurrent starts pulling the same new image must not leave a
+        // truncated tar that poisons the offline fallback for good.
+        let refreshed =
+            std::fs::create_dir_all(cache.parent().unwrap_or(Path::new(""))).and_then(|()| {
+                let mut source = std::fs::File::open(&tar_path)?;
+                let mut tmp =
+                    tempfile::NamedTempFile::new_in(cache.parent().unwrap_or(Path::new("")))?;
+                std::io::copy(&mut source, &mut tmp)?;
+                tmp.persist(&cache).map_err(|error| error.error)?;
+                Ok(())
+            });
         if let Err(error) = refreshed {
             eprintln!(
                 "Warning: cannot refresh the registry cache at {}: {error}",

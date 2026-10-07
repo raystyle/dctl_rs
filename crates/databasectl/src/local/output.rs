@@ -901,7 +901,8 @@ pub struct ServerStopEntry {
     pub name: String,
     /// "clickhouse", "postgres", or "falkordb".
     pub engine: String,
-    /// Postgres image version, used to distinguish same-name major versions.
+    /// Engine image version (stored form, e.g. "postgres:18"), used to
+    /// distinguish same-name versions in stop entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
     pub stopped: bool,

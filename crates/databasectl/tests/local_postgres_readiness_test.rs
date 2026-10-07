@@ -998,7 +998,12 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["code"], "startup_exit");
     assert!(!stderr.contains("directory contained data before this start attempt"));
-    assert!(!stderr.contains("recovery metadata retained"));
+    // Health-review F-14: metadata pointing at the removed container must
+    // not survive a failed fresh start whose data dir pre-existed - the
+    // next start fresh-creates and reuses the retained data instead of
+    // dead-ending on "container is gone". (The envelope classifies by the
+    // primary failure, so the cleanup note rides the human face only; the
+    // file assertions below are the contract.)
     assert!(
         fresh_instance_dir(home.path(), project.path())
             .join("data/existing-data")
@@ -1006,8 +1011,8 @@ fn failed_fresh_start_preserves_postgres_identity_without_polluting_clickhouse_s
         "failed start removed pre-existing data"
     );
     assert!(
-        metadata_path(home.path(), project.path()).exists(),
-        "failed start did not retain recovery metadata"
+        !metadata_path(home.path(), project.path()).exists(),
+        "failed start kept metadata pointing at the removed container"
     );
     assert_eq!(
         requests

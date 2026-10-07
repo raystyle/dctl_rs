@@ -232,7 +232,11 @@ pub(crate) fn write_dotenv_file(path: &std::path::Path, content: &str) -> std::i
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let mut tmp = match dir {
         Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
-        None => tempfile::NamedTempFile::new()?,
+        // A bare filename has no usable parent; stage the tempfile in the
+        // current directory — the target's own directory — so the persist
+        // rename stays on one filesystem. The system temp directory can be
+        // a different device (EXDEV on rename).
+        None => tempfile::NamedTempFile::new_in(".")?,
     };
     std::io::Write::write_all(&mut tmp, content.as_bytes())?;
     // NamedTempFile is created 0o600 on Unix; persist renames onto the
@@ -589,6 +593,32 @@ mod tests {
             Some("POSTGRES_USER")
         );
         assert_eq!(extract_dotenv_key("CLICKHOUSE_HOST=x", "POSTGRES_"), None);
+    }
+
+    #[test]
+    fn write_dotenv_file_accepts_a_bare_relative_name() {
+        // A bare filename has no usable parent dir; the helper must stage
+        // its tempfile in the current directory (the target's own), not in
+        // the system temp, whose device can differ (EXDEV on rename).
+        let sandbox = tempfile::tempdir().unwrap();
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(sandbox.path()).unwrap();
+        let result = write_dotenv_file(std::path::Path::new(".env"), "KEY=value\n");
+        std::env::set_current_dir(previous).unwrap();
+        result.expect("bare relative names must work");
+        assert_eq!(
+            std::fs::read_to_string(sandbox.path().join(".env")).unwrap(),
+            "KEY=value\n"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(sandbox.path().join(".env"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "credentials file must be owner-only");
+        }
     }
 
     #[test]

@@ -349,13 +349,20 @@ fn ensure_no_live_containers_with(
 
 /// Copy a directory tree, creating intermediate directories as needed.
 /// Unlike a rename this allocates fresh inodes, which is why callers must
-/// first prove no live bind mounts reference the source.
+/// first prove no live bind mounts reference the source. Symbolic links
+/// are copied as links (`DirEntry::file_type` never follows them), so a
+/// `pg_tblspc` entry keeps pointing wherever it pointed, no linked tree is
+/// silently materialized into the bucket, and link cycles cannot recurse.
 fn copy_dir_recursive(source: &Path, destination: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(destination)?;
     for entry in std::fs::read_dir(source)? {
         let entry = entry?;
         let destination_child = destination.join(entry.file_name());
-        if entry.path().is_dir() {
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            let target = std::fs::read_link(entry.path())?;
+            std::os::unix::fs::symlink(&target, &destination_child)?;
+        } else if file_type.is_dir() {
             copy_dir_recursive(&entry.path(), &destination_child)?;
         } else {
             std::fs::copy(entry.path(), &destination_child)?;
@@ -1136,6 +1143,31 @@ mod fk_key_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_dir_recursive_preserves_symbolic_links() {
+        // The copy must not dereference links: a pg_tblspc entry keeps
+        // pointing wherever it pointed, the target tree is not silently
+        // materialized into the bucket, and link cycles cannot recurse.
+        let sandbox = tempfile::tempdir().unwrap();
+        let outside = sandbox.path().join("outside");
+        std::fs::create_dir_all(outside.join("inner")).unwrap();
+        std::fs::write(outside.join("inner").join("file.txt"), "data").unwrap();
+        let source = sandbox.path().join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::os::unix::fs::symlink(std::path::Path::new("../outside"), source.join("link"))
+            .unwrap();
+
+        let destination = sandbox.path().join("dest");
+        copy_dir_recursive(&source, &destination).unwrap();
+
+        let copied = destination.join("link");
+        assert!(copied.is_symlink(), "the link must stay a link");
+        assert_eq!(
+            std::fs::read_link(&copied).unwrap(),
+            std::path::Path::new("../outside")
+        );
+    }
 
     fn test_info(pid: u32, version: &str) -> ServerInfo {
         ServerInfo {

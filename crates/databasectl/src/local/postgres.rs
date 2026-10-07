@@ -575,15 +575,23 @@ async fn rollback_failed_fresh_start(
         }
     } else if container_removed {
         // The container is gone but the data directory pre-existed this
-        // attempt and is retained: do not write back metadata pointing at
-        // the deleted container — that would dead-end the next `start`
-        // (whose guided exit, `remove`, would delete this data). With no
-        // metadata the next start fresh-creates and reuses the directory.
-        diagnostics.push(
-            "no recovery metadata written; the next start re-creates the container \
-             and reuses the retained data"
-                .to_string(),
-        );
+        // attempt and is retained. Metadata pointing at the deleted
+        // container must not survive — the next `start` would hit
+        // "container is gone" and its guided exit, `remove`, would delete
+        // this data. The fresh path only runs without prior metadata, so
+        // removing this attempt's own file is always safe; the call
+        // tolerates absence (the save may never have happened).
+        match server::try_remove_server_info_locked(&info.name, metadata_lock) {
+            Ok(()) => diagnostics.push(
+                "no recovery metadata kept; the next start re-creates the container \
+                 and reuses the retained data"
+                    .to_string(),
+            ),
+            Err(error) => diagnostics.push(format!(
+                "failed to remove recovery metadata '{}': {error}",
+                metadata_display(&metadata_path, &info.name)
+            )),
+        }
     } else {
         match server::save_server_info_locked(info, metadata_lock) {
             Ok(()) => diagnostics.push(format!(
@@ -725,7 +733,8 @@ async fn resume_existing(
         // driver text).
         return Err(Error::PostgresUsage(format!(
             "cannot determine the TCP port of container '{container_id}'; \
-             run `dctl local postgres remove {display_name}` and start fresh"
+             run `dctl local postgres remove {display_name}` and start fresh, \
+             or `docker rm` the stopped container by hand to keep the data directory"
         )));
     }
     let info = ServerInfo {
