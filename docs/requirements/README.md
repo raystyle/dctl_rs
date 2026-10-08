@@ -19,4 +19,5 @@
 | REQ-013 | implemented | should | skills 面剪枝:只装与 dctl 命令域对齐的引擎知识项 | 剪枝批 4e6834f;实机冒烟收敛两项 |
 | REQ-0014 | implemented | must | 项目作用域状态目录迁入 ~/.dctl 应用数据目录(不随 cwd 漂移) | 三笔 5519267/dceddd0/640c1ac;ADR-0012;评审两轮 CONFIRM |
 | REQ-0016 | implemented | should | Postgres 服务端 mTLS 腿(容器 TLS 面;判据自 REQ-009 迁出) | 证书面默认+口令回落;lan-linux2 实弹 11/11;ADR-0011 |
+| REQ-0017 | draft | should | FalkorDB 与 ClickHouse 的 mTLS 腿(ADR-0011 收官;FK 先过实测闸门) | 立项 2026-10-08;判据承 REQ-009 后续批 |
 | REQ-0015 | implemented | must | 端口选择感知 Docker 已发布口(NAT 模式探测失明修复) | 8db8b66;双端 343/0,lan-linux2 two_concurrent 转绿,余两败归因 daemon loopback 环境限制 |
