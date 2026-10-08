@@ -893,8 +893,11 @@ pub async fn clickhouse_tls_query(docker: &Docker, id: &str, user: &str, sql: &s
         .await
         .map_err(|error| Error::DockerError(error.to_string()))?;
     if !matches!(started, StartExecResults::Detached) {
-        return Err(Error::DockerError(
-            "clickhouse-client exec unexpectedly attached".to_string(),
+        eprintln!("clickhouse-client exec unexpectedly attached");
+        return Err(Error::ClickhouseUsage(
+            "could not confirm the in-container bootstrap finished; the attempt \
+             was rolled back"
+                .to_string(),
         ));
     }
     for _ in 0..150 {
@@ -929,8 +932,11 @@ pub async fn clickhouse_tls_query(docker: &Docker, id: &str, user: &str, sql: &s
         }
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    Err(Error::DockerError(
-        "clickhouse-client exec did not exit within 3 seconds".to_string(),
+    eprintln!("clickhouse-client exec did not exit within 3 seconds");
+    Err(Error::ClickhouseUsage(
+        "the in-container database bootstrap did not finish in time; the attempt \
+         was rolled back"
+            .to_string(),
     ))
 }
 

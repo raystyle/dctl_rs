@@ -1451,10 +1451,12 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
     // Certificate-face instances carry their requested database in metadata
     // (no CLICKHOUSE_DB env rides the container, review r1 F5).
     let db = info.database.clone().unwrap_or(db);
-    if tls && info.database.is_none() {
+    if tls && info.database.is_none() && database.is_none() {
         // A recovered certificate instance has no database memory (the
         // name rides neither the env nor the labels); say so instead of
-        // silently querying the default database (review r2 F3).
+        // silently querying the default database (review r2 F3). With an
+        // explicit --database the user already chose - the note would
+        // describe the wrong query (review r3 F1).
         eprintln!(
             "Note: this instance was recovered without its startup database; \
              querying the default database (pass --database to pick another)."
@@ -1682,6 +1684,14 @@ pub(crate) fn dotenv(
     ))?;
     if let Some(stored) = info.database.clone() {
         database = stored;
+    } else if info.tls == Some(true) {
+        // A recovered certificate instance has no database memory; the
+        // file carries the default, and the reader should know that is a
+        // fallback, not the provisioned name (review r3 F2).
+        eprintln!(
+            "Note: this instance was recovered without its startup database; \
+             CLICKHOUSE_DATABASE falls back to the default database."
+        );
     }
 
     // The face decides the shape (ADR-0011): certificate instances get the
