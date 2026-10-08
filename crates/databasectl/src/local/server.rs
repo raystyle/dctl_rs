@@ -76,11 +76,9 @@ pub struct ServerInfo {
     pub engine: Engine,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
-    /// Postgres authentication face (ADR-0011): `Some(true)` = certificate
-    /// (mTLS) instances, `Some(false)` = explicit `--auth password`, and
-    /// Authentication face: `Some(true)` certificate mTLS, `Some(false)`
-    /// password, `None` = metadata predating the face split (password
-    /// behavior).
+    /// Authentication face (ADR-0011, shared by all three engines):
+    /// `Some(true)` certificate mTLS, `Some(false)` password, `None` =
+    /// metadata predating the face split (password behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
     /// The requested startup database, when the engine stores it in

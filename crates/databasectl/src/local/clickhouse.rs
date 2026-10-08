@@ -145,11 +145,28 @@ fn validate_start_options(
     native_port: Option<u16>,
     bind: Option<&str>,
     password: Option<&str>,
+    database: Option<&str>,
     config: Option<&str>,
     extra_env: Vec<String>,
 ) -> Result<StartPreflight> {
     if let Some(name) = name {
         server::validate_server_name(name)?;
+    }
+    // The database name is spliced into the certificate-face bootstrap SQL
+    // and the password-face env; either way it must be one plain identifier,
+    // not free-form text (review r2 G1).
+    if let Some(database) = database
+        && (database.is_empty()
+            || !database
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || database.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Err(Error::ClickhouseUsage(
+            "invalid --database: use a plain identifier (letters, digits, \
+             underscores; may not start with a digit)"
+                .into(),
+        ));
     }
     if let Some(version) = version {
         validate_ch_tag(version)?;
@@ -257,6 +274,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         native_port,
         bind.as_deref(),
         password.as_deref(),
+        database.as_deref(),
         config.as_deref(),
         extra_env,
     )?;
@@ -481,8 +499,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
                         DEFAULT_USER,
                         &format!("CREATE DATABASE IF NOT EXISTS {database}"),
                     )
-                    .await
-                    .map(|_| ()),
+                    .await,
                 )
             } else {
                 None
@@ -740,6 +757,10 @@ async fn resume_existing(
     // provisioned, not the defaults. The password is intentionally not
     // reprinted (it is recoverable via `dotenv`).
     let (user, _password, database) = read_ch_env(docker, &container_id).await?;
+    // The stored startup database wins on the certificate face (review
+    // r2 F3): the env carries none there, and the fresh start reported
+    // the requested name - the resume output must not drift to default.
+    let database = prior.database.clone().unwrap_or(database);
 
     docker::start_existing(docker, &container_id).await?;
 
@@ -1430,6 +1451,15 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
     // Certificate-face instances carry their requested database in metadata
     // (no CLICKHOUSE_DB env rides the container, review r1 F5).
     let db = info.database.clone().unwrap_or(db);
+    if tls && info.database.is_none() {
+        // A recovered certificate instance has no database memory (the
+        // name rides neither the env nor the labels); say so instead of
+        // silently querying the default database (review r2 F3).
+        eprintln!(
+            "Note: this instance was recovered without its startup database; \
+             querying the default database (pass --database to pick another)."
+        );
+    }
 
     if query.is_some() || queries_file.is_some() {
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
@@ -1857,12 +1887,50 @@ mod tests {
             Some("192.0.2.1"),
             None,
             None,
+            None,
             Vec::new(),
         )
         .unwrap_err();
         assert!(
             matches!(error, Error::ClickhouseUsage(ref message) if message.contains("not present on this host")),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_start_options_rejects_non_identifier_databases() {
+        for bad in ["", "has space", "semi;colon", "1starts_digit", "dash-name"] {
+            let error = validate_start_options(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(bad),
+                None,
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::ClickhouseUsage(ref message) if message.contains("invalid --database")),
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(
+            validate_start_options(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("events_2"),
+                None,
+                Vec::new(),
+            )
+            .is_ok(),
+            "plain identifiers pass"
         );
     }
 }

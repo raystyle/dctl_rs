@@ -806,6 +806,14 @@ async fn resume_existing(
     }
 
     let (user, password, database) = read_pg_env(docker, &container_id).await?;
+    // The env keeps the inert bootstrap credential even on the certificate
+    // face (the entrypoint requires it); the resume output hides it the
+    // same way the fresh start does (review r2 F2).
+    let password = if prior.tls == Some(true) {
+        String::new()
+    } else {
+        password
+    };
 
     let out = output::PostgresStartOutput {
         name: display_name,

@@ -846,14 +846,12 @@ pub async fn upload_clickhouse_tls_material(
 /// One SQL statement over the certificate face from inside the container
 /// (clickhouse-client on the secure native port with the uploaded client
 /// config) - the published-port-decoupled twin of the readiness probe,
-/// used by the certificate-face database bootstrap.
-pub async fn clickhouse_tls_query(
-    docker: &Docker,
-    id: &str,
-    user: &str,
-    sql: &str,
-) -> Result<String> {
-    use bollard::exec::StartExecResults;
+/// used by the certificate-face database bootstrap. Probe-shaped on
+/// purpose: no attached output (the machine channel must stay clean), the
+/// exit code is the verdict, and an unreadable status is a failure, never
+/// a silent success (review r2 F1).
+pub async fn clickhouse_tls_query(docker: &Docker, id: &str, user: &str, sql: &str) -> Result<()> {
+    use bollard::exec::{StartExecOptions, StartExecResults};
     use bollard::models::ExecConfig;
 
     let cmd = vec![
@@ -874,8 +872,8 @@ pub async fn clickhouse_tls_query(
         .create_exec(
             id,
             ExecConfig {
-                attach_stdout: Some(true),
-                attach_stderr: Some(true),
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
                 attach_stdin: Some(false),
                 tty: Some(false),
                 cmd: Some(cmd),
@@ -884,45 +882,56 @@ pub async fn clickhouse_tls_query(
         )
         .await
         .map_err(|error| Error::DockerError(error.to_string()))?;
-    let output = match docker
-        .start_exec(&exec.id, None)
+    let started = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
         .await
-        .map_err(|error| Error::DockerError(error.to_string()))?
-    {
-        StartExecResults::Attached { output, input } => {
-            drop(input);
-            output
-        }
-        StartExecResults::Detached => return Ok(String::new()),
-    };
-    use futures_util::StreamExt as _;
-    use tokio::io::AsyncWriteExt as _;
-    let mut stdout = tokio::io::stdout();
-    let mut result = String::new();
-    let mut stream = output;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(out) => {
-                let bytes = out.into_bytes();
-                result.push_str(&String::from_utf8_lossy(&bytes));
-                let _ = stdout.write_all(&bytes).await;
-            }
-            Err(error) => {
-                return Err(Error::DockerError(format!(
-                    "clickhouse-client exec stream failed: {error}"
-                )));
-            }
-        }
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    if !matches!(started, StartExecResults::Detached) {
+        return Err(Error::DockerError(
+            "clickhouse-client exec unexpectedly attached".to_string(),
+        ));
     }
-    if let Ok(info) = docker.inspect_exec(&exec.id).await
-        && let Some(code) = info.exit_code
-        && code != 0
-    {
-        return Err(Error::DockerError(format!(
-            "clickhouse-client exited with status {code}"
-        )));
+    for _ in 0..150 {
+        let inspect = docker.inspect_exec(&exec.id).await.map_err(|error| {
+            eprintln!("clickhouse-client exec inspect failed: {error}");
+            Error::ClickhouseUsage(
+                "could not confirm the in-container bootstrap finished; the attempt \
+                     was rolled back"
+                    .to_string(),
+            )
+        })?;
+        if inspect.running != Some(true) {
+            return match inspect.exit_code {
+                Some(0) => Ok(()),
+                Some(code) => {
+                    eprintln!("clickhouse-client exited with status {code}");
+                    Err(Error::ClickhouseUsage(
+                        "the in-container database bootstrap failed; the attempt was \
+                         rolled back"
+                            .to_string(),
+                    ))
+                }
+                // An absent exit code after the run ended is unknowable
+                // state: treating it as success would resurrect the
+                // half-product this path exists to prevent.
+                None => Err(Error::ClickhouseUsage(
+                    "the in-container bootstrap finished without an exit status; the \
+                     attempt was rolled back"
+                        .to_string(),
+                )),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
-    Ok(result)
+    Err(Error::DockerError(
+        "clickhouse-client exec did not exit within 3 seconds".to_string(),
+    ))
 }
 
 /// Face-aware readiness for the certificate face: an in-container wget over
