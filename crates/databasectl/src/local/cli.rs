@@ -1103,6 +1103,25 @@ mod tests {
     }
 
     #[test]
+    fn falkordb_start_auth_face_parses_with_cert_default() {
+        let LocalCommands::Falkordb {
+            command: FalkorCommands::Start { auth, .. },
+        } = local_command(&["falkordb", "start"])
+        else {
+            panic!("expected falkordb start");
+        };
+        assert_eq!(auth, AuthFaceArg::Cert, "certificate face is the default");
+
+        let LocalCommands::Falkordb {
+            command: FalkorCommands::Start { auth, .. },
+        } = local_command(&["falkordb", "start", "--auth", "password"])
+        else {
+            panic!("expected falkordb start");
+        };
+        assert_eq!(auth, AuthFaceArg::Password);
+    }
+
+    #[test]
     fn install_selectors_parse_by_engine() {
         for (input, expected) in [
             ("26.8", InstallVersionArg::ClickHouse("26.8".to_string())),
