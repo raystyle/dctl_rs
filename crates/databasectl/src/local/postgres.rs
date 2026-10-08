@@ -386,15 +386,18 @@ async fn start(
         let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_string());
 
         let tls = auth == crate::local::cli::AuthFaceArg::Cert;
-        // The certificate face provisions no usable TCP password; the start
-        // output prints none rather than a decorative one (contract across
-        // the three engines).
+        // The env keeps a generated password even on the certificate face:
+        // the postgres entrypoint refuses to boot on an empty
+        // POSTGRES_PASSWORD (review r1 F1), and the dctl-managed hba never
+        // accepts password auth there anyway - the credential stays inert.
+        // The start output prints none instead of the decorative row.
+        let provisioned_password = password_from_env
+            .or(password)
+            .unwrap_or_else(generate_password);
         let password = if tls {
             String::new()
         } else {
-            password_from_env
-                .or(password)
-                .unwrap_or_else(generate_password)
+            provisioned_password.clone()
         };
 
         // The certificate face (ADR-0011): create with the TLS server flags,
@@ -409,7 +412,7 @@ async fn start(
             data_dir: &data_dir,
             project_cwd: &project_cwd,
             user: &user,
-            password: &password,
+            password: &provisioned_password,
             database: &database,
             extra_env,
             tls,
@@ -428,6 +431,7 @@ async fn start(
             engine: Engine::Postgres,
             container_id: Some(container_id.clone()),
             tls: Some(tls),
+            database: None,
         };
         // Issuance and upload live inside the rollback-covered block (the
         // material rides in the container layer, so removing the container
@@ -1753,6 +1757,7 @@ mod tests {
             engine: Engine::Postgres,
             container_id: Some("running-default".into()),
             tls: None,
+            database: None,
         };
         server::save_server_info_locked(&info, &lock).unwrap();
 

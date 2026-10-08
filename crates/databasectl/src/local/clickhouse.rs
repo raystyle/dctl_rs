@@ -395,6 +395,10 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             engine: Engine::Clickhouse,
             container_id: Some(container_id.clone()),
             tls: Some(tls),
+            // The certificate face carries no CLICKHOUSE_DB env (S005), so
+            // metadata remembers the requested database for client/dotenv
+            // (review r1 F5); the password face reads it from the env.
+            database: if tls { Some(database.clone()) } else { None },
         };
         // Issuance and upload live inside the rollback-covered block (the
         // material rides in the container layer, so removing the container
@@ -462,17 +466,19 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
 
         let bootstrap = if tls {
             // The entrypoint skipped its database bootstrap (no CLICKHOUSE_DB
-            // on this face, S005); the certificate client creates it instead.
-            // A failure rolls the fresh start back like a readiness failure:
-            // leaving a running server without the requested database would
-            // be a half-product the next resume never repairs (review F4).
+            // on this face, S005); the in-container certificate client
+            // creates it over the secure native port instead - same
+            // published-port decoupling as the readiness probe, so this
+            // works everywhere (review r1 F4). A failure rolls the fresh
+            // start back like a readiness failure: leaving a running server
+            // without the requested database would be a half-product the
+            // next resume never repairs.
             if database != DEFAULT_DATABASE {
                 Some(
-                    https_query(
-                        "127.0.0.1",
-                        http_port,
+                    docker::clickhouse_tls_query(
+                        &docker,
+                        &container_id,
                         DEFAULT_USER,
-                        None,
                         &format!("CREATE DATABASE IF NOT EXISTS {database}"),
                     )
                     .await
@@ -1421,6 +1427,9 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let (user, password, db) = read_ch_env(&docker, container_id).await?;
     let tls = info.tls == Some(true);
+    // Certificate-face instances carry their requested database in metadata
+    // (no CLICKHOUSE_DB env rides the container, review r1 F5).
+    let db = info.database.clone().unwrap_or(db);
 
     if query.is_some() || queries_file.is_some() {
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
@@ -1638,9 +1647,12 @@ pub(crate) fn dotenv(
     }
     drop(metadata_lock);
 
-    let (user, password, database) = docker::block_on(read_ch_env_for_dotenv(
+    let (user, password, mut database) = docker::block_on(read_ch_env_for_dotenv(
         info.container_id.as_deref().unwrap_or_default(),
     ))?;
+    if let Some(stored) = info.database.clone() {
+        database = stored;
+    }
 
     // The face decides the shape (ADR-0011): certificate instances get the
     // TLS material paths and no password; password instances keep the

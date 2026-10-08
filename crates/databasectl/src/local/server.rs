@@ -78,10 +78,17 @@ pub struct ServerInfo {
     pub container_id: Option<String>,
     /// Postgres authentication face (ADR-0011): `Some(true)` = certificate
     /// (mTLS) instances, `Some(false)` = explicit `--auth password`, and
-    /// `None` = metadata predating the split (password behavior). Other
-    /// engines leave it `None`.
+    /// Authentication face: `Some(true)` certificate mTLS, `Some(false)`
+    /// password, `None` = metadata predating the face split (password
+    /// behavior).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<bool>,
+    /// The requested startup database, when the engine stores it in
+    /// metadata instead of the container env (ClickHouse certificate face:
+    /// no CLICKHOUSE_DB env rides the container, review r1 F5). `None` on
+    /// every other path; the env remains the source of truth there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub database: Option<String>,
 }
 
 /// A server entry shown in list output — may or may not be running.
@@ -1103,6 +1110,7 @@ mod fk_key_tests {
             engine,
             container_id: Some("cid".into()),
             tls: None,
+            database: None,
         }
     }
 
@@ -1188,6 +1196,7 @@ mod tests {
             engine: Engine::Clickhouse,
             container_id: None,
             tls: None,
+            database: None,
         }
     }
 
@@ -1233,6 +1242,7 @@ mod tests {
             engine: Engine::Postgres,
             container_id: Some("abc123".into()),
             tls: None,
+            database: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: ServerInfo = serde_json::from_str(&json).unwrap();
@@ -1529,6 +1539,7 @@ mod state_bucket_tests {
                 engine: Engine::Postgres,
                 container_id: None,
                 tls: None,
+                database: None,
             })
             .unwrap(),
         )
@@ -1607,6 +1618,7 @@ mod state_bucket_tests {
             engine: Engine::Postgres,
             container_id: Some("live-container".into()),
             tls: None,
+            database: None,
         })
         .unwrap()
     }

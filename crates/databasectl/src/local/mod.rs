@@ -528,6 +528,7 @@ mod tests {
             engine,
             container_id: None,
             tls: None,
+            database: None,
         }
     }
 

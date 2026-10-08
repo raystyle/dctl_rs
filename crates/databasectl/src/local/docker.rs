@@ -843,6 +843,88 @@ pub async fn upload_clickhouse_tls_material(
     }
 }
 
+/// One SQL statement over the certificate face from inside the container
+/// (clickhouse-client on the secure native port with the uploaded client
+/// config) - the published-port-decoupled twin of the readiness probe,
+/// used by the certificate-face database bootstrap.
+pub async fn clickhouse_tls_query(
+    docker: &Docker,
+    id: &str,
+    user: &str,
+    sql: &str,
+) -> Result<String> {
+    use bollard::exec::StartExecResults;
+    use bollard::models::ExecConfig;
+
+    let cmd = vec![
+        "clickhouse-client".to_string(),
+        "--secure".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "9440".to_string(),
+        "--user".to_string(),
+        user.to_string(),
+        "--config".to_string(),
+        format!("{CH_TLS_DIR_IN_CONTAINER}/cli.xml"),
+        "--query".to_string(),
+        sql.to_string(),
+    ];
+    let exec = docker
+        .create_exec(
+            id,
+            ExecConfig {
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                attach_stdin: Some(false),
+                tty: Some(false),
+                cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    let output = match docker
+        .start_exec(&exec.id, None)
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?
+    {
+        StartExecResults::Attached { output, input } => {
+            drop(input);
+            output
+        }
+        StartExecResults::Detached => return Ok(String::new()),
+    };
+    use futures_util::StreamExt as _;
+    use tokio::io::AsyncWriteExt as _;
+    let mut stdout = tokio::io::stdout();
+    let mut result = String::new();
+    let mut stream = output;
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(out) => {
+                let bytes = out.into_bytes();
+                result.push_str(&String::from_utf8_lossy(&bytes));
+                let _ = stdout.write_all(&bytes).await;
+            }
+            Err(error) => {
+                return Err(Error::DockerError(format!(
+                    "clickhouse-client exec stream failed: {error}"
+                )));
+            }
+        }
+    }
+    if let Ok(info) = docker.inspect_exec(&exec.id).await
+        && let Some(code) = info.exit_code
+        && code != 0
+    {
+        return Err(Error::DockerError(format!(
+            "clickhouse-client exited with status {code}"
+        )));
+    }
+    Ok(result)
+}
+
 /// Face-aware readiness for the certificate face: an in-container wget over
 /// https with the uploaded client pair and the certificate auth header
 /// (S005). The published port is never touched, so this probe works even
@@ -2126,6 +2208,7 @@ pub fn recover_project_postgres_blocking(
                 engine: Engine::Postgres,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -2185,6 +2268,7 @@ pub fn recover_project_clickhouse_blocking(
                 engine: Engine::Clickhouse,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -2250,6 +2334,7 @@ pub fn recover_project_falkor_blocking(
                 engine: Engine::Falkordb,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }

@@ -103,7 +103,7 @@ $ dctl server dotenv              # 写 CLICKHOUSE_* 连接变量(证书面写 T
 
 ClickHouse 实例默认以证书面起(ADR-0011):HTTP 发布口改供 https、native 发布口接安全口 9440,`client -q` 经 dctl 内置 reqwest 客户端带证书直查(认证头 `X-ClickHouse-SSL-Certificate-Auth`),`--auth password` 显式回落口令面(此时才用 CLICKHOUSE_ 密码 env)。证书面的 `dotenv` 写 `CLICKHOUSE_TLS=true` 与三个证书路径,不再写口令;旧实例 resume 保持其原有认证面。
 
-start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以只读卷挂载进容器 `config.d/`。随机密码由 start 打印一次,`client`/`dotenv` 从容器环境重读。孤儿容器(元数据被移动)通过 Docker label 被重新发现。
+start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以只读卷挂载进容器 `config.d/`。口令面的随机密码由 start 打印一次,`client`/`dotenv` 从容器环境重读;证书面零口令。孤儿容器(元数据被移动)通过 Docker label 被重新发现。
 
 ### init 后的项目目录结构
 
