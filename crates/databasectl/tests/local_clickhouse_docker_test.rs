@@ -62,6 +62,15 @@ struct ChScenario {
     /// listing (label recovery). Ports are omitted (a stopped container does
     /// not publish them) so recovery stores 0/0 — the F1 regression state.
     discovered_stopped: bool,
+    /// Authentication face: the certificate face starts with no managed
+    /// env trio and probes readiness over an in-container https exec.
+    tls: bool,
+    /// Serve this status for the TLS material upload (PUT archive); a
+    /// failure must roll the fresh start back (container removed).
+    upload_status: u16,
+    /// Exit codes served for the in-container readiness execs (certificate
+    /// face); an empty list serves 0 (always ready).
+    readiness_exit_codes: Vec<i64>,
     /// Port bindings the inspect response reports for the container
     /// (AtomicU16 so a test can reserve ports after the daemon starts).
     inspect_http_port: u16,
@@ -78,6 +87,9 @@ impl Default for ChScenario {
             logs: Vec::new(),
             live_before_start: true,
             discovered_stopped: false,
+            tls: false,
+            upload_status: 200,
+            readiness_exit_codes: Vec::new(),
             inspect_http_port: 0,
             inspect_native_port: 0,
         }
@@ -122,12 +134,19 @@ impl FakeDocker {
                 logs,
                 live_before_start,
                 discovered_stopped,
+                tls,
+                upload_status,
+                readiness_exit_codes,
                 // inspect ports ride the shared cell, seeded synchronously
                 // in start(); tests may override via set_inspect_ports.
                 inspect_http_port: _,
                 inspect_native_port: _,
             } = scenario;
             let mut started = false;
+            let mut next_exec = 0_usize;
+            let mut readiness_exit_codes: std::collections::VecDeque<i64> =
+                readiness_exit_codes.into_iter().collect();
+            let mut exec_exit_codes = std::collections::HashMap::new();
             let inspect_ports = Arc::clone(&thread_inspect_ports);
             let discovered_body = format!(
                 r#"[{{"Id":"{CONTAINER}","Labels":{{"dctl.engine":"clickhouse","dctl.name":"default","dctl.major":"{TAG}","dctl.project":"{}"}},"Image":"{IMAGE}","Ports":[]}}]"#,
@@ -224,8 +243,13 @@ impl FakeDocker {
                         };
                         let (inspect_http_port, inspect_native_port) =
                             *inspect_ports.lock().unwrap();
+                        let env = if tls {
+                            "[]".to_string()
+                        } else {
+                            r#"["CLICKHOUSE_USER=app","CLICKHOUSE_PASSWORD=stored-secret","CLICKHOUSE_DB=events"]"#.to_string()
+                        };
                         let body = format!(
-                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":["CLICKHOUSE_USER=app","CLICKHOUSE_PASSWORD=stored-secret","CLICKHOUSE_DB=events"]}},"HostConfig":{{"PortBindings":{{"8123/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_http_port}"}}],"9000/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_native_port}"}}]}}}}}}"#
+                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":{env}}},"HostConfig":{{"PortBindings":{{"8123/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_http_port}"}}],"9000/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_native_port}"}}]}}}}}}"#
                         );
                         write_json(&mut stream, 200, &body);
                     }
@@ -269,6 +293,45 @@ impl FakeDocker {
                     }
                     ("DELETE", path) if path.starts_with("/containers/") => {
                         write_response(&mut stream, 204, "application/json", b"")
+                    }
+                    // The certificate face uploads the TLS material into
+                    // the created container (S005); accept and record it.
+                    ("PUT", path)
+                        if path.starts_with("/containers/") && path.contains("/archive?") =>
+                    {
+                        if upload_status == 200 {
+                            write_response(&mut stream, 200, "application/json", b"")
+                        } else {
+                            write_json(
+                                &mut stream,
+                                upload_status,
+                                r#"{"message":"upload failed by test"}"#,
+                            )
+                        }
+                    }
+                    // Certificate-face readiness: in-container https probe.
+                    ("POST", path)
+                        if path.starts_with(&format!("/containers/{CONTAINER}/exec")) =>
+                    {
+                        let exit_code = readiness_exit_codes.pop_front().unwrap_or(0);
+                        let exec_id = format!("exec-{next_exec}");
+                        next_exec += 1;
+                        exec_exit_codes.insert(exec_id.clone(), exit_code);
+                        write_json(&mut stream, 201, &format!(r#"{{"Id":"{exec_id}"}}"#));
+                    }
+                    ("POST", path) if path.starts_with("/exec/") && path.ends_with("/start") => {
+                        write_response(&mut stream, 200, "application/json", b"")
+                    }
+                    ("GET", path) if path.starts_with("/exec/") && path.ends_with("/json") => {
+                        let exec_id = path.trim_start_matches("/exec/").trim_end_matches("/json");
+                        let exit_code = exec_exit_codes.get(exec_id).copied().unwrap_or(0);
+                        write_json(
+                            &mut stream,
+                            200,
+                            &format!(
+                                r#"{{"ID":"{exec_id}","Running":false,"ExitCode":{exit_code}}}"#
+                            ),
+                        );
                     }
                     _ => {
                         eprintln!("UNEXPECTED fake Docker request: {request:?}");
@@ -624,6 +687,8 @@ fn assert_start_publishes_on_faces(bind: &str, expected: &[&str]) {
             "--json",
             "server",
             "start",
+            "--auth",
+            "password",
             "--bind",
             bind,
             "--http-port",
@@ -710,6 +775,8 @@ fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
             "app",
             "--database",
             "events",
+            "--auth",
+            "password",
         ],
     );
     assert!(
@@ -794,6 +861,192 @@ fn fresh_start_creates_container_writes_metadata_and_prints_credentials() {
 }
 
 #[test]
+fn cert_face_default_start_uploads_tls_material_and_serves_https() {
+    let _guard = START_COMMAND_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario {
+            running: true,
+            live_before_start: false,
+            tls: true,
+            ..Default::default()
+        },
+    );
+    let (http_port, native_port) = reserve_port_pair();
+
+    // No fake HTTP listener: the certificate face never touches the
+    // published port (readiness rides the in-container https exec).
+    let output = run(
+        project.path(),
+        home.path(),
+        &[
+            "local",
+            "--json",
+            "server",
+            "start",
+            "--http-port",
+            &http_port.to_string(),
+            "--native-port",
+            &native_port.to_string(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).expect("start JSON");
+    assert_eq!(result["user"], "default");
+    assert!(
+        result["password"]
+            .as_str()
+            .map(str::is_empty)
+            .unwrap_or(true),
+        "the certificate face prints no usable password: {result}"
+    );
+
+    let requests = docker.requests();
+    let create = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.path.starts_with("/containers/create"))
+        .expect("create request");
+    let body: serde_json::Value = serde_json::from_str(&create.body).expect("create body JSON");
+    let env = body["Env"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !env.iter()
+            .any(|e| e.as_str().unwrap_or("").starts_with("CLICKHOUSE_")),
+        "the certificate face carries none of the managed env trio: {env:?}"
+    );
+    let bindings = &body["HostConfig"]["PortBindings"];
+    assert_eq!(
+        bindings["8123/tcp"][0]["HostPort"],
+        http_port.to_string(),
+        "https_port takes over the published HTTP port"
+    );
+    assert_eq!(
+        bindings["9440/tcp"][0]["HostPort"],
+        native_port.to_string(),
+        "tcp_port_secure is the published native port: {bindings}"
+    );
+
+    let upload = requests
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.contains("/archive?"))
+        .expect("TLS material upload");
+    assert!(
+        upload.path.contains("path=%2Fetc%2Fclickhouse-server"),
+        "upload targets the config tree: {}",
+        upload.path
+    );
+    let tar = &upload.body;
+    for entry in [
+        "dctl/server.crt",
+        "dctl/server.key",
+        "dctl/ca.crt",
+        "dctl/client.crt",
+        "dctl/client.key",
+        "dctl/cli.xml",
+        "config.d/dctl-tls.xml",
+        "users.d/zz-dctl-user.xml",
+    ] {
+        assert!(tar.contains(entry), "tar carries {entry}");
+    }
+    assert!(
+        tar.contains("<common_name>default</common_name>"),
+        "the certificate user maps the default CN"
+    );
+    assert!(
+        tar.contains("<verificationMode>strict</verificationMode>"),
+        "the server verifies client certificates"
+    );
+    let exec_create = requests
+        .iter()
+        .find(|r| {
+            r.method == "POST" && r.path.starts_with(&format!("/containers/{CONTAINER}/exec"))
+        })
+        .expect("readiness exec request");
+    let exec_body: serde_json::Value =
+        serde_json::from_str(&exec_create.body).expect("exec body JSON");
+    let cmd = exec_body["Cmd"].as_array().expect("cmd array");
+    let cmd: Vec<&str> = cmd.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(cmd.first(), Some(&"wget"));
+    assert!(
+        cmd.contains(&"--header=X-ClickHouse-SSL-Certificate-Auth: on"),
+        "the probe sends the certificate auth header: {cmd:?}"
+    );
+    assert_eq!(cmd.last(), Some(&"https://127.0.0.1:8123/ping"));
+
+    let metadata = read_metadata(home.path(), project.path(), "default-ch26.8");
+    assert_eq!(metadata["tls"], true, "the face persists in metadata");
+}
+
+#[test]
+fn cert_face_upload_failure_rolls_the_fresh_start_back() {
+    let _guard = START_COMMAND_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let docker = FakeDocker::start(
+        &home.path().join("docker.sock"),
+        project.path(),
+        ChScenario {
+            running: true,
+            live_before_start: false,
+            tls: true,
+            upload_status: 500,
+            ..Default::default()
+        },
+    );
+    let (http_port, _native_port) = reserve_port_pair();
+
+    let output = run(
+        project.path(),
+        home.path(),
+        &[
+            "local",
+            "--json",
+            "server",
+            "start",
+            "--http-port",
+            &http_port.to_string(),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not upload the TLS material"),
+        "self-composed upload failure: {stderr}"
+    );
+    // The human channel carries the daemon text; the JSON envelope's
+    // message line must carry only the self-composed sentence.
+    let message_line = stderr
+        .lines()
+        .find(|line| line.contains("\"message\""))
+        .expect("JSON envelope present");
+    assert!(
+        !message_line.contains("upload failed by test"),
+        "daemon text must stay out of the envelope: {message_line}"
+    );
+    let requests = docker.requests();
+    // The failed fresh start rolls the container back.
+    assert!(
+        requests.iter().any(
+            |r| r.method == "DELETE" && r.path.starts_with(&format!("/containers/{CONTAINER}"))
+        ),
+        "rollback removed the failed container"
+    );
+    assert!(
+        !bucket_servers(home.path(), project.path())
+            .join("default-ch26.8.json")
+            .exists(),
+        "rollback removed the fresh metadata"
+    );
+}
+
+#[test]
 fn start_pulls_missing_image_before_creating() {
     let _guard = START_COMMAND_LOCK.lock().unwrap();
     let project = tempfile::tempdir().unwrap();
@@ -820,6 +1073,8 @@ fn start_pulls_missing_image_before_creating() {
             "--json",
             "server",
             "start",
+            "--auth",
+            "password",
             "--http-port",
             &http_port.to_string(),
             "--native-port",
@@ -873,7 +1128,7 @@ fn resume_starts_existing_container_without_creating() {
     let output = run(
         project.path(),
         home.path(),
-        &["local", "--json", "server", "start"],
+        &["local", "--json", "server", "start", "--auth", "password"],
     );
     assert!(
         output.status.success(),
@@ -934,7 +1189,9 @@ fn start_when_container_running_reports_already_running() {
     let output = run(
         project.path(),
         home.path(),
-        &["local", "--json", "server", "start", "default"],
+        &[
+            "local", "--json", "server", "start", "default", "--auth", "password",
+        ],
     );
     assert!(!output.status.success(), "already-running must fail");
     let result: serde_json::Value = serde_json::from_slice(&output.stderr).expect("error JSON");
@@ -968,6 +1225,8 @@ fn readiness_timeout_rolls_back_fresh_container_and_data() {
             "--json",
             "server",
             "start",
+            "--auth",
+            "password",
             "--http-port",
             &http_port.to_string(),
             "--native-port",
@@ -1068,7 +1327,7 @@ fn recovery_from_deleted_metadata_resumes_with_correct_ports() {
     let output = run(
         project.path(),
         home.path(),
-        &["local", "--json", "server", "start"],
+        &["local", "--json", "server", "start", "--auth", "password"],
     );
     assert!(
         output.status.success(),
@@ -1266,6 +1525,8 @@ fn start_warns_when_existing_data_rejects_the_printed_credentials() {
             "local",
             "server",
             "start",
+            "--auth",
+            "password",
             "--http-port",
             &http_port.to_string(),
             "--native-port",

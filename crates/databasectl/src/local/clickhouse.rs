@@ -230,6 +230,7 @@ pub(crate) struct StartCmd {
     pub config: Option<String>,
     pub extra_env: Vec<String>,
     pub wait_timeout: Duration,
+    pub auth: crate::local::cli::AuthFaceArg,
     pub json: bool,
 }
 
@@ -246,6 +247,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         config,
         extra_env,
         wait_timeout,
+        auth,
         json,
     } = cmd;
     let preflight = validate_start_options(
@@ -345,9 +347,23 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         server::ensure_ch_data_dir(&user_name, &tag)?;
         let data_dir = server::ch_data_dir(&user_name, &tag)?;
 
+        let tls = auth == crate::local::cli::AuthFaceArg::Cert;
         let user = user.unwrap_or_else(|| DEFAULT_USER.to_string());
+        // The certificate user is the image's only user; a named user only
+        // exists through the entrypoint's password flow (S005).
+        if tls && user != DEFAULT_USER {
+            return Err(Error::ClickhouseUsage(
+                "the certificate face authenticates as the default user; pass --auth \
+                 password to start a named user"
+                    .into(),
+            ));
+        }
         let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_string());
-        let password = password.unwrap_or_else(generate_password);
+        let password = if tls {
+            String::new()
+        } else {
+            password.unwrap_or_else(generate_password)
+        };
 
         let opts = ClickhouseRunOpts {
             user_name: &user_name,
@@ -363,6 +379,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             database: &database,
             config_source: config_source.as_deref(),
             extra_env,
+            tls,
         };
 
         let container_id = docker::create_clickhouse(&docker, opts).await?;
@@ -377,9 +394,37 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             cwd: project_cwd.clone(),
             engine: Engine::Clickhouse,
             container_id: Some(container_id.clone()),
-            tls: None,
+            tls: Some(tls),
         };
+        // Issuance and upload live inside the rollback-covered block (the
+        // material rides in the container layer, so removing the container
+        // cleans it). The client pair is uploaded too: the in-container
+        // clickhouse-client legs (readiness probe and the interactive REPL)
+        // ride it; the certificate-face programmatic path connects from the
+        // host with the CA material instead (REQ-0017).
         let startup_result = async {
+            if tls {
+                let cname = docker::ch_container_name(&user_name, &tag);
+                let (server_cert, server_key) = crate::local::ca::issue_server_cert(&cname)?;
+                let ca_cert =
+                    std::fs::read_to_string(crate::local::ca::ensure_ca()?).map_err(|e| {
+                        Error::ClickhouseUsage(format!(
+                            "could not read the dctl CA certificate: {e}"
+                        ))
+                    })?;
+                let (client_cert, client_key) = crate::local::ca::issue(DEFAULT_USER)?;
+                docker::upload_clickhouse_tls_material(
+                    &docker,
+                    &container_id,
+                    &server_cert,
+                    &server_key,
+                    &client_cert,
+                    &client_key,
+                    &ca_cert,
+                    DEFAULT_USER,
+                )
+                .await?;
+            }
             docker::start_existing(&docker, &container_id).await?;
             server::save_server_info_locked(&info, &metadata_lock)
         }
@@ -399,7 +444,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         drop(metadata_lock);
 
         if let Err(failure) =
-            wait_for_ch_ready(&docker, &container_id, http_port, wait_timeout).await
+            wait_for_ch_ready(&docker, &container_id, http_port, tls, wait_timeout).await
         {
             let primary =
                 ch_readiness_error(&docker, &container_id, &user_name, wait_timeout, failure).await;
@@ -415,7 +460,22 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             .await);
         }
 
-        warn_if_credentials_rejected(http_port, &user, &password, &database).await;
+        if tls {
+            // The entrypoint skipped its database bootstrap (no CLICKHOUSE_DB
+            // on this face, S005); the certificate client creates it instead.
+            if database != DEFAULT_DATABASE {
+                https_query(
+                    "127.0.0.1",
+                    http_port,
+                    DEFAULT_USER,
+                    None,
+                    &format!("CREATE DATABASE IF NOT EXISTS {database}"),
+                )
+                .await?;
+            }
+        } else {
+            warn_if_credentials_rejected(http_port, &user, &password, &database).await;
+        }
         let out = output::ClickhouseStartOutput {
             name: user_name,
             container_id,
@@ -697,8 +757,14 @@ async fn resume_existing(
     }
     drop(metadata_lock);
 
-    if let Err(failure) =
-        wait_for_ch_ready(docker, &container_id, info.http_port, wait_timeout).await
+    if let Err(failure) = wait_for_ch_ready(
+        docker,
+        &container_id,
+        info.http_port,
+        prior.tls == Some(true),
+        wait_timeout,
+    )
+    .await
     {
         let error =
             ch_readiness_error(docker, &container_id, &display_name, wait_timeout, failure).await;
@@ -857,24 +923,76 @@ async fn wait_for_ch_ready(
     docker: &bollard::Docker,
     container_id: &str,
     http_port: u16,
+    tls: bool,
     timeout: Duration,
 ) -> std::result::Result<(), ReadinessFailure> {
-    let mut last_probe_error = None;
-    match tokio::time::timeout(
-        timeout,
-        poll_ch_readiness(
-            docker,
-            container_id,
-            http_port,
-            usize::MAX,
-            || Box::pin(tokio::time::sleep(READINESS_POLL_INTERVAL)),
-            &mut last_probe_error,
-        ),
-    )
-    .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(ReadinessFailure::TimedOut { last_probe_error }),
+    if tls {
+        // The certificate face probes in-container over https with the
+        // uploaded pair (S005): the published port stays out of the loop, so
+        // this works even where daemon port publishing is unreachable over
+        // host loopback.
+        let mut last_probe_error = None;
+        match tokio::time::timeout(
+            timeout,
+            poll_ch_tls_readiness(docker, container_id, &mut last_probe_error),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ReadinessFailure::TimedOut { last_probe_error }),
+        }
+    } else {
+        let mut last_probe_error = None;
+        match tokio::time::timeout(
+            timeout,
+            poll_ch_readiness(
+                docker,
+                container_id,
+                http_port,
+                usize::MAX,
+                || Box::pin(tokio::time::sleep(READINESS_POLL_INTERVAL)),
+                &mut last_probe_error,
+            ),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(ReadinessFailure::TimedOut { last_probe_error }),
+        }
+    }
+}
+
+/// Certificate-face readiness loop: container state plus the in-container
+/// https probe with the uploaded client pair.
+async fn poll_ch_tls_readiness(
+    docker: &bollard::Docker,
+    container_id: &str,
+    last_probe_error: &mut Option<String>,
+) -> std::result::Result<(), ReadinessFailure> {
+    loop {
+        match probe_container_state(docker, container_id).await {
+            Ok(ReadinessState::Exited {
+                status,
+                exit_code,
+                oom_killed,
+            }) => {
+                return Err(ReadinessFailure::Exited {
+                    status,
+                    exit_code,
+                    oom_killed,
+                });
+            }
+            Ok(ReadinessState::Running) => {
+                match docker::clickhouse_tls_is_ready(docker, container_id, DEFAULT_USER).await {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(error) => *last_probe_error = Some(error.to_string()),
+                }
+            }
+            Ok(ReadinessState::Pending) => {}
+            Err(error) => return Err(ReadinessFailure::Probe(error)),
+        }
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
 }
 
@@ -1118,6 +1236,72 @@ pub(crate) async fn http_query(
     Ok(response.text().await.unwrap_or_default())
 }
 
+/// Execute a SQL query over the certificate face (REQ-0017): https with
+/// the dctl client identity, trusting only the dctl CA, authenticating the
+/// default user through the certificate-auth header pair (S005). The URL
+/// carries no user/password parameters - mixing them with certificate auth
+/// is rejected by the server.
+pub(crate) async fn https_query(
+    host: &str,
+    port: u16,
+    user: &str,
+    database: Option<&str>,
+    sql: &str,
+) -> Result<String> {
+    use reqwest::tls::{Certificate, Identity};
+
+    let (cert_path, key_path) = crate::local::ca::client_cert(user)?;
+    let key_pem = std::fs::read_to_string(&key_path)
+        .map_err(|e| Error::ClickhouseUsage(format!("could not read the client key: {e}")))?;
+    let cert_pem = std::fs::read_to_string(&cert_path).map_err(|e| {
+        Error::ClickhouseUsage(format!("could not read the client certificate: {e}"))
+    })?;
+    let ca_pem = std::fs::read(crate::local::ca::ensure_ca()?).map_err(|e| {
+        Error::ClickhouseUsage(format!("could not read the dctl CA certificate: {e}"))
+    })?;
+
+    let identity_pem = format!("{key_pem}{cert_pem}");
+    let identity = Identity::from_pem(identity_pem.as_bytes()).map_err(|e| {
+        Error::ClickhouseUsage(format!("could not load the client certificate: {e}"))
+    })?;
+    // tls_certs_only (not the deprecated add_root_certificate): the private
+    // CA must fully replace the platform verifier, or rustls reports
+    // UnknownIssuer for the self-signed chain (S005).
+    let client = crate::http::client_builder()
+        .tls_certs_only([Certificate::from_pem(&ca_pem)
+            .map_err(|e| Error::ClickhouseUsage(format!("could not load the CA: {e}")))?])
+        .identity(identity)
+        .timeout(Duration::from_secs(120))
+        .no_proxy()
+        .build()?;
+
+    let url = format!("https://{host}:{port}/");
+    let mut request = client
+        .post(&url)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("X-ClickHouse-SSL-Certificate-Auth", "on")
+        .header("X-ClickHouse-User", user);
+    if let Some(database) = database {
+        request = request.query(&[("database", database)]);
+    }
+    let response = request.body(sql.to_string()).send().await.map_err(|e| {
+        eprintln!("certificate query to {host}:{port} failed: {e}");
+        Error::ClickhouseUsage(format!(
+            "the query to {host}:{port} over the client certificate failed; the \
+                 transport's message is on stderr"
+        ))
+    })?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(Error::ClickhouseHttp {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    Ok(response.text().await.unwrap_or_default())
+}
+
 /// Read the provisioned credentials from the container's effective env.
 /// Fails loudly when the container cannot be inspected: fabricating the
 /// defaults instead would silently connect (and write .env files) with a
@@ -1205,32 +1389,66 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
         .as_deref()
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let (user, password, db) = read_ch_env(&docker, container_id).await?;
+    let tls = info.tls == Some(true);
 
     if query.is_some() || queries_file.is_some() {
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
-        let result = http_query(
-            "127.0.0.1",
-            info.http_port,
-            Some(&user),
-            Some(&password),
-            database.as_deref().or(Some(db.as_str())),
-            &sql,
-        )
-        .await?;
+        let result = if tls {
+            // Certificate face (REQ-0017): https with the client identity
+            // and the certificate-auth header pair (S005); no password
+            // exists to send.
+            https_query(
+                "127.0.0.1",
+                info.http_port,
+                DEFAULT_USER,
+                database.as_deref().or(Some(db.as_str())),
+                &sql,
+            )
+            .await?
+        } else {
+            http_query(
+                "127.0.0.1",
+                info.http_port,
+                Some(&user),
+                Some(&password),
+                database.as_deref().or(Some(db.as_str())),
+                &sql,
+            )
+            .await?
+        };
         print!("{result}");
         return Ok(());
     }
 
-    // Interactive: docker exec clickhouse-client with TTY.
-    let cli_args: Vec<String> = vec![
-        "--user".into(),
-        user.clone(),
-        "--password".into(),
-        password.clone(),
-        "--database".into(),
-        database.clone().unwrap_or(db),
-        "--interactive".into(),
-    ];
+    // Interactive: docker exec clickhouse-client with TTY. The certificate
+    // face rides the secure port with the in-container client config; the
+    // password face keeps the credential flags.
+    let cli_args: Vec<String> = if tls {
+        vec![
+            "--secure".into(),
+            "--host".into(),
+            "127.0.0.1".into(),
+            "--port".into(),
+            "9440".into(),
+            "--user".into(),
+            DEFAULT_USER.to_string(),
+            "--config".into(),
+            "/etc/clickhouse-server/dctl/cli.xml".into(),
+            "--database".into(),
+            database.clone().unwrap_or(db),
+            "--interactive".into(),
+        ]
+    } else {
+        vec![
+            "--user".into(),
+            user.clone(),
+            "--password".into(),
+            password.clone(),
+            "--database".into(),
+            database.clone().unwrap_or(db),
+            "--interactive".into(),
+        ]
+    };
     docker::exec_clickhouse_client_in_container(&docker, container_id, &cli_args).await
 }
 
@@ -1393,20 +1611,66 @@ pub(crate) fn dotenv(
         info.container_id.as_deref().unwrap_or_default(),
     ))?;
 
-    let vars: Vec<(&str, String)> = vec![
-        ("CLICKHOUSE_HOST", "127.0.0.1".to_string()),
-        ("CLICKHOUSE_HTTP_PORT", info.http_port.to_string()),
-        ("CLICKHOUSE_PORT", info.tcp_port.to_string()),
-        ("CLICKHOUSE_USER", user),
-        ("CLICKHOUSE_PASSWORD", password),
-        ("CLICKHOUSE_DATABASE", database),
-    ];
+    // The face decides the shape (ADR-0011): certificate instances get the
+    // TLS material paths and no password; password instances keep the
+    // credential line (S005).
+    let vars: Vec<(&str, String)> = if info.tls == Some(true) {
+        let (cert_path, key_path) = crate::local::ca::client_cert(DEFAULT_USER)?;
+        vec![
+            ("CLICKHOUSE_HOST", "127.0.0.1".to_string()),
+            ("CLICKHOUSE_HTTP_PORT", info.http_port.to_string()),
+            ("CLICKHOUSE_PORT", info.tcp_port.to_string()),
+            ("CLICKHOUSE_USER", DEFAULT_USER.to_string()),
+            ("CLICKHOUSE_DATABASE", database),
+            ("CLICKHOUSE_TLS", "true".to_string()),
+            (
+                "CLICKHOUSE_CA_CERT",
+                crate::local::ca::ensure_ca()?.display().to_string(),
+            ),
+            ("CLICKHOUSE_CLIENT_CERT", cert_path.display().to_string()),
+            ("CLICKHOUSE_CLIENT_KEY", key_path.display().to_string()),
+        ]
+    } else {
+        vec![
+            ("CLICKHOUSE_HOST", "127.0.0.1".to_string()),
+            ("CLICKHOUSE_HTTP_PORT", info.http_port.to_string()),
+            ("CLICKHOUSE_PORT", info.tcp_port.to_string()),
+            ("CLICKHOUSE_USER", user),
+            ("CLICKHOUSE_PASSWORD", password),
+            ("CLICKHOUSE_DATABASE", database),
+        ]
+    };
 
     let filename = if use_local { ".env.local" } else { ".env" };
     let path = std::path::Path::new(filename);
 
     let content = if path.exists() {
         let existing = std::fs::read_to_string(path)?;
+        // All CLICKHOUSE_* keys share the managed prefix, so update_dotenv
+        // replaces in place; the cross-face keys need exact-key stripping
+        // so a switch cannot leave both shapes behind.
+        let strip_password = info.tls == Some(true);
+        let existing = existing
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                let bare = trimmed
+                    .strip_prefix("export")
+                    .map(str::trim_start)
+                    .unwrap_or(trimmed);
+                let key = bare.split('=').next().unwrap_or("").trim_end();
+                let face_key = matches!(
+                    key,
+                    "CLICKHOUSE_TLS"
+                        | "CLICKHOUSE_CA_CERT"
+                        | "CLICKHOUSE_CLIENT_CERT"
+                        | "CLICKHOUSE_CLIENT_KEY"
+                ) || (strip_password && key == "CLICKHOUSE_PASSWORD");
+                !face_key
+            })
+            .chain(std::iter::once(""))
+            .collect::<Vec<_>>()
+            .join("\n");
         crate::local::update_dotenv(&existing, "CLICKHOUSE_", &vars)
     } else {
         vars.iter()

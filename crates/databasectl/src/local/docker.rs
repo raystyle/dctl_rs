@@ -669,6 +669,242 @@ pub async fn upload_falkordb_tls_material(
     }
 }
 
+/// Where the ClickHouse certificate face rides inside the container: the
+/// material under `dctl/`, the TLS listener overlay in `config.d/`, and
+/// the certificate user in `users.d/` (S005).
+pub(crate) const CH_TLS_DIR_IN_CONTAINER: &str = "/etc/clickhouse-server/dctl";
+
+/// The clickhouse user's uid/gid in the official images (Debian base).
+fn clickhouse_uid() -> u64 {
+    101
+}
+
+/// The config.d overlay for the certificate face (S005): https_port takes
+/// over the published 8123, the native port moves to tcp_port_secure 9440,
+/// and the plaintext listeners relocate to cold unpublished ports (deleted
+/// keys would break the image entrypoint's init client).
+fn ch_tls_config_xml() -> &'static str {
+    concat!(
+        "<clickhouse>\n",
+        "  <openSSL>\n",
+        "    <server>\n",
+        "      <certificateFile>/etc/clickhouse-server/dctl/server.crt</certificateFile>\n",
+        "      <privateKeyFile>/etc/clickhouse-server/dctl/server.key</privateKeyFile>\n",
+        "      <caConfig>/etc/clickhouse-server/dctl/ca.crt</caConfig>\n",
+        "      <verificationMode>strict</verificationMode>\n",
+        "      <loadDefaultCAFile>false</loadDefaultCAFile>\n",
+        "      <cacheSessions>true</cacheSessions>\n",
+        "      <disableProtocols>sslv2,sslv3</disableProtocols>\n",
+        "      <preferServerCiphers>true</preferServerCiphers>\n",
+        "    </server>\n",
+        "  </openSSL>\n",
+        "  <http_port>9400</http_port>\n",
+        "  <https_port>8123</https_port>\n",
+        "  <tcp_port>9500</tcp_port>\n",
+        "  <tcp_port_secure>9440</tcp_port_secure>\n",
+        "</clickhouse>\n",
+    )
+}
+
+/// The users.d certificate user (S005): `zz-` sorts after the entrypoint's
+/// `default-user.xml` so a leftover lock-down file cannot re-merge over it;
+/// `replace` swaps the password method for the certificate method wholesale
+/// (the two are mutually exclusive) and every kept field is rewritten.
+fn ch_tls_user_xml(user: &str) -> String {
+    format!(
+        concat!(
+            "<clickhouse>\n",
+            "  <users>\n",
+            "    <default replace=\"replace\">\n",
+            "      <ssl_certificates>\n",
+            "        <common_name>{user}</common_name>\n",
+            "      </ssl_certificates>\n",
+            "      <networks>\n",
+            "        <ip>::/0</ip>\n",
+            "      </networks>\n",
+            "      <profile>default</profile>\n",
+            "      <quota>default</quota>\n",
+            "      <access_management>0</access_management>\n",
+            "    </default>\n",
+            "  </users>\n",
+            "</clickhouse>\n"
+        ),
+        user = user,
+    )
+}
+
+/// The in-container clickhouse-client TLS config (S005): the client offers
+/// no certificate flags, the identity rides in this config file instead.
+fn ch_tls_client_xml() -> &'static str {
+    concat!(
+        "<config>\n",
+        "  <openSSL>\n",
+        "    <client>\n",
+        "      <caConfig>/etc/clickhouse-server/dctl/ca.crt</caConfig>\n",
+        "      <certificateFile>/etc/clickhouse-server/dctl/client.crt</certificateFile>\n",
+        "      <privateKeyFile>/etc/clickhouse-server/dctl/client.key</privateKeyFile>\n",
+        "      <loadDefaultCAFile>false</loadDefaultCAFile>\n",
+        "    </client>\n",
+        "  </openSSL>\n",
+        "</config>\n",
+    )
+}
+
+/// Build the in-memory tar carrying the ClickHouse certificate face: the
+/// server and client pairs with the CA under `dctl/`, the TLS listener
+/// overlay in `config.d/`, and the certificate user in `users.d/`, all
+/// clickhouse-owned (uid 101) with owner-only keys.
+fn build_clickhouse_tls_tar(
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
+    user: &str,
+) -> Result<Vec<u8>> {
+    let uid = clickhouse_uid();
+    let entries: [(&str, String, u32); 8] = [
+        ("dctl/server.crt", server_cert_pem.to_string(), 0o644),
+        ("dctl/server.key", server_key_pem.to_string(), 0o600),
+        ("dctl/ca.crt", ca_cert_pem.to_string(), 0o644),
+        ("dctl/client.crt", client_cert_pem.to_string(), 0o644),
+        ("dctl/client.key", client_key_pem.to_string(), 0o600),
+        ("dctl/cli.xml", ch_tls_client_xml().to_string(), 0o644),
+        (
+            "config.d/dctl-tls.xml",
+            ch_tls_config_xml().to_string(),
+            0o644,
+        ),
+        ("users.d/zz-dctl-user.xml", ch_tls_user_xml(user), 0o644),
+    ];
+    let mut builder = tar::Builder::new(Vec::new());
+    for (path, contents, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_uid(uid);
+        header.set_gid(uid);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .map_err(|e| Error::DockerError(format!("could not build TLS material tar: {e}")))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| Error::DockerError(format!("could not finish TLS material tar: {e}")))
+}
+
+/// Upload the ClickHouse certificate face into a (created, not started)
+/// container; rollback that removes the container cleans it with the layer.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_clickhouse_tls_material(
+    docker: &Docker,
+    container_id: &str,
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
+    user: &str,
+) -> Result<()> {
+    use bollard::query_parameters::UploadToContainerOptionsBuilder;
+    let tar_bytes = build_clickhouse_tls_tar(
+        server_cert_pem,
+        server_key_pem,
+        client_cert_pem,
+        client_key_pem,
+        ca_cert_pem,
+        user,
+    )?;
+    let opts = UploadToContainerOptionsBuilder::default()
+        .path("/etc/clickhouse-server")
+        .build();
+    match docker
+        .upload_to_container(
+            container_id,
+            Some(opts),
+            bollard::body_full(bytes::Bytes::from(tar_bytes)),
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Human-visible diagnostic; the machine envelope carries only
+            // the self-composed sentence (daemon text stays out of parity).
+            eprintln!("TLS material upload failed: {error}");
+            Err(Error::ClickhouseUsage(
+                "could not upload the TLS material into container '{container_id}'; the \
+                 failed attempt was rolled back and nothing was started"
+                    .to_string()
+                    .replace("{container_id}", container_id),
+            ))
+        }
+    }
+}
+
+/// Face-aware readiness for the certificate face: an in-container wget over
+/// https with the uploaded client pair and the certificate auth header
+/// (S005). The published port is never touched, so this probe works even
+/// where daemon port publishing is unreachable over host loopback.
+pub async fn clickhouse_tls_is_ready(docker: &Docker, id: &str, user: &str) -> Result<bool> {
+    use bollard::exec::{StartExecOptions, StartExecResults};
+    use bollard::models::ExecConfig;
+
+    let cmd = vec![
+        "wget".to_string(),
+        "-qO-".to_string(),
+        "--header=X-ClickHouse-SSL-Certificate-Auth: on".to_string(),
+        format!("--header=X-ClickHouse-User: {user}"),
+        format!("--ca-certificate={CH_TLS_DIR_IN_CONTAINER}/ca.crt"),
+        format!("--certificate={CH_TLS_DIR_IN_CONTAINER}/client.crt"),
+        format!("--private-key={CH_TLS_DIR_IN_CONTAINER}/client.key"),
+        "https://127.0.0.1:8123/ping".to_string(),
+    ];
+    let exec = docker
+        .create_exec(
+            id,
+            ExecConfig {
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                attach_stdin: Some(false),
+                tty: Some(false),
+                cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    let started = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    if !matches!(started, StartExecResults::Detached) {
+        return Err(Error::DockerError(
+            "ClickHouse readiness probe unexpectedly attached".to_string(),
+        ));
+    }
+    for _ in 0..75 {
+        let inspect = docker
+            .inspect_exec(&exec.id)
+            .await
+            .map_err(|error| Error::DockerError(error.to_string()))?;
+        if inspect.running != Some(true) {
+            return Ok(inspect.exit_code == Some(0));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Err(Error::DockerError(
+        "ClickHouse readiness probe did not exit within 1.5 seconds".to_string(),
+    ))
+}
+
 /// Upload the certificate face into a (created, not started) container.
 /// Docker honors the tar entries' uid/gid and mode on extraction, so the
 /// key lands postgres-owned and owner-only without any host-side chown.
@@ -865,6 +1101,12 @@ pub struct ClickhouseRunOpts<'a> {
     /// Bind-mount for a partial config overlay (source on the host), if any.
     pub config_source: Option<&'a std::path::Path>,
     pub extra_env: Vec<String>,
+    /// Certificate face (ADR-0011): https_port takes over the published
+    /// HTTP port, the native port is published from tcp_port_secure, and
+    /// the plaintext listeners move to cold unpublished ports. The TLS
+    /// material, config.d overlay and certificate user ride in via
+    /// [`upload_clickhouse_tls_material`] after create.
+    pub tls: bool,
 }
 
 /// Create a ClickHouse container without starting it; return its ID.
@@ -889,8 +1131,15 @@ pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> 
         Some(face) if face.to_string() == loopback => vec![loopback],
         Some(face) => vec![loopback, face.to_string()],
     };
-    for (container_port, host_port) in
-        [("8123/tcp", opts.http_port), ("9000/tcp", opts.native_port)]
+    // The certificate face swaps the roles: https_port listens on 8123 and
+    // the native port is served by tcp_port_secure on 9440 (S005); the
+    // plaintext listeners move to cold ports that stay unpublished.
+    let (http_key, native_key) = if opts.tls {
+        ("8123/tcp", "9440/tcp")
+    } else {
+        ("8123/tcp", "9000/tcp")
+    };
+    for (container_port, host_port) in [(http_key, opts.http_port), (native_key, opts.native_port)]
     {
         port_bindings.insert(
             container_port.to_string(),
@@ -937,11 +1186,19 @@ pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> 
         ..Default::default()
     };
 
-    let mut env: Vec<String> = vec![
-        format!("CLICKHOUSE_USER={}", opts.user),
-        format!("CLICKHOUSE_PASSWORD={}", opts.password),
-        format!("CLICKHOUSE_DB={}", opts.database),
-    ];
+    // The certificate face leaves the trio unset (S005): without them the
+    // image entrypoint neither writes a password user nor locks the default
+    // user's networks, and the database is created over the certificate
+    // client once ready. The password face keeps the entrypoint flow.
+    let mut env: Vec<String> = if opts.tls {
+        Vec::new()
+    } else {
+        vec![
+            format!("CLICKHOUSE_USER={}", opts.user),
+            format!("CLICKHOUSE_PASSWORD={}", opts.password),
+            format!("CLICKHOUSE_DB={}", opts.database),
+        ]
+    };
     env.extend(opts.extra_env);
 
     let mut labels: HashMap<String, String> = HashMap::new();
@@ -1896,6 +2153,22 @@ pub fn recover_project_clickhouse_blocking(
                 continue;
             }
             ensure_ch_data_dir(&c.user_name, &c.major)?;
+            // The authentication face lives in the container's env: the
+            // password face always carries CLICKHOUSE_PASSWORD (generated
+            // when not given), the certificate face carries none of the
+            // managed trio (S005). An un-inspectable container is left for
+            // the next recovery pass instead of being misclassified.
+            let tls = match docker.inspect_container(&c.container_id, None).await {
+                Ok(inspect) => inspect.config.map(|cfg| {
+                    cfg.env
+                        .map(|env| {
+                            !env.iter()
+                                .any(|line| line.starts_with("CLICKHOUSE_PASSWORD="))
+                        })
+                        .unwrap_or(false)
+                }),
+                Err(_) => continue,
+            };
             let info = ServerInfo {
                 name: key,
                 pid: 0,
@@ -1906,7 +2179,7 @@ pub fn recover_project_clickhouse_blocking(
                 cwd: cwd_owned.clone(),
                 engine: Engine::Clickhouse,
                 container_id: Some(c.container_id.clone()),
-                tls: None,
+                tls,
             };
             save_server_info_locked(&info, lock)?;
         }
