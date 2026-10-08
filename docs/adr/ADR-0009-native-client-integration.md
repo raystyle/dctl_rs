@@ -31,4 +31,4 @@ tags: [client, engines]
 - 宿主 psql/redis-cli 探测逻辑退役,client 面依赖只剩 Docker。
 - 既有 client 集成测试(postgres input、falkordb readiness 的透传断言)随原生道重写。
 
-> 追注(2026-10-08,REQ-0017):FK 客户端证书面经 **fred v10**(enable-rustls-ring)落地。决策 2 的 falkordb crate 基座在 redis-rs 1.7 无客户端证书注入口(TlsConnParams 全 pub(crate),S004 补记),口令面仍走 falkordb crate 不变。fred 腿 = GRAPH.QUERY --compact 自定义命令 + 本仓解码器(镜像官方 crate 的类型标记与 schema 懒刷新,产出其 FalkorValue),渲染面两口令面同构;曾议的容器内 redis-cli exec 查询过渡道不采用。
+> 追注(2026-10-08,REQ-0017):FK 客户端证书面经 **fred v10**(enable-rustls-ring)落地。决策 2 的 falkordb crate 基座在 redis-rs 1.7 无客户端证书注入口(TlsConnParams 全 pub(crate),S004 补记),口令面仍走 falkordb crate 不变。fred 腿 = GRAPH.QUERY --compact 自定义命令 + 本仓解码器(镜像官方 crate 的类型标记与 schema 懒刷新,产出其 FalkorValue),渲染面与口令面同构;曾议的容器内 redis-cli exec 查询过渡道不采用。

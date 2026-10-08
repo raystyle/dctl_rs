@@ -613,10 +613,24 @@ fn cert_face_default_start_uploads_tls_material_and_sets_tls_flags() {
     let cmd: Vec<&str> = cmd.iter().filter_map(|v| v.as_str()).collect();
     assert_eq!(cmd.first(), Some(&"redis-cli"));
     assert!(cmd.contains(&"--tls"), "TLS probe argv: {cmd:?}");
-    assert!(
-        cmd.iter().any(|arg| arg.starts_with("--cacert ")),
-        "TLS probe argv: {cmd:?}"
-    );
+    // The exec Cmd array reaches redis-cli's argv with no shell
+    // word-splitting, so each flag and its path must be separate elements
+    // (redis-cli compares whole elements only).
+    for (flag, path) in [
+        ("--cert", "/var/lib/falkordb/tls/client.crt"),
+        ("--key", "/var/lib/falkordb/tls/client.key"),
+        ("--cacert", "/var/lib/falkordb/tls/ca.crt"),
+    ] {
+        let index = cmd
+            .iter()
+            .position(|arg| *arg == flag)
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            cmd.get(index + 1).copied(),
+            Some(path),
+            "{flag} must be its own argv element followed by the path: {cmd:?}"
+        );
+    }
     assert_eq!(cmd.last(), Some(&"ping"));
     let exec_env = exec_body["Env"].as_array().expect("exec env array");
     assert!(

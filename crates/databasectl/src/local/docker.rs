@@ -1448,16 +1448,21 @@ pub async fn exec_redis_cli_in_container_with_face(
 }
 
 /// The TLS flags every in-container redis-cli invocation needs on the
-/// certificate face (material paths per FK_TLS_DIR_IN_CONTAINER).
+/// certificate face (material paths per FK_TLS_DIR_IN_CONTAINER). Flag and
+/// path are separate argv elements: the exec Cmd array reaches redis-cli's
+/// argv untouched (no shell word-splitting), and redis-cli matches each
+/// flag with a whole-element comparison.
 pub(crate) fn fk_tls_cli_flags() -> Vec<String> {
     [
-        "--tls",
-        &format!("--cert {FK_TLS_DIR_IN_CONTAINER}/client.crt"),
-        &format!("--key {FK_TLS_DIR_IN_CONTAINER}/client.key"),
-        &format!("--cacert {FK_TLS_DIR_IN_CONTAINER}/ca.crt"),
+        "--tls".to_string(),
+        "--cert".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/client.crt"),
+        "--key".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/client.key"),
+        "--cacert".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/ca.crt"),
     ]
     .into_iter()
-    .map(str::to_string)
     .collect()
 }
 
@@ -1978,6 +1983,44 @@ pub fn recover_project_falkor_blocking(
 mod tests {
     use super::*;
     use bollard::models::{CreateImageInfo, ProgressDetail};
+
+    #[test]
+    fn falkordb_tls_tar_carries_root_ownership_and_key_modes() {
+        // run.sh execs redis-server as root (S004), so every entry is uid 0;
+        // the keys stay owner-only and the certs world-readable.
+        let bytes = build_falkordb_tls_tar("CERT", "KEY", "CLIENT", "CLIENTKEY", "CA").unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut seen: Vec<(String, u64, u64, u32)> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().display().to_string();
+            let header = entry.header();
+            seen.push((
+                path,
+                header.uid().unwrap(),
+                header.gid().unwrap(),
+                header.mode().unwrap(),
+            ));
+        }
+        assert_eq!(seen.len(), 5, "exactly the five face files");
+        for (_, uid, gid, _) in &seen {
+            assert_eq!((*uid, *gid), (0, 0), "every entry is root-owned");
+        }
+        for (path, _, _, mode) in &seen {
+            let expected = if path.ends_with(".key") { 0o600 } else { 0o644 };
+            assert_eq!(*mode, expected, "{path} mode");
+        }
+        let paths: Vec<&str> = seen.iter().map(|(path, ..)| path.as_str()).collect();
+        for entry in [
+            "tls/server.crt",
+            "tls/server.key",
+            "tls/client.crt",
+            "tls/client.key",
+            "tls/ca.crt",
+        ] {
+            assert!(paths.contains(&entry), "{entry} missing");
+        }
+    }
 
     #[test]
     fn postgres_tls_tar_carries_container_ownership_and_modes() {

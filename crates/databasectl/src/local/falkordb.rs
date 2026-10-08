@@ -453,9 +453,9 @@ async fn start(
         // Issuance and upload live inside the rollback-covered block (the
         // material rides in the container layer, so removing the container
         // cleans it). The client pair is uploaded too: the in-container
-        // redis-cli legs (readiness, interactive, and the certificate-face
-        // programmatic path - redis-rs 1.7 exposes no client-cert
-        // injection, ADR-0009 追注/S004) ride it.
+        // redis-cli legs (readiness probe and the interactive REPL) ride
+        // it; the certificate-face programmatic path connects from the
+        // host with the CA material instead (fred, REQ-0017).
         let startup_result = async {
             if tls {
                 let cname = docker::fk_container_name(&user_name, &tag);
@@ -1443,8 +1443,12 @@ async fn tls_cypher_table(host: &str, port: u16, graph_name: &str, cypher: &str)
     };
     let client = Client::new(config, None, None, None);
     client.init().await.map_err(|error| {
+        // The library's text is human-only context; the parity envelope
+        // keeps the self-composed sentence (the upload path's split).
+        eprintln!("client certificate connection to {host}:{port} failed: {error}");
         Error::FalkorUsage(format!(
-            "could not connect to FalkorDB at {host}:{port} with the client certificate: {error}"
+            "could not connect to FalkorDB at {host}:{port} with the client certificate; \
+             check that the instance is running and the dctl CA material is intact"
         ))
     })?;
     let outcome = compact_cypher_table(
@@ -1460,8 +1464,9 @@ async fn tls_cypher_table(host: &str, port: u16, graph_name: &str, cypher: &str)
 }
 
 /// The transport the compact-protocol decoder talks to: GRAPH.QUERY for
-/// rows, GRAPH.RO_QUERY for the db.* schema listings. Split out so the
-/// decoder is drivable from tests with canned replies.
+/// rows and for the db.* schema listings (the official client's refresh
+/// uses the same command). Split out so the decoder is drivable from tests
+/// with canned replies.
 trait ProcedureCaller {
     async fn query(
         &mut self,
@@ -1510,7 +1515,7 @@ impl ProcedureCaller for FredProcedureCaller<'_> {
             .0
             .custom::<fred::types::Value, _>(
                 fred::types::CustomCommand::new(
-                    "GRAPH.RO_QUERY",
+                    "GRAPH.QUERY",
                     fred::types::ClusterHash::FirstKey,
                     false,
                 ),
@@ -1569,7 +1574,13 @@ async fn compact_cypher_table<C: ProcedureCaller>(
     cypher: &str,
 ) -> Result<String> {
     let reply = caller.query(graph_name, cypher).await.map_err(|message| {
-        Error::FalkorUsage(format!("GRAPH.QUERY on {host}:{port} failed: {message}"))
+        // Transport/server text is human-only; the parity envelope keeps
+        // the self-composed sentence.
+        eprintln!("GRAPH.QUERY on {host}:{port} failed: {message}");
+        Error::FalkorUsage(format!(
+            "the Cypher query failed on FalkorDB at {host}:{port}; the server's message \
+             is on stderr"
+        ))
     })?;
     let mut schema = GraphSchemaMaps::default();
     let (columns, rows) = decode_query_reply(reply, caller, graph_name, &mut schema).await?;
@@ -1585,11 +1596,14 @@ enum SchemaKind {
 }
 
 impl SchemaKind {
+    /// The procedure names the official client's refresh sends, verbatim
+    /// (upper-case, over GRAPH.QUERY): keeping the identical wire shape
+    /// removes any server-side parsing difference from the equation.
     fn procedure(self) -> &'static str {
         match self {
-            SchemaKind::Labels => "db.labels",
-            SchemaKind::Relationships => "db.relationshipTypes",
-            SchemaKind::Properties => "db.propertyKeys",
+            SchemaKind::Labels => "DB.LABELS",
+            SchemaKind::Relationships => "DB.RELATIONSHIPTYPES",
+            SchemaKind::Properties => "DB.PROPERTYKEYS",
         }
     }
 }
@@ -1640,7 +1654,16 @@ impl GraphSchemaMaps {
         let names = caller
             .list_schema(graph, kind.procedure())
             .await
-            .map_err(|message| Error::FalkorUsage(format!("schema refresh failed: {message}")))?;
+            .map_err(|message| {
+                // Human-only context; the parity envelope stays self-composed.
+                let procedure = kind.procedure();
+                eprintln!("schema listing {procedure} failed: {message}");
+                Error::FalkorUsage(
+                    "could not refresh the graph schema over FalkorDB; the server's message \
+                     is on stderr"
+                        .to_string(),
+                )
+            })?;
         *self.map(kind) = names
             .into_iter()
             .enumerate()
@@ -1965,10 +1988,11 @@ async fn decode_typed<C: ProcedureCaller>(
                 })?);
             }
             // The Vec32 type is not exported by the crate, so the password
-            // face's renderer only ever shows its Debug form; mirror that
-            // text exactly to keep both faces printing identically.
+            // face's renderer only ever shows the enum's Debug form; mirror
+            // that text exactly (outer variant name included) to keep both
+            // faces printing identically.
             Ok(FalkorValue::String(format!(
-                "Vec32 {{ values: {values:?} }}"
+                "Vec32(Vec32 {{ values: {values:?} }})"
             )))
         }
         kind @ (CellKind::DateTime | CellKind::Date | CellKind::Time | CellKind::Duration) => {
@@ -2457,10 +2481,10 @@ mod tests {
 
     fn canned_schema() -> std::collections::HashMap<&'static str, Vec<String>> {
         std::collections::HashMap::from([
-            ("db.labels", vec!["Person".to_string()]),
-            ("db.relationshipTypes", vec!["KNOWS".to_string()]),
+            ("DB.LABELS", vec!["Person".to_string()]),
+            ("DB.RELATIONSHIPTYPES", vec!["KNOWS".to_string()]),
             (
-                "db.propertyKeys",
+                "DB.PROPERTYKEYS",
                 vec!["name".to_string(), "age".to_string(), "note".to_string()],
             ),
         ])
@@ -2615,6 +2639,52 @@ mod tests {
             error.to_string().contains("unknown type marker 99"),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn vec32_cells_mirror_the_password_faces_debug_rendering() {
+        // The crate does not export the Vec32 type, so the certificate face
+        // carries a String that must print exactly what the password face's
+        // Debug fallback prints for a real FalkorValue::Vec32.
+        let reply = v_arr(vec![
+            v_arr(vec![v_arr(vec![v_str("v")])]),
+            v_arr(vec![v_arr(vec![v_arr(vec![
+                v_int(12),
+                v_arr(vec![v_str("1.5"), v_str("2.5")]),
+            ])])]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ]);
+        let mut caller = CannedProcedureCaller {
+            reply: reply.clone(),
+            schema: canned_schema(),
+        };
+        let (columns, rows) =
+            decode_query_reply(reply, &mut caller, "g", &mut GraphSchemaMaps::default())
+                .await
+                .expect("the vector reply decodes");
+        assert_eq!(columns, ["v"].map(String::from).to_vec());
+        let expected = format!(
+            "{:?}",
+            Vec32Mirror::Vec32(Vec32 {
+                values: vec![1.5_f32, 2.5]
+            })
+        );
+        assert_eq!(rows[0][0].as_deref(), Some(expected.as_str()));
+    }
+
+    /// Stand-ins with the same Debug shape as the crate's unexported
+    /// `FalkorValue::Vec32(Vec32 { values })`, so the mirrored text can be
+    /// asserted without naming the real type.
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    enum Vec32Mirror {
+        Vec32(Vec32),
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Vec32 {
+        values: Vec<f32>,
     }
 
     /// Opt-in live round trip for the certificate-face client leg, for
