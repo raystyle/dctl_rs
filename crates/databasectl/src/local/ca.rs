@@ -190,9 +190,20 @@ mod tests {
     fn server_cert_issuance_returns_a_pem_pair() {
         // SAN verification (loopback faces) is exercised on the lan-linux2
         // real-Docker pass; here we pin the issuance shape without writing
-        // armored marker literals into the source.
+        // armored marker literals into the source. The CA writes under HOME,
+        // so the test runs against a scratch home instead of the developer's
+        // real ~/.dctl (the one issuance test is the only HOME-touching unit
+        // test, so the env swap cannot race a sibling).
+        let scratch = tempfile::tempdir().expect("scratch home");
+        // Single-threaded by construction (the only HOME-touching unit
+        // test), so the env swap cannot race a sibling.
+        unsafe { std::env::set_var("HOME", scratch.path()) };
         let (cert, key) = issue_server_cert("dctl-pg-default-18").unwrap();
         assert!(cert.contains("CERTIFICATE"));
         assert!(key.contains("PRIVATE KEY"));
+        assert!(
+            scratch.path().join(".dctl/ca/ca.crt").is_file(),
+            "issuance used the scratch home"
+        );
     }
 }

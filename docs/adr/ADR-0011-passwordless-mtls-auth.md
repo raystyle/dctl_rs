@@ -35,3 +35,5 @@ tags: [auth, tls, certificates]
 > 追注(2026-10-08,晚):PG 服务端腿落地(REQ-0016):证书面为 fresh start 默认,服务器证书 tar 注入容器层(uid 999/0600),`-c ssl=on/hba_file` 启动,hba 三行制(local trust、hostssl cert、明文 reject);`--auth password` 显式回落;lan-linux2 实弹 11/11。FK/CH 腿仍未做。
 
 > 追注(2026-10-08,FK 腿):FK 服务端+客户端证书面落地(REQ-0017):TLS-only 监听(--port 0 --tls-port 6379,tls-auth-clients-user CN,S004 旗标名),证书 tar 注入容器层 uid 0;客户端从宿主经 fred 直连 mTLS(见 ADR-0009 追注),`--auth password` 回落保留。CH 腿仍未做。
+
+> 追注(2026-10-08,CH 腿):CH 服务端+客户端证书面落地(REQ-0017):https_port 承接发布 HTTP 口、tcp_port_secure 9440 发布到 native 口、明文口挪冷端口不删(entrypoint init 依赖),证书+config.d+users.d 单 tar 注入 uid 101(users.d zz- 排序在 entrypoint 锁网文件后,replace 整节换认证法);客户端 HTTP 走 reqwest(tls_certs_only + Identity + X-ClickHouse-SSL-Certificate-Auth 头),交互走容器内 clickhouse-client --secure --config;证书面用户恒 default(镜像唯一用户,CN 映射),named user 走 --auth password;readiness 走容器内 https 探针(不依赖发布口)。三引擎证书面 start 输出统一零口令行。ADR-0011 三引擎收官。

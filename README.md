@@ -5,8 +5,8 @@
 一条命令在项目目录里跑起数据库,无需手写配置:
 
 ```console
-$ dctl server start          # 需要时拉取 clickhouse-server 镜像,打印生成的密码
-$ dctl client -q 'SELECT 1'  # dctl 内置 HTTP 客户端直查
+$ dctl server start          # 需要时拉取镜像;默认证书 mTLS(ADR-0011),连接零口令
+$ dctl client -q 'SELECT 1'  # dctl 内置 HTTP 客户端直查(证书面走 https mTLS)
 $ dctl server stop
 ```
 
@@ -87,7 +87,7 @@ $ dctl registry catalog            # 列私仓 repos;读面匿名开放,有本�
 
 ```console
 $ dctl init                       # 脚手架 clickhouse/、postgres/、falkordb/ 目录
-$ dctl server start               # default 实例,clickhouse:26.8,双口被占自动选空闲口
+$ dctl server start               # default 实例,clickhouse:26.8;证书面默认,--auth password 回落
 $ dctl server start dev --http-port 8333 --native-port 9333
 $ dctl server start nsm --bind 192.168.88.175  # 双口追加发布到该面(loopback 保留;0.0.0.0 全接口)
 $ dctl server start --version 26.8.9   # 指定镜像 tag;latest 亦可
@@ -98,8 +98,10 @@ $ dctl client [-q 'SELECT 1']     # 内置 HTTP 客户端;-q/--queries-file 走 
 $ dctl client                     # 交互式,docker exec 进容器内 clickhouse-client
 $ dctl client --host H --port P -q 'SELECT 1'   # 直连任意 ClickHouse(要认证时加 --user/--password)
 $ dctl client --queries-file seed/init.sql      # 一次一条语句(HTTP 接口限制;多语句文件请拆分或走交互)
-$ dctl server dotenv              # 写 CLICKHOUSE_* 连接变量
+$ dctl server dotenv              # 写 CLICKHOUSE_* 连接变量(证书面写 TLS 键,口令面写密码)
 ```
+
+ClickHouse 实例默认以证书面起(ADR-0011):HTTP 发布口改供 https、native 发布口接安全口 9440,`client -q` 经 dctl 内置 reqwest 客户端带证书直查(认证头 `X-ClickHouse-SSL-Certificate-Auth`),`--auth password` 显式回落口令面(此时才用 CLICKHOUSE_ 密码 env)。证书面的 `dotenv` 写 `CLICKHOUSE_TLS=true` 与三个证书路径,不再写口令;旧实例 resume 保持其原有认证面。
 
 start 时可用 `--config <name>` 把 `~/.dctl/configs/<name>` 部分配置以只读卷挂载进容器 `config.d/`。随机密码由 start 打印一次,`client`/`dotenv` 从容器环境重读。孤儿容器(元数据被移动)通过 Docker label 被重新发现。
 

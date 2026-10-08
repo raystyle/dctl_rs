@@ -207,13 +207,14 @@ CONTEXT FOR AGENTS:
     /// Connect to a running ClickHouse server
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Default mode looks up a Docker-managed server; queries run via the HTTP interface
-  (no clickhouse-client binary needed). Interactive mode uses docker exec.
+  Default mode looks up a Docker-managed server; queries run via the HTTP interface:
+  certificate instances (the start default) ride https with the ~/.dctl/ca/ material and
+  the certificate auth header (REQ-0017), --auth password instances use stored
+  credentials; interactive mode is docker exec (secure port + in-container config).
   Direct mode (--host/--port) connects via HTTP to any ClickHouse server; pass
   --user/--password when that server requires auth (dctl-managed instances do).
-  The HTTP interface executes ONE statement per --query/--queries-file; split
-  multi-statement files or use interactive mode for them.
-  `--query` output stays native even with --json or a coding agent.")]
+  The HTTP interface executes ONE statement per --query/--queries-file; use interactive
+  mode for multi-statement files. `--query` output stays native even with --json.")]
     Client {
         /// Server name to connect to (default: "default")
         #[arg(value_name = "NAME", conflicts_with_all = ["name_flag", "host", "port"])]
@@ -282,7 +283,8 @@ CONTEXT FOR AGENTS:
         after_help = "\
 CONTEXT FOR AGENTS:
   `list` and `stop-all` cover ClickHouse and Docker-backed Postgres/FalkorDB; other subcommands
-  are ClickHouse-only.
+  are ClickHouse-only. Fresh starts default to the certificate face (ADR-0011); `--auth
+  password` is the fallback. Existing instances resume with their stored face.
   Data persists across stop/start; only `remove` deletes it.
   Retain the name `start` returns (it may be generated) for later `stop`/`remove`.
   Custom configs inherit built-in defaults; find available names with `server configs`.
@@ -599,9 +601,11 @@ pub enum ServerCommands {
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Docker-managed: same container lifecycle as Postgres and FalkorDB.
-  Ports: 8123 (HTTP) and 9000 (native); auto-picked when busy, never the same.
-  The generated password is printed once by start; query later with `local client -q`.
-  An existing stopped instance is resumed; --user/--password/--database/--config/--env,
+  Ports: 8123 (HTTP) and 9000 (native); auto-picked when busy, never the same. On the
+  certificate face (the default, ADR-0011) the HTTP port serves https, the native port is
+  the secure 9440, and auth is the default user (named users need --auth password).
+  The generated password is printed once by start on --auth password instances.
+  An existing stopped instance is resumed; --user/--password/--database/--config/--env/--auth,
   the port flags, and --bind are ignored on a resume (the container keeps its settings).
   A failed fresh start rolls back container and data; pre-existing data is kept.")]
     Start {
@@ -675,6 +679,11 @@ CONTEXT FOR AGENTS:
         /// Seconds to wait for readiness (maximum: 600)
         #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u16).range(1..=600))]
         wait_timeout: u16,
+
+        /// Authentication face: certificate mTLS (default, ADR-0011) or
+        /// password. Ignored on resume; existing instances keep their face.
+        #[arg(long, value_enum, default_value_t = AuthFaceArg::Cert)]
+        auth: AuthFaceArg,
     },
 
     /// List custom config files available to `server start --config`
@@ -749,10 +758,11 @@ CONTEXT FOR AGENTS:
     /// Write ClickHouse connection env vars to a .env file
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Requires a running server; reads ports and credentials from the container env.
-  Writes CLICKHOUSE_HOST, CLICKHOUSE_HTTP_PORT, CLICKHOUSE_PORT, CLICKHOUSE_USER,
-  CLICKHOUSE_PASSWORD, CLICKHOUSE_DATABASE.
-  Contains the password in plaintext — prefer --local.")]
+  The face decides the shape (ADR-0011): certificate instances get CLICKHOUSE_HOST/PORT/USER/
+  DATABASE plus CLICKHOUSE_TLS=true and the CA_CERT/CLIENT_CERT/CLIENT_KEY material paths,
+  with no password; --auth password instances get CLICKHOUSE_PASSWORD instead.
+  Requires a running server; reads ports from the metadata.
+  Password-bearing output belongs in --local, out of version control.")]
     Dotenv {
         /// Server name (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -1321,6 +1331,7 @@ mod tests {
                     config_file,
                     env,
                     wait_timeout,
+                    ..
                 },
         } = local_command(&[
             "server",
@@ -1379,6 +1390,7 @@ mod tests {
                     config_file,
                     env,
                     wait_timeout,
+                    auth,
                     ..
                 },
         } = local_command(&["server", "start"])
@@ -1395,6 +1407,7 @@ mod tests {
         assert_eq!(config_file, None);
         assert!(env.is_empty());
         assert_eq!(wait_timeout, 60);
+        assert_eq!(auth, AuthFaceArg::Cert, "certificate face is the default");
     }
 
     #[test]

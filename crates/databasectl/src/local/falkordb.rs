@@ -418,8 +418,15 @@ async fn start(
         server::ensure_fk_data_dir(&user_name, &tag)?;
         let data_dir = server::fk_data_dir(&user_name, &tag)?;
 
-        let password = password.unwrap_or_else(generate_password);
         let tls = auth == crate::local::cli::AuthFaceArg::Cert;
+        // The certificate face provisions no password; the start output
+        // prints none rather than a decorative one (contract across the
+        // three engines).
+        let password = if tls {
+            String::new()
+        } else {
+            password.unwrap_or_else(generate_password)
+        };
 
         let opts = FalkorRunOpts {
             user_name: &user_name,

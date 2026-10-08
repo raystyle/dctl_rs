@@ -385,16 +385,22 @@ async fn start(
         let user = user.unwrap_or_else(|| DEFAULT_USER.to_string());
         let database = database.unwrap_or_else(|| DEFAULT_DATABASE.to_string());
 
-        let password = password_from_env
-            .or(password)
-            .unwrap_or_else(generate_password);
+        let tls = auth == crate::local::cli::AuthFaceArg::Cert;
+        // The certificate face provisions no usable TCP password; the start
+        // output prints none rather than a decorative one (contract across
+        // the three engines).
+        let password = if tls {
+            String::new()
+        } else {
+            password_from_env
+                .or(password)
+                .unwrap_or_else(generate_password)
+        };
 
         // The certificate face (ADR-0011): create with the TLS server flags,
         // then upload the material before the first start so postgres never
         // boots against missing files. The upload rides in the container
         // layer, so the rollback that removes the container cleans it too.
-        let tls = auth == crate::local::cli::AuthFaceArg::Cert;
-
         let opts = PostgresRunOpts {
             user_name: &user_name,
             major: &major,

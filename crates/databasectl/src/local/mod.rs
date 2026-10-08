@@ -297,6 +297,7 @@ async fn run_server_commands(command: ServerCommands, json: bool) -> Result<()> 
             config_file,
             env,
             wait_timeout,
+            auth,
         } => {
             clickhouse::start(clickhouse::StartCmd {
                 name: name.or(name_flag),
@@ -310,6 +311,7 @@ async fn run_server_commands(command: ServerCommands, json: bool) -> Result<()> 
                 config: config_file,
                 extra_env: env,
                 wait_timeout: std::time::Duration::from_secs(wait_timeout.into()),
+                auth,
                 json,
             })
             .await

@@ -27,13 +27,20 @@ ADR-0011(accepted)裁定三引擎免密 mTLS;PG 腿已闭环(REQ-0016:证书面�
 - [x] dotenv/tls/信封文案三面与 pg 腿同构
 - [x] lan-linux2 实弹:电池 scripts/test-falkordb-integration.sh 十用例 10/10(服务器面容器内直轰);fred 腿 opt-in live 测试 1/1(宿主 127.0.0.1 经 python 转发器抵容器桥 IP,SAN 校验真实发生;该 daemon 发布口宿主 loopback 不可达,直连发布口待可达环境复验)
 
-### CH 实施
+### CH 实测闸门(先行,结论决定腿形)
 
-- [ ] server start 证书面:config.d 注入(openSSL/server 段,证书 tar 进容器 /etc/clickhouse-server/)+ HTTP 口 TLS 化或双口过渡(依 clickhouse 面实测)
-- [ ] http_query 带客户端身份(reqwest identity + 根证书,ADR-0011 决策 5 的既有考证)
-- [ ] dotenv 证书形;`--auth password` 回落;实弹
+- [x] lan-linux2 实测 clickhouse 26.8:config.d 注入 openSSL/server strict + https_port/tcp_port_secure 起活(S005)
+- [x] 实测零口令查询:https + 客户户端证书 CN 映射 + `X-ClickHouse-SSL-Certificate-Auth: on` 头(S005)
+- [x] 实测结论立档(docs/research/S005-ch-mtls-probe.md + 源码级检索件 s005-ch-config-research-grok.md);**腿形裁定:https_port 承接发布口 + users.d 证书用户 + HTTP 认证头**
+
+### CH 实施(腿形依实测定)
+
+- [x] server start 证书面:证书 + config.d + users.d tar 注入(uid 101),https_port 承接发布 HTTP 口,tcp_port_secure 9440 发布到 native 口,明文口挪冷端口(S005)
+- [x] http_query 带客户端身份(reqwest tls_certs_only + Identity + 认证头;交互 REPL 走容器内 clickhouse-client --secure --config)
+- [x] dotenv 证书形;`--auth password` 回落;named user 在证书面报用法错(镜像仅 default 用户)
+- [ ] 实弹(电池 scripts/test-clickhouse-integration.sh + 宿主 https 腿;该机发布口不可达时经 python 转发器)
 
 ### 共通
 
-- [ ] README/CONTEXT 帮助面三引擎口径一致(FK 面已改,CH 面随 CH 腿)
-- [x] 测试:假 Docker 断言 + 真机实弹 + 电池用例(FK 三面全齐:夹具双面用例、电池 10/10、fred live 1/1)
+- [x] README/CONTEXT 帮助面三引擎口径一致(三引擎证书面口径齐;契约账并收:三引擎证书面 start 输出不再打印无效 Password 行)
+- [ ] 测试:假 Docker 断言 + 真机实弹 + 电池用例(FK 三面全齐;CH 夹具双面 + upload-500 回归 + 电池已建,实弹待)
