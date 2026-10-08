@@ -22,10 +22,10 @@ ADR-0011(accepted)裁定三引擎免密 mTLS;PG 腿已闭环(REQ-0016:证书面�
 
 ### FK 实施(腿形依实测定)
 
-- [ ] falkordb start 证书面:服务器证书 tar 注入(沿 REQ-0016 机制,uid 按 falkordb 镜像实测)+ TLS 旗标/配置 + 客户端证书道
-- [ ] `--auth password` 回落语义与 pg 对齐;ServerInfo.tls 复用
-- [ ] dotenv/tls/信封文案三面与 pg 腿同构
-- [ ] lan-linux2 实弹(含 redis-cli 经 TLS 的实测通路)
+- [x] falkordb start 证书面:服务器证书 tar 注入(沿 REQ-0016 机制,uid 0 按 falkordb 镜像实测)+ TLS 旗标/配置 + 客户端证书道(fred v10,redis-rs 无注入口,S004 补记)
+- [x] `--auth password` 回落语义与 pg 对齐;ServerInfo.tls 复用
+- [x] dotenv/tls/信封文案三面与 pg 腿同构
+- [ ] lan-linux2 实弹(服务器面容器内直轰 + fred 腿容器 IP 直连绕发布口限制;电池 scripts/test-falkordb-integration.sh)
 
 ### CH 实施
 
@@ -35,5 +35,5 @@ ADR-0011(accepted)裁定三引擎免密 mTLS;PG 腿已闭环(REQ-0016:证书面�
 
 ### 共通
 
-- [ ] README/CONTEXT 帮助面三引擎口径一致
-- [ ] 测试:假 Docker 断言 + 真机实弹 + 电池用例
+- [ ] README/CONTEXT 帮助面三引擎口径一致(FK 面已改,CH 面随 CH 腿)
+- [ ] 测试:假 Docker 断言 + 真机实弹 + 电池用例(FK 假 Docker 断言与电池已建,实弹待)

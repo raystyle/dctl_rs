@@ -33,3 +33,5 @@ tags: [auth, tls, certificates]
 > 追注(2026-10-08,健康评审):落地进度修正。现行码只含客户端基建(`~/.dctl/ca/` 本地 CA、客户端证书签发、PG client 的 Prefer 先试再带内降级);决策 3 的服务端面(容器 ssl=on、pg_hba cert 法)与决策 4 的 `--auth` 旋钮、dotenv 证书道均未接入,用户可见行为仍为口令道。REQ-009 状态已同步修正为 draft;服务端腿另立 REQ 时从其判据清单迁出。
 
 > 追注(2026-10-08,晚):PG 服务端腿落地(REQ-0016):证书面为 fresh start 默认,服务器证书 tar 注入容器层(uid 999/0600),`-c ssl=on/hba_file` 启动,hba 三行制(local trust、hostssl cert、明文 reject);`--auth password` 显式回落;lan-linux2 实弹 11/11。FK/CH 腿仍未做。
+
+> 追注(2026-10-08,FK 腿):FK 服务端+客户端证书面落地(REQ-0017):TLS-only 监听(--port 0 --tls-port 6379,tls-auth-clients-user CN,S004 旗标名),证书 tar 注入容器层 uid 0;客户端从宿主经 fred 直连 mTLS(见 ADR-0009 追注),`--auth password` 回落保留。CH 腿仍未做。

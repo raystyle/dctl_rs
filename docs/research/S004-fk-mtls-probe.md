@@ -30,4 +30,4 @@
 
 - FK 腿形 = 全免密 mTLS(tls-auth-clients-user CN + dctl CA 客户端证书,CN=DB 用户名)
 - `--auth password` 回落 = 现状 REDIS_ARGS requirepass 道
-- 客户端:redis-cli 实测通路如上;falkordb crate 的 TLS 客户端身份支持面待实施时核(rustls Connector 注入是否开放,不开放则经 redis-rs 低层或回落容器内 redis-cli exec 查询道(ADR-0009 交互道的既有形态))
+- 客户端:redis-cli 实测通路如上;falkordb crate 基座的 redis-rs 1.7 无客户端证书注入口(TlsConnParams 字段全 pub(crate),核于 vendored 源码),**客户端证书道裁定走 fred v10**(TlsConnector 直收 rustls ClientConfig,feature enable-rustls-ring;2026-10-08,REQ-0017 实施批)。fred 腿以 GRAPH.QUERY --compact 自定义命令 + 本仓解码器(镜像官方 crate 的 ParserTypeMarker 与 GraphSchema 懒刷新)产出 FalkorValue,渲染面与口令面同构;曾议的容器内 redis-cli exec 查询过渡道不采用。

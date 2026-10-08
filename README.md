@@ -1,6 +1,6 @@
 # dctl
 
-**dctl**(DataBase Control)是本地数据库服务器管理 CLI:ClickHouse、Postgres、FalkorDB 图数据库三引擎统一走 Docker 容器生命周期,宿主无需装数据库客户端(ClickHouse 走 dctl 内置 HTTP 客户端,Postgres 走内置 tokio-postgres,FalkorDB 走内置官方 falkordb 客户端;交互式 REPL 用容器内 psql/redis-cli)。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 与二进制下载部分,保留本地引擎生命周期作为核心。
+**dctl**(DataBase Control)是本地数据库服务器管理 CLI:ClickHouse、Postgres、FalkorDB 图数据库三引擎统一走 Docker 容器生命周期,宿主无需装数据库客户端(ClickHouse 走 dctl 内置 HTTP 客户端,Postgres 走内置 tokio-postgres,FalkorDB 口令面走内置官方 falkordb 客户端、证书面走内置 fred mTLS 客户端;交互式 REPL 用容器内 psql/redis-cli)。它是 [ClickHouse 官方 clickhousectl](https://github.com/ClickHouse/clickhousectl) 的 fork(Apache-2.0),剪除了 Cloud 与二进制下载部分,保留本地引擎生命周期作为核心。
 
 一条命令在项目目录里跑起数据库,无需手写配置:
 
