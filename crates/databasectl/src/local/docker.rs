@@ -590,6 +590,85 @@ fn build_postgres_tls_tar(
         .map_err(|e| Error::DockerError(format!("could not finish TLS material tar: {e}")))
 }
 
+/// Build the in-memory tar carrying the FalkorDB certificate face: the
+/// server pair, the client pair (for the in-container redis-cli legs),
+/// and the CA. run.sh execs redis-server as root, so uid 0 with owner-only
+/// key modes is readable by design (S004).
+fn build_falkordb_tls_tar(
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
+) -> Result<Vec<u8>> {
+    let mut builder = tar::Builder::new(Vec::new());
+    let entries: [(&str, &str, u32); 5] = [
+        ("tls/server.crt", server_cert_pem, 0o644),
+        ("tls/server.key", server_key_pem, 0o600),
+        ("tls/client.crt", client_cert_pem, 0o644),
+        ("tls/client.key", client_key_pem, 0o600),
+        ("tls/ca.crt", ca_cert_pem, 0o644),
+    ];
+    for (path, contents, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(mode);
+        header.set_uid(0);
+        header.set_gid(0);
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, contents.as_bytes())
+            .map_err(|e| Error::DockerError(format!("could not build TLS material tar: {e}")))?;
+    }
+    builder
+        .into_inner()
+        .map_err(|e| Error::DockerError(format!("could not finish TLS material tar: {e}")))
+}
+
+/// Upload the FalkorDB certificate face into a (created, not started)
+/// container; rollback that removes the container cleans it with the layer.
+pub async fn upload_falkordb_tls_material(
+    docker: &Docker,
+    container_id: &str,
+    server_cert_pem: &str,
+    server_key_pem: &str,
+    client_cert_pem: &str,
+    client_key_pem: &str,
+    ca_cert_pem: &str,
+) -> Result<()> {
+    use bollard::query_parameters::UploadToContainerOptionsBuilder;
+    let tar_bytes = build_falkordb_tls_tar(
+        server_cert_pem,
+        server_key_pem,
+        client_cert_pem,
+        client_key_pem,
+        ca_cert_pem,
+    )?;
+    let opts = UploadToContainerOptionsBuilder::default()
+        .path("/var/lib/falkordb")
+        .build();
+    match docker
+        .upload_to_container(
+            container_id,
+            Some(opts),
+            bollard::body_full(bytes::Bytes::from(tar_bytes)),
+        )
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            // Human-visible diagnostic; the machine envelope carries only
+            // the self-composed sentence (daemon text stays out of parity).
+            eprintln!("TLS material upload failed: {error}");
+            Err(Error::FalkorUsage(format!(
+                "could not upload the TLS material into container '{container_id}'; the \
+                 failed attempt was rolled back and nothing was started"
+            )))
+        }
+    }
+}
+
 /// Upload the certificate face into a (created, not started) container.
 /// Docker honors the tar entries' uid/gid and mode on extraction, so the
 /// key lands postgres-owned and owner-only without any host-side chown.
@@ -683,7 +762,15 @@ pub struct FalkorRunOpts<'a> {
     pub project_cwd: &'a str,
     pub password: &'a str,
     pub extra_env: Vec<String>,
+    /// Certificate face (ADR-0011): TLS-only listener with CN-mapped client
+    /// certificates instead of requirepass. The material rides in via
+    /// [`upload_falkordb_tls_material`] after create.
+    pub tls: bool,
 }
+
+/// Where the TLS material lives inside the falkordb container; matches the
+/// image's own FALKORDB_TLS_PATH convention.
+pub(crate) const FK_TLS_DIR_IN_CONTAINER: &str = "/var/lib/falkordb/tls";
 
 /// Create a FalkorDB container without starting it; return its ID. Same
 /// create-then-start split as `create_postgres`, for identical rollback
@@ -718,9 +805,20 @@ pub async fn create_falkordb(docker: &Docker, opts: FalkorRunOpts<'_>) -> Result
         ..Default::default()
     };
 
-    // Authentication is Redis-layer: REDIS_ARGS reaches the server's argv.
+    // Authentication is Redis-layer: REDIS_ARGS reaches the server's argv
+    // (the image's run.sh composes it into redis-server's command line).
+    // The certificate face replaces requirepass with the TLS listener; the
+    // flag names are the Redis 8.6 spellings (S004: tls-ca-cert-file, and
+    // tls-auth-clients-user takes CN, not a username).
     // FALKORDB_ARGS (module tuning) may arrive through extra_env.
-    let mut env: Vec<String> = vec![format!("REDIS_ARGS=--requirepass {}", opts.password)];
+    let redis_args = if opts.tls {
+        format!(
+            "--port 0 --tls-port 6379 --tls-cert-file {FK_TLS_DIR_IN_CONTAINER}/server.crt --tls-key-file {FK_TLS_DIR_IN_CONTAINER}/server.key --tls-ca-cert-file {FK_TLS_DIR_IN_CONTAINER}/ca.crt --tls-auth-clients-user CN"
+        )
+    } else {
+        format!("--requirepass {}", opts.password)
+    };
+    let mut env: Vec<String> = vec![format!("REDIS_ARGS={redis_args}")];
     env.extend(opts.extra_env);
 
     let mut labels: HashMap<String, String> = HashMap::new();
@@ -871,12 +969,26 @@ pub async fn create_clickhouse(docker: &Docker, opts: ClickhouseRunOpts<'_>) -> 
         .map_err(|e| Error::DockerError(e.to_string()))?;
     Ok(created.id)
 }
-/// `redis-cli ping` succeeds (exit 0, PONG) only once the server answers with
-/// the password we provisioned. Connection failures exit non-zero.
-pub async fn falkor_is_ready(docker: &Docker, id: &str, password: &str) -> Result<bool> {
+/// Readiness probe: `redis-cli ping` succeeds (exit 0, PONG) only once the
+/// server answers — over TLS with the in-container client pair on the
+/// certificate face (S004), with REDISCLI_AUTH on the password face.
+pub async fn falkor_is_ready_with_face(
+    docker: &Docker,
+    id: &str,
+    password: &str,
+    tls: bool,
+) -> Result<bool> {
     use bollard::exec::{StartExecOptions, StartExecResults};
     use bollard::models::ExecConfig;
 
+    let mut cmd = vec!["redis-cli".to_string(), "--no-auth-warning".to_string()];
+    let env = if tls {
+        cmd.extend(fk_tls_cli_flags());
+        Vec::new()
+    } else {
+        env_lines(redis_auth_env(password))
+    };
+    cmd.push("ping".to_string());
     let exec = docker
         .create_exec(
             id,
@@ -885,12 +997,8 @@ pub async fn falkor_is_ready(docker: &Docker, id: &str, password: &str) -> Resul
                 attach_stderr: Some(false),
                 attach_stdin: Some(false),
                 tty: Some(false),
-                cmd: Some(vec![
-                    "redis-cli".to_string(),
-                    "--no-auth-warning".to_string(),
-                    "ping".to_string(),
-                ]),
-                env: Some(env_lines(redis_auth_env(password))),
+                cmd: Some(cmd),
+                env: Some(env),
                 ..Default::default()
             },
         )
@@ -1316,15 +1424,46 @@ pub async fn exec_clickhouse_client_in_container(
     exec_command_tty(docker, container_id, cmd, Vec::new()).await
 }
 
-pub async fn exec_redis_cli_in_container(
+/// Interactive redis-cli exec with a full TTY (same exec stream as the psql
+/// shells): the certificate face rides TLS with the in-container client pair
+/// and needs no auth env; the password face carries REDISCLI_AUTH.
+pub async fn exec_redis_cli_in_container_with_face(
     docker: &Docker,
     container_id: &str,
     cli_args: &[String],
     password: &str,
+    tls: bool,
 ) -> Result<()> {
     let mut cmd = vec!["redis-cli".to_string()];
+    if tls {
+        cmd.extend(fk_tls_cli_flags());
+    }
     cmd.extend(cli_args.iter().cloned());
-    exec_command_tty(docker, container_id, cmd, redis_auth_env(password)).await
+    let env = if tls {
+        Vec::new()
+    } else {
+        redis_auth_env(password)
+    };
+    exec_command_tty(docker, container_id, cmd, env).await
+}
+
+/// The TLS flags every in-container redis-cli invocation needs on the
+/// certificate face (material paths per FK_TLS_DIR_IN_CONTAINER). Flag and
+/// path are separate argv elements: the exec Cmd array reaches redis-cli's
+/// argv untouched (no shell word-splitting), and redis-cli matches each
+/// flag with a whole-element comparison.
+pub(crate) fn fk_tls_cli_flags() -> Vec<String> {
+    [
+        "--tls".to_string(),
+        "--cert".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/client.crt"),
+        "--key".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/client.key"),
+        "--cacert".to_string(),
+        format!("{FK_TLS_DIR_IN_CONTAINER}/ca.crt"),
+    ]
+    .into_iter()
+    .collect()
 }
 
 fn redis_auth_env(password: &str) -> Vec<(String, String)> {
@@ -1802,6 +1941,20 @@ pub fn recover_project_falkor_blocking(
                 continue;
             }
             ensure_fk_data_dir(&c.user_name, &c.major)?;
+            // The authentication face lives in the container's REDIS_ARGS
+            // (the certificate face carries --tls-port); an orphan must
+            // resume in kind. An un-inspectable container is left for the
+            // next recovery pass instead of being misclassified.
+            let tls = match docker.inspect_container(&c.container_id, None).await {
+                Ok(inspect) => inspect.config.and_then(|cfg| {
+                    cfg.env.map(|env| {
+                        env.iter().any(|line| {
+                            line.starts_with("REDIS_ARGS=") && line.contains("--tls-port")
+                        })
+                    })
+                }),
+                Err(_) => continue,
+            };
             let info = ServerInfo {
                 name: key,
                 pid: 0,
@@ -1818,7 +1971,7 @@ pub fn recover_project_falkor_blocking(
                 cwd: cwd_owned.clone(),
                 engine: Engine::Falkordb,
                 container_id: Some(c.container_id.clone()),
-                tls: None,
+                tls,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -1830,6 +1983,44 @@ pub fn recover_project_falkor_blocking(
 mod tests {
     use super::*;
     use bollard::models::{CreateImageInfo, ProgressDetail};
+
+    #[test]
+    fn falkordb_tls_tar_carries_root_ownership_and_key_modes() {
+        // run.sh execs redis-server as root (S004), so every entry is uid 0;
+        // the keys stay owner-only and the certs world-readable.
+        let bytes = build_falkordb_tls_tar("CERT", "KEY", "CLIENT", "CLIENTKEY", "CA").unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let mut seen: Vec<(String, u64, u64, u32)> = Vec::new();
+        for entry in archive.entries().unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path().unwrap().display().to_string();
+            let header = entry.header();
+            seen.push((
+                path,
+                header.uid().unwrap(),
+                header.gid().unwrap(),
+                header.mode().unwrap(),
+            ));
+        }
+        assert_eq!(seen.len(), 5, "exactly the five face files");
+        for (_, uid, gid, _) in &seen {
+            assert_eq!((*uid, *gid), (0, 0), "every entry is root-owned");
+        }
+        for (path, _, _, mode) in &seen {
+            let expected = if path.ends_with(".key") { 0o600 } else { 0o644 };
+            assert_eq!(*mode, expected, "{path} mode");
+        }
+        let paths: Vec<&str> = seen.iter().map(|(path, ..)| path.as_str()).collect();
+        for entry in [
+            "tls/server.crt",
+            "tls/server.key",
+            "tls/client.crt",
+            "tls/client.key",
+            "tls/ca.crt",
+        ] {
+            assert!(paths.contains(&entry), "{entry} missing");
+        }
+    }
 
     #[test]
     fn postgres_tls_tar_carries_container_ownership_and_modes() {

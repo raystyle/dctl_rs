@@ -212,6 +212,14 @@ impl FakeDocker {
                     ("POST", path) if path.starts_with("/containers/fk-id/stop?") => {
                         write_response(&mut stream, 204, "application/json", b"")
                     }
+                    // The certificate face uploads TLS material into the
+                    // created container (ADR-0011); accept and record it so
+                    // the default-start scenarios keep flowing.
+                    ("PUT", path)
+                        if path.starts_with("/containers/") && path.contains("/archive?") =>
+                    {
+                        write_response(&mut stream, 200, "application/json", b"")
+                    }
                     ("POST", "/containers/cleanup-id/start") => {
                         write_response(&mut stream, 204, "application/json", b"")
                     }
@@ -425,9 +433,11 @@ fn fresh_start_waits_for_authenticated_ping_then_succeeds() {
         ..DockerScenario::default()
     });
 
+    // Pinned to the password face: this test asserts the requirepass and
+    // REDISCLI_AUTH shapes; the certificate face has its own test below.
     let output = project.run(
         &project
-            .start_args(&[])
+            .start_args(&["--auth", "password"])
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
@@ -521,6 +531,112 @@ fn fresh_start_waits_for_authenticated_ping_then_succeeds() {
             request.path, request
         );
     }
+}
+
+#[test]
+fn cert_face_default_start_uploads_tls_material_and_sets_tls_flags() {
+    let _guard = start_guard();
+    let project = setup(DockerScenario {
+        readiness_exit_codes: vec![0],
+        ..DockerScenario::default()
+    });
+
+    let output = project.run(
+        &project
+            .start_args(&[])
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The create body replaces requirepass with the TLS-only listener and
+    // the CN-mapped client-certificate face (S004 spellings).
+    let requests = project.docker.requests();
+    let create = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.path.starts_with("/containers/create?"))
+        .expect("container create request");
+    let body: serde_json::Value = serde_json::from_str(&create.body).expect("create body JSON");
+    let env = body["Env"].as_array().expect("env array");
+    let redis_args = env
+        .iter()
+        .find_map(|e| e.as_str().and_then(|s| s.strip_prefix("REDIS_ARGS=")))
+        .expect("REDIS_ARGS env present");
+    assert!(
+        redis_args.starts_with("--port 0 --tls-port 6379"),
+        "{redis_args}"
+    );
+    assert!(redis_args.contains("--tls-cert-file /var/lib/falkordb/tls/server.crt"));
+    assert!(redis_args.contains("--tls-ca-cert-file /var/lib/falkordb/tls/ca.crt"));
+    assert!(
+        redis_args.contains("--tls-auth-clients-user CN"),
+        "{redis_args}"
+    );
+    assert!(!redis_args.contains("requirepass"), "{redis_args}");
+
+    // The TLS material (server and client pairs plus the CA) rides into the
+    // created container before start.
+    let upload = requests
+        .iter()
+        .find(|r| r.method == "PUT" && r.path.contains("/archive?"))
+        .expect("TLS material upload request");
+    assert!(
+        upload.path.contains("path=%2Fvar%2Flib%2Ffalkordb"),
+        "upload targets the data mount parent: {}",
+        upload.path
+    );
+    let tar = &upload.body;
+    for entry in [
+        "tls/server.crt",
+        "tls/server.key",
+        "tls/client.crt",
+        "tls/client.key",
+        "tls/ca.crt",
+    ] {
+        assert!(tar.contains(entry), "tar carries {entry}");
+    }
+
+    // The readiness probe rides TLS with the in-container client pair and
+    // carries no auth env: the certificate replaces the password.
+    let exec_create = requests
+        .iter()
+        .find(|r| r.method == "POST" && r.path == "/containers/fk-id/exec")
+        .expect("exec create request");
+    let exec_body: serde_json::Value =
+        serde_json::from_str(&exec_create.body).expect("exec body JSON");
+    let cmd = exec_body["Cmd"].as_array().expect("cmd array");
+    let cmd: Vec<&str> = cmd.iter().filter_map(|v| v.as_str()).collect();
+    assert_eq!(cmd.first(), Some(&"redis-cli"));
+    assert!(cmd.contains(&"--tls"), "TLS probe argv: {cmd:?}");
+    // The exec Cmd array reaches redis-cli's argv with no shell
+    // word-splitting, so each flag and its path must be separate elements
+    // (redis-cli compares whole elements only).
+    for (flag, path) in [
+        ("--cert", "/var/lib/falkordb/tls/client.crt"),
+        ("--key", "/var/lib/falkordb/tls/client.key"),
+        ("--cacert", "/var/lib/falkordb/tls/ca.crt"),
+    ] {
+        let index = cmd
+            .iter()
+            .position(|arg| *arg == flag)
+            .unwrap_or(usize::MAX);
+        assert_eq!(
+            cmd.get(index + 1).copied(),
+            Some(path),
+            "{flag} must be its own argv element followed by the path: {cmd:?}"
+        );
+    }
+    assert_eq!(cmd.last(), Some(&"ping"));
+    let exec_env = exec_body["Env"].as_array().expect("exec env array");
+    assert!(
+        exec_env.is_empty(),
+        "the certificate probe carries no auth env: {exec_env:?}"
+    );
 }
 
 #[test]

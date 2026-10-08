@@ -51,10 +51,11 @@ serde_ignored = "0.1.14"
 ledger-client = { git = "https://github.com/raystyle/ledger-rs", tag = "v0.1.1" }
 oci-client = "0.18.0"
 falkordb = { version = "0.10.3", features = ["tokio"] }
+fred = { version = "10.1.0", default-features = false, features = ["enable-rustls-ring", "i-std"] }
 rcgen = "0.14.10"
 tokio-postgres-rustls = "0.14.0"
 rustls-pemfile = "2.2.0"
-rustls = { version = "0.23.45", features = ["std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 sha2 = "0.10"
 
 [dev-dependencies]

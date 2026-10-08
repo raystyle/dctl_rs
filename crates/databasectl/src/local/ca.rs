@@ -62,8 +62,18 @@ fn write_atomic(path: &Path, contents: &str) -> Result<()> {
     Ok(())
 }
 
+/// Pin the process-level rustls CryptoProvider to ring before the first
+/// builder call. Feature unification leaves both providers compiled in
+/// (fred and reqwest pull ring; transitive defaults pull aws-lc-rs), and
+/// rustls 0.23 refuses to auto-pick between two, so every rustls-touching
+/// entry here installs ring once (idempotent, first call wins).
+pub(crate) fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// Idempotently ensure the CA exists; return the CA certificate path.
 pub(crate) fn ensure_ca() -> Result<PathBuf> {
+    ensure_crypto_provider();
     let dir = ca_dir()?;
     std::fs::create_dir_all(&dir)?;
     let _lock = CaLock::acquire(&dir)?;
@@ -143,6 +153,7 @@ pub(crate) fn client_cert(user: &str) -> Result<(PathBuf, PathBuf)> {
 pub(crate) fn tls_config(user: &str) -> Result<rustls::ClientConfig> {
     use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
+    ensure_crypto_provider();
     let (cert_path, key_path) = client_cert(user)?;
     let ca_path = ensure_ca()?;
 

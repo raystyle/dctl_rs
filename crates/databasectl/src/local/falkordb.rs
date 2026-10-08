@@ -23,6 +23,10 @@ use std::path::Path;
 use std::time::Duration;
 
 const DEFAULT_FK_PORT: u16 = 6379;
+/// The ACL user certificate faces authenticate as (the CN of the client
+/// certificate); FalkorDB instances have no user axis, so it is always
+/// the redis default user.
+pub(crate) const FK_ACL_USER: &str = "default";
 const DEFAULT_FK_BROWSER_PORT: u16 = 3000;
 /// Default image tag when `--version` is not given. FalkorDB publishes only
 /// full X.Y.Z tags (plus `latest`), so the default is pinned to a concrete
@@ -217,6 +221,7 @@ pub async fn run(cmd: FalkorCommands, json: bool) -> Result<()> {
             password,
             env,
             wait_timeout,
+            auth,
         } => {
             start(
                 name.or(name_flag),
@@ -225,6 +230,7 @@ pub async fn run(cmd: FalkorCommands, json: bool) -> Result<()> {
                 browser_port,
                 password,
                 env,
+                auth,
                 Duration::from_secs(wait_timeout.into()),
                 json,
             )
@@ -297,6 +303,7 @@ async fn start(
     browser_port: Option<u16>,
     password: Option<String>,
     extra_env: Vec<String>,
+    auth: crate::local::cli::AuthFaceArg,
     wait_timeout: Duration,
     json: bool,
 ) -> Result<()> {
@@ -378,7 +385,11 @@ async fn start(
                 return Err(Error::ServerAlreadyRunning(user_name));
             }
             if !json
-                && (port.is_some() || browser_port.is_some() || password.is_some() || has_extra_env)
+                && (port.is_some()
+                    || browser_port.is_some()
+                    || password.is_some()
+                    || has_extra_env
+                    || auth == crate::local::cli::AuthFaceArg::Password)
             {
                 eprintln!(
                     "Note: falkordb:{tag} '{}' already exists; resuming with stored settings. \
@@ -408,6 +419,7 @@ async fn start(
         let data_dir = server::fk_data_dir(&user_name, &tag)?;
 
         let password = password.unwrap_or_else(generate_password);
+        let tls = auth == crate::local::cli::AuthFaceArg::Cert;
 
         let opts = FalkorRunOpts {
             user_name: &user_name,
@@ -419,6 +431,7 @@ async fn start(
             project_cwd: &project_cwd,
             password: &password,
             extra_env,
+            tls,
         };
 
         let container_id = docker::create_falkordb(&docker, opts).await?;
@@ -435,9 +448,32 @@ async fn start(
             cwd: project_cwd.clone(),
             engine: Engine::Falkordb,
             container_id: Some(container_id.clone()),
-            tls: None,
+            tls: Some(tls),
         };
+        // Issuance and upload live inside the rollback-covered block (the
+        // material rides in the container layer, so removing the container
+        // cleans it). The client pair is uploaded too: the in-container
+        // redis-cli legs (readiness probe and the interactive REPL) ride
+        // it; the certificate-face programmatic path connects from the
+        // host with the CA material instead (fred, REQ-0017).
         let startup_result = async {
+            if tls {
+                let cname = docker::fk_container_name(&user_name, &tag);
+                let (server_cert, server_key) = crate::local::ca::issue_server_cert(&cname)?;
+                let (client_cert, client_key) = crate::local::ca::issue(FK_ACL_USER)?;
+                let ca_cert = std::fs::read_to_string(crate::local::ca::ensure_ca()?)
+                    .map_err(|e| Error::Postgres(format!("CA cert read: {e}")))?;
+                docker::upload_falkordb_tls_material(
+                    &docker,
+                    &container_id,
+                    &server_cert,
+                    &server_key,
+                    &client_cert,
+                    &client_key,
+                    &ca_cert,
+                )
+                .await?;
+            }
             docker::start_existing(&docker, &container_id).await?;
             server::save_server_info_locked(&info, &metadata_lock)
         }
@@ -457,7 +493,8 @@ async fn start(
         drop(metadata_lock);
 
         if let Err(failure) =
-            wait_for_falkor_ready(&docker, &container_id, &password, wait_timeout).await
+            wait_for_falkor_ready_with_face(&docker, &container_id, &password, tls, wait_timeout)
+                .await
         {
             let primary =
                 falkor_readiness_error(&docker, &container_id, &user_name, wait_timeout, failure)
@@ -776,8 +813,14 @@ async fn resume_existing(
     }
     drop(metadata_lock);
 
-    if let Err(failure) =
-        wait_for_falkor_ready(docker, &container_id, &password, wait_timeout).await
+    if let Err(failure) = wait_for_falkor_ready_with_face(
+        docker,
+        &container_id,
+        &password,
+        prior.tls == Some(true),
+        wait_timeout,
+    )
+    .await
     {
         let error =
             falkor_readiness_error(docker, &container_id, &display_name, wait_timeout, failure)
@@ -843,6 +886,7 @@ struct DockerReadinessProbe<'a> {
     docker: &'a bollard::Docker,
     container_id: &'a str,
     password: &'a str,
+    tls: bool,
 }
 
 impl ReadinessProbe for DockerReadinessProbe<'_> {
@@ -862,7 +906,8 @@ impl ReadinessProbe for DockerReadinessProbe<'_> {
     }
 
     async fn falkor_is_ready(&mut self) -> Result<bool> {
-        docker::falkor_is_ready(self.docker, self.container_id, self.password).await
+        docker::falkor_is_ready_with_face(self.docker, self.container_id, self.password, self.tls)
+            .await
     }
 }
 
@@ -946,16 +991,18 @@ async fn wait_for_falkor_ready_with_probe<P: ReadinessProbe>(
     }
 }
 
-async fn wait_for_falkor_ready(
+async fn wait_for_falkor_ready_with_face(
     docker: &bollard::Docker,
     container_id: &str,
     password: &str,
+    tls: bool,
     timeout: Duration,
 ) -> std::result::Result<(), ReadinessFailure> {
     let mut probe = DockerReadinessProbe {
         docker,
         container_id,
         password,
+        tls,
     };
     wait_for_falkor_ready_with_probe(&mut probe, timeout).await
 }
@@ -1316,6 +1363,7 @@ async fn client(
         .as_deref()
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let password = read_fk_password(&docker, container_id).await?;
+    let tls = info.tls == Some(true);
 
     // Same shape as the Postgres client: `--`-passthrough arguments reach
     // redis-cli only in interactive mode, so their presence must not force
@@ -1325,11 +1373,18 @@ async fn client(
     if interactive {
         // The redis-cli REPL cannot be rebuilt from a library: interactive
         // mode keeps the container's redis-cli over docker exec (ADR-0009),
-        // authenticating through REDISCLI_AUTH rather than argv.
+        // authenticating through REDISCLI_AUTH (password face) or the
+        // in-container client pair (certificate face).
         let mut cli_args: Vec<String> = vec!["--no-auth-warning".into()];
         cli_args.extend(extra_args);
-        return docker::exec_redis_cli_in_container(&docker, container_id, &cli_args, &password)
-            .await;
+        return docker::exec_redis_cli_in_container_with_face(
+            &docker,
+            container_id,
+            &cli_args,
+            &password,
+            tls,
+        )
+        .await;
     }
     let cypher = match query {
         Some(cypher) => cypher,
@@ -1342,6 +1397,13 @@ async fn client(
             buffer
         }
     };
+    if tls {
+        // Certificate-face programmatic path (REQ-0017): fred carries the
+        // native mTLS identity redis-rs does not expose (S004), so the query
+        // rides the published TLS port straight from the host instead of the
+        // in-container redis-cli exec detour.
+        return run_tls_cypher("127.0.0.1", info.tcp_port, &graph_name, &cypher).await;
+    }
     run_native_cypher(
         "127.0.0.1",
         info.tcp_port,
@@ -1350,6 +1412,706 @@ async fn client(
         &cypher,
     )
     .await
+}
+
+/// The certificate-face programmatic leg (REQ-0017): one Cypher statement
+/// over the published TLS port with the dctl client certificate. fred is on
+/// this leg because its TLS connector takes a full rustls ClientConfig — the
+/// client-certificate injection redis-rs never exposed (S004) — so no exec
+/// detour through the container's redis-cli is needed.
+async fn run_tls_cypher(host: &str, port: u16, graph_name: &str, cypher: &str) -> Result<()> {
+    print!(
+        "{}",
+        tls_cypher_table(host, port, graph_name, cypher).await?
+    );
+    Ok(())
+}
+
+/// The rendered-table core of the certificate-face leg, split out so the
+/// opt-in live test can assert on the decoded output without capturing
+/// stdout.
+async fn tls_cypher_table(host: &str, port: u16, graph_name: &str, cypher: &str) -> Result<String> {
+    use fred::clients::Client;
+    use fred::interfaces::ClientLike;
+    use fred::types::config::{Config as FredConfig, ServerConfig, TlsConfig};
+
+    let tls = crate::local::ca::tls_config(FK_ACL_USER)?;
+    let config = FredConfig {
+        server: ServerConfig::new_centralized(host, port),
+        tls: Some(TlsConfig::from(tls)),
+        ..Default::default()
+    };
+    let client = Client::new(config, None, None, None);
+    client.init().await.map_err(|error| {
+        // The library's text is human-only context; the parity envelope
+        // keeps the self-composed sentence (the upload path's split).
+        eprintln!("client certificate connection to {host}:{port} failed: {error}");
+        Error::FalkorUsage(format!(
+            "could not connect to FalkorDB at {host}:{port} with the client certificate; \
+             check that the instance is running and the dctl CA material is intact"
+        ))
+    })?;
+    let outcome = compact_cypher_table(
+        &mut FredProcedureCaller(&client),
+        host,
+        port,
+        graph_name,
+        cypher,
+    )
+    .await;
+    let _ = client.quit().await;
+    outcome
+}
+
+/// The transport the compact-protocol decoder talks to: GRAPH.QUERY for
+/// rows and for the db.* schema listings (the official client's refresh
+/// uses the same command). Split out so the decoder is drivable from tests
+/// with canned replies.
+trait ProcedureCaller {
+    async fn query(
+        &mut self,
+        graph: &str,
+        cypher: &str,
+    ) -> std::result::Result<fred::types::Value, String>;
+
+    async fn list_schema(
+        &mut self,
+        graph: &str,
+        procedure: &str,
+    ) -> std::result::Result<Vec<String>, String>;
+}
+
+/// The fred-backed caller: custom commands on a connected client.
+struct FredProcedureCaller<'a>(&'a fred::clients::Client);
+
+impl ProcedureCaller for FredProcedureCaller<'_> {
+    async fn query(
+        &mut self,
+        graph: &str,
+        cypher: &str,
+    ) -> std::result::Result<fred::types::Value, String> {
+        use fred::interfaces::ClientLike;
+        use fred::types::{ClusterHash, CustomCommand};
+        self.0
+            .custom(
+                CustomCommand::new("GRAPH.QUERY", ClusterHash::FirstKey, false),
+                vec![
+                    graph.to_string(),
+                    cypher.to_string(),
+                    "--compact".to_string(),
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    async fn list_schema(
+        &mut self,
+        graph: &str,
+        procedure: &str,
+    ) -> std::result::Result<Vec<String>, String> {
+        use fred::interfaces::ClientLike;
+        let reply = self
+            .0
+            .custom::<fred::types::Value, _>(
+                fred::types::CustomCommand::new(
+                    "GRAPH.QUERY",
+                    fred::types::ClusterHash::FirstKey,
+                    false,
+                ),
+                vec![graph.to_string(), format!("CALL {procedure}()")],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        parse_procedure_rows(reply)
+    }
+}
+
+/// Rows of a `CALL db.*()` listing: the reply is `[header, rows, stats]` and
+/// each row's first slot holds the bare name (the official client's refresh
+/// reads the same shape).
+fn parse_procedure_rows(reply: fred::types::Value) -> std::result::Result<Vec<String>, String> {
+    use fred::types::Value;
+    let decode = |message: &str| format!("could not decode the schema listing: {message}");
+    let Value::Array(mut parts) = reply else {
+        return Err(decode("expected a top-level array"));
+    };
+    let Some(rows) = parts.get_mut(1) else {
+        return Err(decode("expected header, rows and stats sections"));
+    };
+    let Value::Array(rows) = std::mem::replace(rows, Value::Null) else {
+        return Err(decode("expected the rows section to be an array"));
+    };
+    let mut names = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Value::Array(mut slots) = row else {
+            return Err(decode("expected each row to be an array"));
+        };
+        let Some(first) = slots.drain(..).next() else {
+            return Err(decode("expected at least one slot per row"));
+        };
+        match first {
+            Value::String(name) => names.push(name.to_string()),
+            Value::Bytes(name) => names.push(
+                String::from_utf8(name.to_vec())
+                    .map_err(|_| decode("a schema name is not valid UTF-8"))?,
+            ),
+            _ => return Err(decode("expected the first row slot to be a string")),
+        }
+    }
+    Ok(names)
+}
+
+/// Run one compact-protocol GRAPH.QUERY and render the reply through the
+/// shared table renderer, decoding with the same shapes the official client
+/// parses (type-marker pairs, schema-resolved entity ids) so both faces of
+/// the same instance print identically.
+async fn compact_cypher_table<C: ProcedureCaller>(
+    caller: &mut C,
+    host: &str,
+    port: u16,
+    graph_name: &str,
+    cypher: &str,
+) -> Result<String> {
+    let reply = caller.query(graph_name, cypher).await.map_err(|message| {
+        // Transport/server text is human-only; the parity envelope keeps
+        // the self-composed sentence.
+        eprintln!("GRAPH.QUERY on {host}:{port} failed: {message}");
+        Error::FalkorUsage(format!(
+            "the Cypher query failed on FalkorDB at {host}:{port}; the server's message \
+             is on stderr"
+        ))
+    })?;
+    let mut schema = GraphSchemaMaps::default();
+    let (columns, rows) = decode_query_reply(reply, caller, graph_name, &mut schema).await?;
+    Ok(render_falkor_table(&columns, &rows))
+}
+
+/// Which db.* listing backs a schema id namespace.
+#[derive(Clone, Copy, Debug)]
+enum SchemaKind {
+    Labels,
+    Relationships,
+    Properties,
+}
+
+impl SchemaKind {
+    /// The procedure names the official client's refresh sends, verbatim
+    /// (upper-case, over GRAPH.QUERY): keeping the identical wire shape
+    /// removes any server-side parsing difference from the equation.
+    fn procedure(self) -> &'static str {
+        match self {
+            SchemaKind::Labels => "DB.LABELS",
+            SchemaKind::Relationships => "DB.RELATIONSHIPTYPES",
+            SchemaKind::Properties => "DB.PROPERTYKEYS",
+        }
+    }
+}
+
+/// The label, relationship-type and property-key id tables a compact reply
+/// resolves against, refreshed lazily from the server on a miss (mirroring
+/// the official client's GraphSchema).
+#[derive(Default)]
+struct GraphSchemaMaps {
+    labels: std::collections::HashMap<i64, String>,
+    relationships: std::collections::HashMap<i64, String>,
+    properties: std::collections::HashMap<i64, String>,
+}
+
+impl GraphSchemaMaps {
+    fn map(&mut self, kind: SchemaKind) -> &mut std::collections::HashMap<i64, String> {
+        match kind {
+            SchemaKind::Labels => &mut self.labels,
+            SchemaKind::Relationships => &mut self.relationships,
+            SchemaKind::Properties => &mut self.properties,
+        }
+    }
+
+    async fn resolve<C: ProcedureCaller>(
+        &mut self,
+        caller: &mut C,
+        graph: &str,
+        kind: SchemaKind,
+        id: i64,
+    ) -> Result<String> {
+        if let Some(name) = self.map(kind).get(&id) {
+            return Ok(name.clone());
+        }
+        self.refresh(caller, graph, kind).await?;
+        self.map(kind).get(&id).cloned().ok_or_else(|| {
+            Error::FalkorUsage(format!(
+                "the graph schema has no {kind:?} id {id} after a refresh"
+            ))
+        })
+    }
+
+    async fn refresh<C: ProcedureCaller>(
+        &mut self,
+        caller: &mut C,
+        graph: &str,
+        kind: SchemaKind,
+    ) -> Result<()> {
+        let names = caller
+            .list_schema(graph, kind.procedure())
+            .await
+            .map_err(|message| {
+                // Human-only context; the parity envelope stays self-composed.
+                let procedure = kind.procedure();
+                eprintln!("schema listing {procedure} failed: {message}");
+                Error::FalkorUsage(
+                    "could not refresh the graph schema over FalkorDB; the server's message \
+                     is on stderr"
+                        .to_string(),
+                )
+            })?;
+        *self.map(kind) = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (index as i64, name))
+            .collect();
+        Ok(())
+    }
+}
+
+/// Split a compact-protocol value into its type marker and payload.
+fn split_type_marker(value: fred::types::Value) -> Result<(i64, fred::types::Value)> {
+    use fred::types::Value;
+    let Value::Array(mut pair) = value else {
+        return Err(Error::FalkorUsage(
+            "expected a [type marker, value] pair in the reply".into(),
+        ));
+    };
+    if pair.len() != 2 {
+        return Err(Error::FalkorUsage(format!(
+            "expected exactly 2 elements for a type marker pair, got {}",
+            pair.len()
+        )));
+    }
+    let payload = pair.pop().expect("length checked above");
+    let Value::Integer(marker) = pair.pop().expect("length checked above") else {
+        return Err(Error::FalkorUsage(
+            "expected an integer type marker in the reply".into(),
+        ));
+    };
+    Ok((marker, payload))
+}
+
+fn value_into_string(value: fred::types::Value) -> Result<String> {
+    use fred::types::Value;
+    match value {
+        Value::String(text) => Ok(text.to_string()),
+        Value::Bytes(bytes) => String::from_utf8(bytes.to_vec())
+            .map_err(|_| Error::FalkorUsage("a reply string is not valid UTF-8".into())),
+        other => Err(Error::FalkorUsage(format!(
+            "expected a string in the reply, got {:?}",
+            ValueKind::of(&other)
+        ))),
+    }
+}
+
+fn value_as_int(value: &fred::types::Value) -> Result<i64> {
+    match value {
+        fred::types::Value::Integer(number) => Ok(*number),
+        other => Err(Error::FalkorUsage(format!(
+            "expected an integer in the reply, got {:?}",
+            ValueKind::of(other)
+        ))),
+    }
+}
+
+fn value_into_vec(value: fred::types::Value) -> Result<Vec<fred::types::Value>> {
+    match value {
+        fred::types::Value::Array(items) => Ok(items),
+        other => Err(Error::FalkorUsage(format!(
+            "expected an array in the reply, got {:?}",
+            ValueKind::of(&other)
+        ))),
+    }
+}
+
+/// The compact protocol's marker vocabulary (the official client's
+/// ParserTypeMarker); the kind label doubles as the decode error context.
+#[derive(Clone, Copy, Debug)]
+enum CellKind {
+    None,
+    String,
+    I64,
+    Bool,
+    F64,
+    Array,
+    Edge,
+    Node,
+    Path,
+    Map,
+    Point,
+    Vec32,
+    DateTime,
+    Date,
+    Time,
+    Duration,
+}
+
+impl CellKind {
+    fn from_marker(marker: i64) -> Result<Self> {
+        Ok(match marker {
+            1 => Self::None,
+            2 => Self::String,
+            3 => Self::I64,
+            4 => Self::Bool,
+            5 => Self::F64,
+            6 => Self::Array,
+            7 => Self::Edge,
+            8 => Self::Node,
+            9 => Self::Path,
+            10 => Self::Map,
+            11 => Self::Point,
+            12 => Self::Vec32,
+            13 => Self::DateTime,
+            14 => Self::Date,
+            15 => Self::Time,
+            16 => Self::Duration,
+            other => {
+                return Err(Error::FalkorUsage(format!(
+                    "unknown type marker {other} in the reply"
+                )));
+            }
+        })
+    }
+}
+
+/// The value kind label for decode errors (fred's Value has no kind method).
+struct ValueKind;
+
+impl ValueKind {
+    fn of(value: &fred::types::Value) -> &'static str {
+        use fred::types::Value;
+        match value {
+            Value::Boolean(_) => "boolean",
+            Value::Integer(_) => "integer",
+            Value::Double(_) => "double",
+            Value::String(_) => "string",
+            Value::Bytes(_) => "bytes",
+            Value::Null => "nil",
+            Value::Queued => "queued",
+            Value::Map(_) => "map",
+            Value::Array(_) => "array",
+        }
+    }
+}
+
+/// Decode a `[header, rows, stats]` GRAPH.QUERY reply into rendered table
+/// rows. Stats-only and header-only replies (no matching rows) yield empty
+/// row sets, matching the official client's dispatch.
+async fn decode_query_reply<C: ProcedureCaller>(
+    reply: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<(Vec<String>, Vec<Vec<Option<String>>>)> {
+    let mut parts = value_into_vec(reply)?;
+    // The stats trailer always closes the reply; it is not rendered.
+    if parts.pop().is_none() {
+        return Err(Error::FalkorUsage(
+            "the GRAPH.QUERY reply has no stats section".into(),
+        ));
+    }
+    let rows_raw = if parts.len() == 2 {
+        value_into_vec(parts.pop().expect("length checked above"))?
+    } else {
+        Vec::new()
+    };
+    let columns = match parts.pop() {
+        Some(header) => parse_header(header)?,
+        None => Vec::new(),
+    };
+
+    let mut rows: Vec<Vec<Option<String>>> = Vec::with_capacity(rows_raw.len());
+    for row in rows_raw {
+        let cells = value_into_vec(row)?;
+        if cells.len() != columns.len() {
+            return Err(Error::FalkorUsage(format!(
+                "a reply row has {} values for {} columns",
+                cells.len(),
+                columns.len()
+            )));
+        }
+        let mut rendered = Vec::with_capacity(cells.len());
+        for cell in cells {
+            let value = decode_falkor_value(cell, caller, graph, schema).await?;
+            rendered.push(Some(render_falkor_value(&value)));
+        }
+        rows.push(rendered);
+    }
+    Ok((columns, rows))
+}
+
+/// Parse the header section: each column arrives as a one-element array, or
+/// a `[type, name]` pair for typed columns.
+fn parse_header(header: fred::types::Value) -> Result<Vec<String>> {
+    let items = value_into_vec(header)?;
+    let mut columns = Vec::with_capacity(items.len());
+    for item in items {
+        let slots = value_into_vec(item)?;
+        let key = if slots.len() == 2 {
+            slots.into_iter().nth(1).expect("length checked above")
+        } else {
+            slots
+                .into_iter()
+                .next()
+                .ok_or_else(|| Error::FalkorUsage("a header column is empty".into()))?
+        };
+        columns.push(value_into_string(key)?);
+    }
+    Ok(columns)
+}
+
+/// Decode one reply cell (a type-marker pair) into a FalkorValue, the same
+/// shapes the official client produces so the shared renderer prints both
+/// faces identically.
+async fn decode_falkor_value<C: ProcedureCaller>(
+    cell: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<falkordb::FalkorValue> {
+    let (marker, payload) = split_type_marker(cell)?;
+    decode_typed(marker, payload, caller, graph, schema).await
+}
+
+async fn decode_typed<C: ProcedureCaller>(
+    marker: i64,
+    payload: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<falkordb::FalkorValue> {
+    use falkordb::FalkorValue;
+    match CellKind::from_marker(marker)? {
+        CellKind::None => Ok(FalkorValue::None),
+        CellKind::String => Ok(FalkorValue::String(value_into_string(payload)?)),
+        CellKind::I64 => Ok(FalkorValue::I64(value_as_int(&payload)?)),
+        CellKind::Bool => match value_into_string(payload)?.as_str() {
+            "true" => Ok(FalkorValue::Bool(true)),
+            "false" => Ok(FalkorValue::Bool(false)),
+            other => Err(Error::FalkorUsage(format!(
+                "expected true or false for a boolean cell, got {other:?}"
+            ))),
+        },
+        CellKind::F64 => {
+            let text = value_into_string(payload)?;
+            let number = text
+                .parse::<f64>()
+                .map_err(|_| Error::FalkorUsage(format!("expected a float cell, got {text:?}")))?;
+            Ok(FalkorValue::F64(number))
+        }
+        CellKind::Array => {
+            let items = value_into_vec(payload)?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                // Recursive decode through decode_falkor_value needs the
+                // pin; the type marker vocabulary is fixed, so the depth
+                // follows the reply's nesting, which the server bounds.
+                values.push(Box::pin(decode_falkor_value(item, caller, graph, schema)).await?);
+            }
+            Ok(FalkorValue::Array(values))
+        }
+        CellKind::Edge => {
+            let edge = decode_edge(payload, caller, graph, schema).await?;
+            Ok(FalkorValue::Edge(edge))
+        }
+        CellKind::Node => {
+            let node = decode_node(payload, caller, graph, schema).await?;
+            Ok(FalkorValue::Node(node))
+        }
+        CellKind::Path => {
+            let mut slots = value_into_vec(payload)?;
+            if slots.len() != 2 {
+                return Err(Error::FalkorUsage(format!(
+                    "expected exactly 2 elements for a path, got {}",
+                    slots.len()
+                )));
+            }
+            let edges_raw = slots.pop().expect("length checked above");
+            let nodes_raw = slots.pop().expect("length checked above");
+            let mut nodes = Vec::new();
+            for item in value_into_vec(nodes_raw)? {
+                nodes.push(decode_node(item, caller, graph, schema).await?);
+            }
+            let mut relationships = Vec::new();
+            for item in value_into_vec(edges_raw)? {
+                relationships.push(decode_edge(item, caller, graph, schema).await?);
+            }
+            Ok(FalkorValue::Path(falkordb::Path {
+                nodes,
+                relationships,
+            }))
+        }
+        CellKind::Map => {
+            let slots = value_into_vec(payload)?;
+            if slots.len() % 2 != 0 {
+                return Err(Error::FalkorUsage(format!(
+                    "expected an even number of map slots, got {}",
+                    slots.len()
+                )));
+            }
+            let mut map = std::collections::HashMap::with_capacity(slots.len() / 2);
+            let mut slots = slots.into_iter();
+            while let (Some(key), Some(value)) = (slots.next(), slots.next()) {
+                let key = value_into_string(key)?;
+                let value = Box::pin(decode_falkor_value(value, caller, graph, schema)).await?;
+                map.insert(key, value);
+            }
+            Ok(FalkorValue::Map(map))
+        }
+        CellKind::Point => {
+            let mut slots = value_into_vec(payload)?;
+            if slots.len() != 2 {
+                return Err(Error::FalkorUsage(format!(
+                    "expected latitude and longitude for a point, got {}",
+                    slots.len()
+                )));
+            }
+            let longitude = slots.pop().expect("length checked above");
+            let latitude = slots.pop().expect("length checked above");
+            Ok(FalkorValue::Point(falkordb::Point {
+                latitude: parse_float_cell(latitude)?,
+                longitude: parse_float_cell(longitude)?,
+            }))
+        }
+        CellKind::Vec32 => {
+            let items = value_into_vec(payload)?;
+            let mut values = Vec::with_capacity(items.len());
+            for item in items {
+                let text = value_into_string(item)?;
+                values.push(text.parse::<f32>().map_err(|_| {
+                    Error::FalkorUsage(format!("expected a float vector member, got {text:?}"))
+                })?);
+            }
+            // The Vec32 type is not exported by the crate, so the password
+            // face's renderer only ever shows the enum's Debug form; mirror
+            // that text exactly (outer variant name included) to keep both
+            // faces printing identically.
+            Ok(FalkorValue::String(format!(
+                "Vec32(Vec32 {{ values: {values:?} }})"
+            )))
+        }
+        kind @ (CellKind::DateTime | CellKind::Date | CellKind::Time | CellKind::Duration) => {
+            let secs = value_as_int(&payload)?;
+            Ok(match kind {
+                CellKind::DateTime => FalkorValue::DateTime(falkordb::DateTime::new(secs)),
+                CellKind::Date => FalkorValue::Date(falkordb::Date::new(secs)),
+                CellKind::Time => FalkorValue::Time(falkordb::Time::new(secs)),
+                CellKind::Duration => FalkorValue::Duration(falkordb::Duration::new(secs)),
+                _ => unreachable!("the outer arm pinned the temporal kinds"),
+            })
+        }
+    }
+}
+
+fn parse_float_cell(value: fred::types::Value) -> Result<f64> {
+    let text = value_into_string(value)?;
+    text.parse::<f64>()
+        .map_err(|_| Error::FalkorUsage(format!("expected a float cell, got {text:?}")))
+}
+
+/// Node payload: `[id, label ids, [key id, marker, value] triples]`, with
+/// both id namespaces resolved against the live schema.
+async fn decode_node<C: ProcedureCaller>(
+    payload: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<falkordb::Node> {
+    let mut slots = value_into_vec(payload)?;
+    if slots.len() != 3 {
+        return Err(Error::FalkorUsage(format!(
+            "expected exactly 3 elements for a node, got {}",
+            slots.len()
+        )));
+    }
+    let properties_raw = slots.pop().expect("length checked above");
+    let labels_raw = slots.pop().expect("length checked above");
+    let entity_id = value_as_int(&slots.pop().expect("length checked above"))?;
+    let mut labels = Vec::new();
+    for label in value_into_vec(labels_raw)? {
+        let id = value_as_int(&label)?;
+        labels.push(
+            schema
+                .resolve(caller, graph, SchemaKind::Labels, id)
+                .await?,
+        );
+    }
+    let properties = decode_properties(properties_raw, caller, graph, schema).await?;
+    Ok(falkordb::Node {
+        entity_id,
+        labels,
+        properties,
+    })
+}
+
+/// Edge payload: `[id, relationship id, source id, destination id, property
+/// triples]`.
+async fn decode_edge<C: ProcedureCaller>(
+    payload: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<falkordb::Edge> {
+    let mut slots = value_into_vec(payload)?;
+    if slots.len() != 5 {
+        return Err(Error::FalkorUsage(format!(
+            "expected exactly 5 elements for an edge, got {}",
+            slots.len()
+        )));
+    }
+    let properties_raw = slots.pop().expect("length checked above");
+    let dst_node_id = value_as_int(&slots.pop().expect("length checked above"))?;
+    let src_node_id = value_as_int(&slots.pop().expect("length checked above"))?;
+    let relationship_id = value_as_int(&slots.pop().expect("length checked above"))?;
+    let entity_id = value_as_int(&slots.pop().expect("length checked above"))?;
+    let relationship_type = schema
+        .resolve(caller, graph, SchemaKind::Relationships, relationship_id)
+        .await?;
+    let properties = decode_properties(properties_raw, caller, graph, schema).await?;
+    Ok(falkordb::Edge {
+        entity_id,
+        relationship_type,
+        src_node_id,
+        dst_node_id,
+        properties,
+    })
+}
+
+/// Property triples: `[key id, type marker, value]`, keys resolved against
+/// the property-key schema and values decoded like top-level cells.
+async fn decode_properties<C: ProcedureCaller>(
+    payload: fred::types::Value,
+    caller: &mut C,
+    graph: &str,
+    schema: &mut GraphSchemaMaps,
+) -> Result<std::collections::HashMap<String, falkordb::FalkorValue>> {
+    let triples = value_into_vec(payload)?;
+    let mut map = std::collections::HashMap::with_capacity(triples.len());
+    for triple in triples {
+        let mut slots = value_into_vec(triple)?;
+        if slots.len() != 3 {
+            return Err(Error::FalkorUsage(format!(
+                "expected exactly 3 elements for a property, got {}",
+                slots.len()
+            )));
+        }
+        let value_raw = slots.pop().expect("length checked above");
+        let marker = value_as_int(&slots.pop().expect("length checked above"))?;
+        let key_id = value_as_int(&slots.pop().expect("length checked above"))?;
+        let key = schema
+            .resolve(caller, graph, SchemaKind::Properties, key_id)
+            .await?;
+        // Boxed to break the decode_typed → node/edge → properties →
+        // decode_typed recursion the compiler cannot size.
+        let value = Box::pin(decode_typed(marker, value_raw, caller, graph, schema)).await?;
+        map.insert(key, value);
+    }
+    Ok(map)
 }
 
 /// Percent-encode every byte outside the URL unreserved set. The redis URL
@@ -1521,18 +2283,63 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     } else {
         info.tcp_port.to_string()
     };
-    let vars: Vec<(&str, String)> = vec![
-        ("FALKORDB_HOST", "127.0.0.1".to_string()),
-        ("FALKORDB_PORT", tcp_port),
-        ("FALKORDB_PASSWORD", password),
-        ("FALKORDB_BROWSER_URL", browser_url),
-    ];
+    // The face decides the shape (ADR-0011): the certificate face emits the
+    // TLS material paths with no password; the password face keeps the
+    // historical four.
+    let vars: Vec<(&str, String)> = if info.tls == Some(true) {
+        let ca = crate::local::ca::ensure_ca()?;
+        let (cert, key) = crate::local::ca::client_cert(FK_ACL_USER)?;
+        vec![
+            ("FALKORDB_HOST", "127.0.0.1".to_string()),
+            ("FALKORDB_PORT", tcp_port),
+            ("FALKORDB_TLS", "true".to_string()),
+            ("FALKORDB_CA_CERT", ca.display().to_string()),
+            ("FALKORDB_CLIENT_CERT", cert.display().to_string()),
+            ("FALKORDB_CLIENT_KEY", key.display().to_string()),
+            ("FALKORDB_BROWSER_URL", browser_url),
+        ]
+    } else {
+        vec![
+            ("FALKORDB_HOST", "127.0.0.1".to_string()),
+            ("FALKORDB_PORT", tcp_port),
+            ("FALKORDB_PASSWORD", password),
+            ("FALKORDB_BROWSER_URL", browser_url),
+        ]
+    };
 
     let filename = if use_local { ".env.local" } else { ".env" };
     let path = std::path::Path::new(filename);
 
     let content = if path.exists() {
         let existing = std::fs::read_to_string(path)?;
+        // All FALKORDB_* keys share the managed prefix, so update_dotenv
+        // replaces in place; only the cross-face key needs exact-key
+        // stripping so a switch cannot leave both shapes behind.
+        let strip_password = info.tls == Some(true);
+        let existing = existing
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim_start();
+                let bare = trimmed
+                    .strip_prefix("export")
+                    .map(str::trim_start)
+                    .unwrap_or(trimmed);
+                let key = bare.split('=').next().unwrap_or("").trim_end();
+                let face_key = matches!(
+                    key,
+                    "FALKORDB_TLS"
+                        | "FALKORDB_CA_CERT"
+                        | "FALKORDB_CLIENT_CERT"
+                        | "FALKORDB_CLIENT_KEY"
+                ) || (strip_password && key == "FALKORDB_PASSWORD");
+                !face_key
+            })
+            .chain(std::iter::once(""))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            );
         crate::local::update_dotenv(&existing, "FALKORDB_", &vars)
     } else {
         vars.iter()
@@ -1629,6 +2436,291 @@ mod tests {
         );
         // Unreserved characters pass through untouched.
         assert_eq!(percent_encode_component("aZ09-._~"), "aZ09-._~");
+    }
+
+    // ── compact-protocol decoder (certificate face, REQ-0017) ────────────
+
+    use fred::types::Value as FredValue;
+
+    fn v_int(i: i64) -> FredValue {
+        FredValue::Integer(i)
+    }
+
+    fn v_str(text: &str) -> FredValue {
+        FredValue::String(text.into())
+    }
+
+    fn v_arr(items: Vec<FredValue>) -> FredValue {
+        FredValue::Array(items)
+    }
+
+    /// A canned transport: one fixed GRAPH.QUERY reply plus fixed schema
+    /// listings, so the decoder runs without a server.
+    struct CannedProcedureCaller {
+        reply: FredValue,
+        schema: std::collections::HashMap<&'static str, Vec<String>>,
+    }
+
+    impl ProcedureCaller for CannedProcedureCaller {
+        async fn query(
+            &mut self,
+            _graph: &str,
+            _cypher: &str,
+        ) -> std::result::Result<FredValue, String> {
+            Ok(self.reply.clone())
+        }
+
+        async fn list_schema(
+            &mut self,
+            _graph: &str,
+            procedure: &str,
+        ) -> std::result::Result<Vec<String>, String> {
+            Ok(self.schema.get(procedure).cloned().unwrap_or_default())
+        }
+    }
+
+    fn canned_schema() -> std::collections::HashMap<&'static str, Vec<String>> {
+        std::collections::HashMap::from([
+            ("DB.LABELS", vec!["Person".to_string()]),
+            ("DB.RELATIONSHIPTYPES", vec!["KNOWS".to_string()]),
+            (
+                "DB.PROPERTYKEYS",
+                vec!["name".to_string(), "age".to_string(), "note".to_string()],
+            ),
+        ])
+    }
+
+    /// A one-row reply with one node, one edge, one path and two scalars,
+    /// exercising every schema namespace and the recursive property decode.
+    fn sample_compact_reply() -> FredValue {
+        let node = v_arr(vec![
+            v_int(0),
+            v_arr(vec![v_int(0)]),
+            v_arr(vec![
+                v_arr(vec![v_int(0), v_int(2), v_str("alice")]),
+                v_arr(vec![v_int(1), v_int(3), v_int(42)]),
+            ]),
+        ]);
+        let edge = v_arr(vec![
+            v_int(0),
+            v_int(0),
+            v_int(0),
+            v_int(1),
+            v_arr(vec![v_arr(vec![v_int(2), v_int(2), v_str("since 2020")])]),
+        ]);
+        let path = v_arr(vec![v_arr(vec![node.clone()]), v_arr(vec![edge.clone()])]);
+        let row = v_arr(vec![
+            v_arr(vec![v_int(8), node]),
+            v_arr(vec![v_int(7), edge]),
+            v_arr(vec![v_int(9), path]),
+            v_arr(vec![v_int(3), v_int(7)]),
+            v_arr(vec![v_int(2), v_str("scalar")]),
+        ]);
+        v_arr(vec![
+            v_arr(vec![
+                v_arr(vec![v_str("n")]),
+                v_arr(vec![v_str("e")]),
+                v_arr(vec![v_str("p")]),
+                v_arr(vec![v_str("i")]),
+                v_arr(vec![v_str("s")]),
+            ]),
+            v_arr(vec![row]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ])
+    }
+
+    #[tokio::test]
+    async fn compact_reply_decodes_entities_scalars_and_schema_ids() {
+        let mut caller = CannedProcedureCaller {
+            reply: sample_compact_reply(),
+            schema: canned_schema(),
+        };
+        let mut schema = GraphSchemaMaps::default();
+        let (columns, rows) =
+            decode_query_reply(caller.reply.clone(), &mut caller, "g", &mut schema)
+                .await
+                .expect("the sample reply decodes");
+        assert_eq!(
+            columns,
+            ["n", "e", "p", "i", "s"].map(String::from).to_vec()
+        );
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        // The node resolves label id 0 and property ids 0/1 through the
+        // canned schema, mirroring the official client's rendering.
+        assert_eq!(
+            row[0].as_deref(),
+            Some("(:Person #0 {age: 42, name: alice})")
+        );
+        assert_eq!(row[1].as_deref(), Some("-[KNOWS #0 {note: since 2020}]->"));
+        assert_eq!(row[2].as_deref(), Some("[path 1 nodes]"));
+        assert_eq!(row[3].as_deref(), Some("7"));
+        assert_eq!(row[4].as_deref(), Some("scalar"));
+        // The schema refresh ran lazily: the maps started empty and were
+        // populated from the canned listings during the decode.
+        assert_eq!(schema.labels.get(&0).map(String::as_str), Some("Person"));
+    }
+
+    #[tokio::test]
+    async fn compact_reply_rejects_rows_that_do_not_match_the_header() {
+        let short_row = v_arr(vec![v_arr(vec![v_int(3), v_int(1)])]);
+        let reply = v_arr(vec![
+            v_arr(vec![v_arr(vec![v_str("a")]), v_arr(vec![v_str("b")])]),
+            v_arr(vec![short_row]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ]);
+        let mut caller = CannedProcedureCaller {
+            reply: reply.clone(),
+            schema: canned_schema(),
+        };
+        let error = decode_query_reply(reply, &mut caller, "g", &mut GraphSchemaMaps::default())
+            .await
+            .expect_err("a one-cell row for a two-column header must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("a reply row has 1 values for 2 columns"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_reply_errors_when_a_schema_id_stays_unknown() {
+        // The listing answers, but with a table that has no id 5: the
+        // official client surfaces MissingSchemaId; so does this decode.
+        let node = v_arr(vec![v_int(0), v_arr(vec![v_int(5)]), v_arr(vec![])]);
+        let reply = v_arr(vec![
+            v_arr(vec![v_arr(vec![v_str("n")])]),
+            v_arr(vec![v_arr(vec![v_arr(vec![v_int(8), node])])]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ]);
+        let mut caller = CannedProcedureCaller {
+            reply: reply.clone(),
+            schema: canned_schema(),
+        };
+        let error = decode_query_reply(reply, &mut caller, "g", &mut GraphSchemaMaps::default())
+            .await
+            .expect_err("an unresolvable label id must fail");
+        assert!(error.to_string().contains("no Labels id 5"), "{error}");
+    }
+
+    #[test]
+    fn header_pairs_carry_the_name_in_the_second_slot() {
+        let header = v_arr(vec![
+            v_arr(vec![v_int(2), v_str("typed")]),
+            v_arr(vec![v_str("plain")]),
+        ]);
+        assert_eq!(
+            parse_header(header).expect("the header parses"),
+            ["typed", "plain"].map(String::from).to_vec()
+        );
+    }
+
+    #[test]
+    fn procedure_listings_take_the_first_slot_of_each_row() {
+        let reply = v_arr(vec![
+            v_arr(vec![v_str("label")]),
+            v_arr(vec![
+                v_arr(vec![v_str("Person")]),
+                v_arr(vec![v_str("Movie")]),
+            ]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ]);
+        assert_eq!(
+            parse_procedure_rows(reply).expect("the listing parses"),
+            vec!["Person".to_string(), "Movie".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_type_markers_are_rejected() {
+        let error = CellKind::from_marker(99).expect_err("marker 99 is not in the vocabulary");
+        assert!(
+            error.to_string().contains("unknown type marker 99"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn vec32_cells_mirror_the_password_faces_debug_rendering() {
+        // The crate does not export the Vec32 type, so the certificate face
+        // carries a String that must print exactly what the password face's
+        // Debug fallback prints for a real FalkorValue::Vec32.
+        let reply = v_arr(vec![
+            v_arr(vec![v_arr(vec![v_str("v")])]),
+            v_arr(vec![v_arr(vec![v_arr(vec![
+                v_int(12),
+                v_arr(vec![v_str("1.5"), v_str("2.5")]),
+            ])])]),
+            v_arr(vec![v_str("Query internal execution time: 0.1")]),
+        ]);
+        let mut caller = CannedProcedureCaller {
+            reply: reply.clone(),
+            schema: canned_schema(),
+        };
+        let (columns, rows) =
+            decode_query_reply(reply, &mut caller, "g", &mut GraphSchemaMaps::default())
+                .await
+                .expect("the vector reply decodes");
+        assert_eq!(columns, ["v"].map(String::from).to_vec());
+        let expected = format!(
+            "{:?}",
+            Vec32Mirror::Vec32(Vec32 {
+                values: vec![1.5_f32, 2.5]
+            })
+        );
+        assert_eq!(rows[0][0].as_deref(), Some(expected.as_str()));
+    }
+
+    /// Stand-ins with the same Debug shape as the crate's unexported
+    /// `FalkorValue::Vec32(Vec32 { values })`, so the mirrored text can be
+    /// asserted without naming the real type.
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    enum Vec32Mirror {
+        Vec32(Vec32),
+    }
+
+    #[allow(dead_code)]
+    #[derive(Debug)]
+    struct Vec32 {
+        values: Vec<f32>,
+    }
+
+    /// Opt-in live round trip for the certificate-face client leg, for
+    /// machines whose Docker daemon publishes ports that host loopback
+    /// cannot reach (the lan-linux2 limitation): point the address at the
+    /// container's bridge IP instead, with the same HOME that started the
+    /// instance (the CA material lives under `$HOME/.dctl/ca/`).
+    ///
+    /// ```text
+    /// DCTL_FK_TLS_TEST_ADDR=172.17.0.5:6379 \
+    ///   cargo test -p databasectl --bin dctl tls_cypher_live -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "opt-in live leg; needs a running certificate-face instance"]
+    async fn tls_cypher_live_round_trip() {
+        let address =
+            std::env::var("DCTL_FK_TLS_TEST_ADDR").expect("DCTL_FK_TLS_TEST_ADDR=<host>:<port>");
+        let (host, port) = address.rsplit_once(':').expect("address shaped host:port");
+        let port: u16 = port.parse().expect("numeric port");
+
+        tls_cypher_table(host, port, "g", "CREATE (n:LiveProbe {name: 'roundtrip'})")
+            .await
+            .expect("create over mTLS");
+        let table = tls_cypher_table(host, port, "g", "MATCH (n:LiveProbe) RETURN n")
+            .await
+            .expect("match over mTLS");
+        assert!(
+            table.contains("(:LiveProbe") && table.contains("name: roundtrip"),
+            "rendered table: {table}"
+        );
+        // A scalar round trip proves the header/rows decode without any
+        // schema refresh in the path.
+        let scalar = tls_cypher_table(host, port, "g", "RETURN 7 as seven")
+            .await
+            .expect("scalar over mTLS");
+        assert!(scalar.contains("7"), "scalar table: {scalar}");
     }
 
     struct FakeReadinessProbe {

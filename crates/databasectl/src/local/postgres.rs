@@ -273,7 +273,7 @@ async fn start(
     password: Option<String>,
     database: Option<String>,
     extra_env: Vec<String>,
-    auth: crate::local::cli::PostgresAuthArg,
+    auth: crate::local::cli::AuthFaceArg,
     wait_timeout: Duration,
     json: bool,
 ) -> Result<()> {
@@ -360,7 +360,7 @@ async fn start(
                     || password.is_some()
                     || database.is_some()
                     || has_extra_env
-                    || auth == crate::local::cli::PostgresAuthArg::Password)
+                    || auth == crate::local::cli::AuthFaceArg::Password)
             {
                 eprintln!(
                     "Note: postgres:{major} '{}' already exists; resuming with stored settings. \
@@ -393,7 +393,7 @@ async fn start(
         // then upload the material before the first start so postgres never
         // boots against missing files. The upload rides in the container
         // layer, so the rollback that removes the container cleans it too.
-        let tls = auth == crate::local::cli::PostgresAuthArg::Cert;
+        let tls = auth == crate::local::cli::AuthFaceArg::Cert;
 
         let opts = PostgresRunOpts {
             user_name: &user_name,

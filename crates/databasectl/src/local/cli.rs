@@ -324,10 +324,12 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   FalkorDB is a Redis-module graph database; queries are openCypher via GRAPH.QUERY.
-  An existing stopped instance for the same (name, version) is resumed with its stored password;
-  --port/--browser-port/--password/-e are ignored on a resume.
+  An existing stopped instance for the same (name, version) is resumed with its stored face;
+  --port/--browser-port/--password/--auth/-e are ignored on a resume.
   Without --version, an existing instance selects the version; two versions under one name error.
-  The generated password is printed once by start — re-read it later with `falkordb dotenv`.
+  Fresh starts default to the certificate face (ADR-0011): no usable password. The printed
+  password matters only on --auth password instances; connection details come from
+  `falkordb dotenv` or `falkordb client`.
   A failed fresh start rolls back the container and data it created; pre-existing data is kept.")]
     Falkordb {
         #[command(subcommand)]
@@ -368,6 +370,8 @@ pub enum FalkorCommands {
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Ports: 6379 (Redis protocol) and 3000 (Browser UI); auto-picked when busy, never the same port.
+  Fresh starts default to the certificate face (ADR-0011): the server is TLS-only and clients
+  authenticate with the dctl CA material; the printed password is not usable.
   The client's --query takes one Cypher statement, e.g.
   `falkordb client -q 'MATCH (n) RETURN n'`; redis-command passthrough
   retired 2026-09-22 (ADR-0009).
@@ -403,7 +407,8 @@ CONTEXT FOR AGENTS:
         #[arg(long, value_parser = crate::local::falkordb::parse_fk_port_arg)]
         browser_port: Option<u16>,
 
-        /// Redis password (default: random 24-char alphanumeric)
+        /// Redis password, effective only on --auth password starts
+        /// (default there: random 24-char alphanumeric)
         #[arg(long)]
         password: Option<String>,
 
@@ -426,6 +431,11 @@ CONTEXT FOR AGENTS:
             value_parser = clap::value_parser!(u16).range(1..=600)
         )]
         wait_timeout: u16,
+
+        /// Authentication face: certificate mTLS (default, ADR-0011) or
+        /// password. Ignored on resume; existing instances keep their face.
+        #[arg(long, value_enum, default_value_t = AuthFaceArg::Cert)]
+        auth: AuthFaceArg,
     },
 
     /// Stop a running FalkorDB instance
@@ -486,8 +496,9 @@ CONTEXT FOR AGENTS:
     /// Connect to a running FalkorDB instance with redis-cli
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Managed mode (the default; NAME selects one) connects with dctl's native FalkorDB client
-  over the container's published port; the stored password authenticates; no redis-cli needed.
+  Managed mode (the default; NAME selects one) connects with dctl's native FalkorDB client:
+  certificate instances (the start default) authenticate with the ~/.dctl/ca/ material over
+  TLS (REQ-0017), --auth password instances use the stored password; no redis-cli needed.
   Direct mode (--host/--port) connects to any Redis-protocol graph server; --password is optional.
   --query takes a Cypher statement (redis-command passthrough retired 2026-09-22, ADR-0009);
   --graph selects the graph (default \"g\"); piped stdin is one Cypher statement.
@@ -552,10 +563,12 @@ CONTEXT FOR AGENTS:
     /// Write FalkorDB connection env vars to a .env file
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
-  Writes FALKORDB_HOST, FALKORDB_PORT, FALKORDB_PASSWORD, FALKORDB_BROWSER_URL.
+  The face decides the shape (ADR-0011): certificate instances get FALKORDB_HOST/PORT/TLS=true
+  plus the CA_CERT/CLIENT_CERT/CLIENT_KEY material paths, with no password; --auth password
+  instances get FALKORDB_PASSWORD instead. FALKORDB_BROWSER_URL rides along either way.
   The instance must be running.
   Managed FALKORDB_* keys are replaced in place; other lines in the file are preserved.
-  Contains the password in plaintext — prefer --local and keep it out of version control.")]
+  Password-bearing output belongs in --local, out of version control.")]
     Dotenv {
         /// Instance name (default: "default")
         #[arg(value_name = "NAME", conflicts_with = "name_flag")]
@@ -764,10 +777,11 @@ CONTEXT FOR AGENTS:
     },
 }
 
-/// The Postgres authentication face (ADR-0011): certificate mTLS by
-/// default, password as the explicit migration fallback.
+/// The engine authentication face (ADR-0011): certificate mTLS by
+/// default, password as the explicit migration fallback. Shared by the
+/// engines that carry the mTLS legs.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PostgresAuthArg {
+pub(crate) enum AuthFaceArg {
     Cert,
     Password,
 }
@@ -845,8 +859,8 @@ CONTEXT FOR AGENTS:
 
         /// Authentication face: certificate mTLS (default, ADR-0011) or
         /// password. Ignored on resume; existing instances keep their face.
-        #[arg(long, value_enum, default_value_t = PostgresAuthArg::Cert)]
-        auth: PostgresAuthArg,
+        #[arg(long, value_enum, default_value_t = AuthFaceArg::Cert)]
+        auth: AuthFaceArg,
     },
 
     /// Stop a running Postgres instance
@@ -1077,11 +1091,7 @@ mod tests {
         else {
             panic!("expected postgres start");
         };
-        assert_eq!(
-            auth,
-            PostgresAuthArg::Cert,
-            "certificate face is the default"
-        );
+        assert_eq!(auth, AuthFaceArg::Cert, "certificate face is the default");
 
         let LocalCommands::Postgres {
             command: PostgresCommands::Start { auth, .. },
@@ -1089,7 +1099,26 @@ mod tests {
         else {
             panic!("expected postgres start");
         };
-        assert_eq!(auth, PostgresAuthArg::Password);
+        assert_eq!(auth, AuthFaceArg::Password);
+    }
+
+    #[test]
+    fn falkordb_start_auth_face_parses_with_cert_default() {
+        let LocalCommands::Falkordb {
+            command: FalkorCommands::Start { auth, .. },
+        } = local_command(&["falkordb", "start"])
+        else {
+            panic!("expected falkordb start");
+        };
+        assert_eq!(auth, AuthFaceArg::Cert, "certificate face is the default");
+
+        let LocalCommands::Falkordb {
+            command: FalkorCommands::Start { auth, .. },
+        } = local_command(&["falkordb", "start", "--auth", "password"])
+        else {
+            panic!("expected falkordb start");
+        };
+        assert_eq!(auth, AuthFaceArg::Password);
     }
 
     #[test]
