@@ -145,11 +145,28 @@ fn validate_start_options(
     native_port: Option<u16>,
     bind: Option<&str>,
     password: Option<&str>,
+    database: Option<&str>,
     config: Option<&str>,
     extra_env: Vec<String>,
 ) -> Result<StartPreflight> {
     if let Some(name) = name {
         server::validate_server_name(name)?;
+    }
+    // The database name is spliced into the certificate-face bootstrap SQL
+    // and the password-face env; either way it must be one plain identifier,
+    // not free-form text (review r2 G1).
+    if let Some(database) = database
+        && (database.is_empty()
+            || !database
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || database.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        return Err(Error::ClickhouseUsage(
+            "invalid --database: use a plain identifier (letters, digits, \
+             underscores; may not start with a digit)"
+                .into(),
+        ));
     }
     if let Some(version) = version {
         validate_ch_tag(version)?;
@@ -257,6 +274,7 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
         native_port,
         bind.as_deref(),
         password.as_deref(),
+        database.as_deref(),
         config.as_deref(),
         extra_env,
     )?;
@@ -395,6 +413,10 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             engine: Engine::Clickhouse,
             container_id: Some(container_id.clone()),
             tls: Some(tls),
+            // The certificate face carries no CLICKHOUSE_DB env (S005), so
+            // metadata remembers the requested database for client/dotenv
+            // (review r1 F5); the password face reads it from the env.
+            database: if tls { Some(database.clone()) } else { None },
         };
         // Issuance and upload live inside the rollback-covered block (the
         // material rides in the container layer, so removing the container
@@ -460,21 +482,43 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             .await);
         }
 
-        if tls {
+        let bootstrap = if tls {
             // The entrypoint skipped its database bootstrap (no CLICKHOUSE_DB
-            // on this face, S005); the certificate client creates it instead.
+            // on this face, S005); the in-container certificate client
+            // creates it over the secure native port instead - same
+            // published-port decoupling as the readiness probe, so this
+            // works everywhere (review r1 F4). A failure rolls the fresh
+            // start back like a readiness failure: leaving a running server
+            // without the requested database would be a half-product the
+            // next resume never repairs.
             if database != DEFAULT_DATABASE {
-                https_query(
-                    "127.0.0.1",
-                    http_port,
-                    DEFAULT_USER,
-                    None,
-                    &format!("CREATE DATABASE IF NOT EXISTS {database}"),
+                Some(
+                    docker::clickhouse_tls_query(
+                        &docker,
+                        &container_id,
+                        DEFAULT_USER,
+                        &format!("CREATE DATABASE IF NOT EXISTS {database}"),
+                    )
+                    .await,
                 )
-                .await?;
+            } else {
+                None
             }
         } else {
             warn_if_credentials_rejected(http_port, &user, &password, &database).await;
+            None
+        };
+        if let Some(Err(primary)) = bootstrap {
+            let metadata_lock = server::lock_metadata()?;
+            return Err(rollback_failed_fresh_start(
+                &docker,
+                &container_id,
+                &info,
+                remove_fresh_data_on_failure,
+                primary,
+                &metadata_lock,
+            )
+            .await);
         }
         let out = output::ClickhouseStartOutput {
             name: user_name,
@@ -713,6 +757,10 @@ async fn resume_existing(
     // provisioned, not the defaults. The password is intentionally not
     // reprinted (it is recoverable via `dotenv`).
     let (user, _password, database) = read_ch_env(docker, &container_id).await?;
+    // The stored startup database wins on the certificate face (review
+    // r2 F3): the env carries none there, and the fresh start reported
+    // the requested name - the resume output must not drift to default.
+    let database = prior.database.clone().unwrap_or(database);
 
     docker::start_existing(docker, &container_id).await?;
 
@@ -728,7 +776,12 @@ async fn resume_existing(
     let http_port = docker::host_port_from_inspect(inspected.as_ref(), "8123/tcp")
         .filter(|port| *port != 0)
         .unwrap_or(prior.http_port);
-    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), "9000/tcp")
+    let native_key = if prior.tls == Some(true) {
+        "9440/tcp"
+    } else {
+        "9000/tcp"
+    };
+    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), native_key)
         .filter(|port| *port != 0)
         .unwrap_or(prior.tcp_port);
     if http_port == 0 {
@@ -771,7 +824,12 @@ async fn resume_existing(
         let _ = docker::stop_container(docker, &container_id).await;
         return Err(error);
     }
-    warn_if_credentials_rejected(info.http_port, &user, &_password, &database).await;
+    // The credentials warning probes the plaintext HTTP port; on the
+    // certificate face that port is https and no password exists, so the
+    // probe would report a rejection that cannot happen (review F2).
+    if prior.tls != Some(true) {
+        warn_if_credentials_rejected(info.http_port, &user, &_password, &database).await;
+    }
 
     let out = output::ClickhouseStartOutput {
         name: display_name.clone(),
@@ -1390,6 +1448,20 @@ pub(crate) async fn client(cmd: ClientCmd) -> Result<()> {
         .ok_or_else(|| Error::DockerError("missing container_id".into()))?;
     let (user, password, db) = read_ch_env(&docker, container_id).await?;
     let tls = info.tls == Some(true);
+    // Certificate-face instances carry their requested database in metadata
+    // (no CLICKHOUSE_DB env rides the container, review r1 F5).
+    let db = info.database.clone().unwrap_or(db);
+    if tls && info.database.is_none() && database.is_none() {
+        // A recovered certificate instance has no database memory (the
+        // name rides neither the env nor the labels); say so instead of
+        // silently querying the default database (review r2 F3). With an
+        // explicit --database the user already chose - the note would
+        // describe the wrong query (review r3 F1).
+        eprintln!(
+            "Note: this instance was recovered without its startup database; \
+             querying the default database (pass --database to pick another)."
+        );
+    }
 
     if query.is_some() || queries_file.is_some() {
         let sql = read_query_input(query.as_deref(), queries_file.as_deref())?;
@@ -1607,9 +1679,20 @@ pub(crate) fn dotenv(
     }
     drop(metadata_lock);
 
-    let (user, password, database) = docker::block_on(read_ch_env_for_dotenv(
+    let (user, password, mut database) = docker::block_on(read_ch_env_for_dotenv(
         info.container_id.as_deref().unwrap_or_default(),
     ))?;
+    if let Some(stored) = info.database.clone() {
+        database = stored;
+    } else if info.tls == Some(true) {
+        // A recovered certificate instance has no database memory; the
+        // file carries the default, and the reader should know that is a
+        // fallback, not the provisioned name (review r3 F2).
+        eprintln!(
+            "Note: this instance was recovered without its startup database; \
+             CLICKHOUSE_DATABASE falls back to the default database."
+        );
+    }
 
     // The face decides the shape (ADR-0011): certificate instances get the
     // TLS material paths and no password; password instances keep the
@@ -1814,12 +1897,50 @@ mod tests {
             Some("192.0.2.1"),
             None,
             None,
+            None,
             Vec::new(),
         )
         .unwrap_err();
         assert!(
             matches!(error, Error::ClickhouseUsage(ref message) if message.contains("not present on this host")),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn validate_start_options_rejects_non_identifier_databases() {
+        for bad in ["", "has space", "semi;colon", "1starts_digit", "dash-name"] {
+            let error = validate_start_options(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(bad),
+                None,
+                Vec::new(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, Error::ClickhouseUsage(ref message) if message.contains("invalid --database")),
+                "{bad:?}: {error}"
+            );
+        }
+        assert!(
+            validate_start_options(
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("events_2"),
+                None,
+                Vec::new(),
+            )
+            .is_ok(),
+            "plain identifiers pass"
         );
     }
 }

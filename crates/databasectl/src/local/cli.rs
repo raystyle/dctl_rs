@@ -208,13 +208,13 @@ CONTEXT FOR AGENTS:
     #[command(after_help = "\
 CONTEXT FOR AGENTS:
   Default mode looks up a Docker-managed server; queries run via the HTTP interface:
-  certificate instances (the start default) ride https with the ~/.dctl/ca/ material and
-  the certificate auth header (REQ-0017), --auth password instances use stored
-  credentials; interactive mode is docker exec (secure port + in-container config).
-  Direct mode (--host/--port) connects via HTTP to any ClickHouse server; pass
-  --user/--password when that server requires auth (dctl-managed instances do).
-  The HTTP interface executes ONE statement per --query/--queries-file; use interactive
-  mode for multi-statement files. `--query` output stays native even with --json.")]
+  certificate instances (the start default) ride https with the ~/.dctl/ca/ material
+  and the certificate auth header, --auth password instances use stored credentials;
+  interactive mode is docker exec (secure port + in-container config).
+  Direct mode (--host/--port) connects via HTTP to any server; pass --user/--password
+  when it requires auth (certificate-face instances need managed mode instead).
+  The HTTP interface executes ONE statement per --query/--queries-file; use
+  interactive mode for multi-statement files. `--query` output stays native.")]
     Client {
         /// Server name to connect to (default: "default")
         #[arg(value_name = "NAME", conflicts_with_all = ["name_flag", "host", "port"])]

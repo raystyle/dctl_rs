@@ -456,6 +456,7 @@ async fn start(
             engine: Engine::Falkordb,
             container_id: Some(container_id.clone()),
             tls: Some(tls),
+            database: None,
         };
         // Issuance and upload live inside the rollback-covered block (the
         // material rides in the container layer, so removing the container

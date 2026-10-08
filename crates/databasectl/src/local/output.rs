@@ -728,6 +728,9 @@ pub struct PostgresStartOutput {
     pub image: String,
     pub port: u16,
     pub user: String,
+    /// Empty on the certificate face: no usable TCP password exists and
+    /// the row is omitted from both output shapes.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub password: String,
     pub database: String,
 }
@@ -739,7 +742,9 @@ impl fmt::Display for PostgresStartOutput {
         writeln!(f, "  Image:    {}", self.image)?;
         writeln!(f, "  Port:     {}", self.port)?;
         writeln!(f, "  User:     {}", self.user)?;
-        writeln!(f, "  Password: {}", self.password)?;
+        if !self.password.is_empty() {
+            writeln!(f, "  Password: {}", self.password)?;
+        }
         writeln!(f, "  Database: {}", self.database)?;
         write!(f, "  Connect:  dctl local postgres client {}", self.name)
     }
@@ -754,6 +759,9 @@ pub struct FalkorStartOutput {
     pub image: String,
     pub port: u16,
     pub browser_port: u16,
+    /// Empty on the certificate face: no password exists and the row is
+    /// omitted from both output shapes.
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub password: String,
 }
 
@@ -764,7 +772,9 @@ impl fmt::Display for FalkorStartOutput {
         writeln!(f, "  Image:   {}", self.image)?;
         writeln!(f, "  Port:    {}", self.port)?;
         writeln!(f, "  Browser: http://127.0.0.1:{}", self.browser_port)?;
-        writeln!(f, "  Password: {}", self.password)?;
+        if !self.password.is_empty() {
+            writeln!(f, "  Password: {}", self.password)?;
+        }
         write!(
             f,
             "  Connect:  dctl local falkordb client {} -q 'PING'",

@@ -843,6 +843,103 @@ pub async fn upload_clickhouse_tls_material(
     }
 }
 
+/// One SQL statement over the certificate face from inside the container
+/// (clickhouse-client on the secure native port with the uploaded client
+/// config) - the published-port-decoupled twin of the readiness probe,
+/// used by the certificate-face database bootstrap. Probe-shaped on
+/// purpose: no attached output (the machine channel must stay clean), the
+/// exit code is the verdict, and an unreadable status is a failure, never
+/// a silent success (review r2 F1).
+pub async fn clickhouse_tls_query(docker: &Docker, id: &str, user: &str, sql: &str) -> Result<()> {
+    use bollard::exec::{StartExecOptions, StartExecResults};
+    use bollard::models::ExecConfig;
+
+    let cmd = vec![
+        "clickhouse-client".to_string(),
+        "--secure".to_string(),
+        "--host".to_string(),
+        "127.0.0.1".to_string(),
+        "--port".to_string(),
+        "9440".to_string(),
+        "--user".to_string(),
+        user.to_string(),
+        "--config".to_string(),
+        format!("{CH_TLS_DIR_IN_CONTAINER}/cli.xml"),
+        "--query".to_string(),
+        sql.to_string(),
+    ];
+    let exec = docker
+        .create_exec(
+            id,
+            ExecConfig {
+                attach_stdout: Some(false),
+                attach_stderr: Some(false),
+                attach_stdin: Some(false),
+                tty: Some(false),
+                cmd: Some(cmd),
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    let started = docker
+        .start_exec(
+            &exec.id,
+            Some(StartExecOptions {
+                detach: true,
+                ..Default::default()
+            }),
+        )
+        .await
+        .map_err(|error| Error::DockerError(error.to_string()))?;
+    if !matches!(started, StartExecResults::Detached) {
+        eprintln!("clickhouse-client exec unexpectedly attached");
+        return Err(Error::ClickhouseUsage(
+            "could not confirm the in-container bootstrap finished; the attempt \
+             was rolled back"
+                .to_string(),
+        ));
+    }
+    for _ in 0..150 {
+        let inspect = docker.inspect_exec(&exec.id).await.map_err(|error| {
+            eprintln!("clickhouse-client exec inspect failed: {error}");
+            Error::ClickhouseUsage(
+                "could not confirm the in-container bootstrap finished; the attempt \
+                     was rolled back"
+                    .to_string(),
+            )
+        })?;
+        if inspect.running != Some(true) {
+            return match inspect.exit_code {
+                Some(0) => Ok(()),
+                Some(code) => {
+                    eprintln!("clickhouse-client exited with status {code}");
+                    Err(Error::ClickhouseUsage(
+                        "the in-container database bootstrap failed; the attempt was \
+                         rolled back"
+                            .to_string(),
+                    ))
+                }
+                // An absent exit code after the run ended is unknowable
+                // state: treating it as success would resurrect the
+                // half-product this path exists to prevent.
+                None => Err(Error::ClickhouseUsage(
+                    "the in-container bootstrap finished without an exit status; the \
+                     attempt was rolled back"
+                        .to_string(),
+                )),
+            };
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    eprintln!("clickhouse-client exec did not exit within 3 seconds");
+    Err(Error::ClickhouseUsage(
+        "the in-container database bootstrap did not finish in time; the attempt \
+         was rolled back"
+            .to_string(),
+    ))
+}
+
 /// Face-aware readiness for the certificate face: an in-container wget over
 /// https with the uploaded client pair and the certificate auth header
 /// (S005). The published port is never touched, so this probe works even
@@ -1605,19 +1702,24 @@ async fn list_project_engine(
                 .find(|p| p.private_port == protocol_port)
                 .and_then(|p| p.public_port)
         });
-        let secondary_private = match engine {
-            ENGINE_FALKORDB => 3000,
-            ENGINE_CLICKHOUSE => 9000,
-            _ => 0,
+        // ClickHouse's native secondary is the secure 9440 on the
+        // certificate face and 9000 on the password face (S005); either
+        // published face is the native port for recovery purposes.
+        let secondary_candidates: &[u16] = match engine {
+            ENGINE_FALKORDB => &[3000],
+            ENGINE_CLICKHOUSE => &[9440, 9000],
+            _ => &[],
         };
-        let secondary_port = if secondary_private == 0 {
+        let secondary_port = if secondary_candidates.is_empty() {
             None
         } else {
             c.ports.as_ref().and_then(|ports| {
-                ports
-                    .iter()
-                    .find(|p| p.private_port == secondary_private)
-                    .and_then(|p| p.public_port)
+                secondary_candidates.iter().find_map(|private| {
+                    ports
+                        .iter()
+                        .find(|p| p.private_port == *private)
+                        .and_then(|p| p.public_port)
+                })
             })
         };
         out.push(DiscoveredContainer {
@@ -2121,6 +2223,7 @@ pub fn recover_project_postgres_blocking(
                 engine: Engine::Postgres,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -2180,6 +2283,7 @@ pub fn recover_project_clickhouse_blocking(
                 engine: Engine::Clickhouse,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }
@@ -2245,6 +2349,7 @@ pub fn recover_project_falkor_blocking(
                 engine: Engine::Falkordb,
                 container_id: Some(c.container_id.clone()),
                 tls,
+                database: None,
             };
             save_server_info_locked(&info, lock)?;
         }

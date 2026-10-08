@@ -195,10 +195,20 @@ mod tests {
         // real ~/.dctl (the one issuance test is the only HOME-touching unit
         // test, so the env swap cannot race a sibling).
         let scratch = tempfile::tempdir().expect("scratch home");
-        // Single-threaded by construction (the only HOME-touching unit
-        // test), so the env swap cannot race a sibling.
+        // Swap HOME for the issuance only, restoring afterwards so sibling
+        // tests in the same process never observe the scratch path (the
+        // swap itself stays single-threaded: this is the only HOME-touching
+        // unit test).
+        let original = std::env::var("HOME").ok();
         unsafe { std::env::set_var("HOME", scratch.path()) };
-        let (cert, key) = issue_server_cert("dctl-pg-default-18").unwrap();
+        let issued = issue_server_cert("dctl-pg-default-18");
+        unsafe {
+            std::env::remove_var("HOME");
+            if let Some(home) = original {
+                std::env::set_var("HOME", home);
+            }
+        }
+        let (cert, key) = issued.unwrap();
         assert!(cert.contains("CERTIFICATE"));
         assert!(key.contains("PRIVATE KEY"));
         assert!(
