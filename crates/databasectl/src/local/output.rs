@@ -359,6 +359,10 @@ impl LocalErrorOutput {
             Error::Postgres(_) => {
                 Mapping::redacted(LocalErrorCode::LocalError, "Local command failed")
             }
+            // Unified under the LocalError code by decision (2026-10-08):
+            // both are local auxiliary faces, no consumer branches on a
+            // dedicated code, and their self-composed texts carry the
+            // detail; a per-face code would add surface without a reader.
             Error::Skills(_) => Mapping::parity(LocalErrorCode::LocalError),
             Error::Ledger(_) => Mapping::parity(LocalErrorCode::LocalError),
             Error::ChildExit(_) => {
@@ -771,7 +775,11 @@ impl fmt::Display for FalkorStartOutput {
         writeln!(f, "FalkorDB '{}' running (container: {})", self.name, short)?;
         writeln!(f, "  Image:   {}", self.image)?;
         writeln!(f, "  Port:    {}", self.port)?;
-        writeln!(f, "  Browser: http://127.0.0.1:{}", self.browser_port)?;
+        // 0 = unavailable (certificate face: the Browser backend speaks
+        // plaintext redis, which the TLS-only listener closed).
+        if self.browser_port != 0 {
+            writeln!(f, "  Browser: http://127.0.0.1:{}", self.browser_port)?;
+        }
         if !self.password.is_empty() {
             writeln!(f, "  Password: {}", self.password)?;
         }

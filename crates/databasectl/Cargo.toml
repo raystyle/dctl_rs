@@ -1,6 +1,6 @@
 [package]
 name = "databasectl"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 description = "dctl (DataBase Control): unified Docker container lifecycle management for ClickHouse, Postgres and FalkorDB; no database CLIs needed on the host."
 license = "Apache-2.0"

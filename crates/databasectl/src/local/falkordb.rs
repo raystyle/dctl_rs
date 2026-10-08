@@ -519,6 +519,18 @@ async fn start(
             .await);
         }
 
+        if tls {
+            // The Browser UI's backend speaks plaintext redis, which the
+            // TLS-only listener closed: it does not start on this face
+            // (live-probed 2026-10-08). Say so instead of printing a dead
+            // URL.
+            if !json {
+                eprintln!(
+                    "Note: the Browser UI is unavailable on the certificate face \
+                     (its backend speaks plaintext redis)."
+                );
+            }
+        }
         let out = output::FalkorStartOutput {
             name: user_name,
             container_id,
@@ -842,7 +854,11 @@ async fn resume_existing(
         container_id,
         image: info.version,
         port: info.tcp_port,
-        browser_port: info.http_port,
+        browser_port: if prior.tls == Some(true) {
+            0
+        } else {
+            info.http_port
+        },
         password,
     };
     output::print_output(&out, json);
@@ -2297,6 +2313,9 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
     let vars: Vec<(&str, String)> = if info.tls == Some(true) {
         let ca = crate::local::ca::ensure_ca()?;
         let (cert, key) = crate::local::ca::client_cert(FK_ACL_USER)?;
+        // No FALKORDB_BROWSER_URL on this face: the Browser UI's backend
+        // speaks plaintext redis, which the TLS-only listener closed - it
+        // does not start (live-probed 2026-10-08; the URL would be dead).
         vec![
             ("FALKORDB_HOST", "127.0.0.1".to_string()),
             ("FALKORDB_PORT", tcp_port),
@@ -2304,7 +2323,6 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
             ("FALKORDB_CA_CERT", ca.display().to_string()),
             ("FALKORDB_CLIENT_CERT", cert.display().to_string()),
             ("FALKORDB_CLIENT_KEY", key.display().to_string()),
-            ("FALKORDB_BROWSER_URL", browser_url),
         ]
     } else {
         vec![
@@ -2339,7 +2357,8 @@ fn dotenv(name: Option<&str>, version: Option<&str>, use_local: bool, json: bool
                         | "FALKORDB_CA_CERT"
                         | "FALKORDB_CLIENT_CERT"
                         | "FALKORDB_CLIENT_KEY"
-                ) || (strip_password && key == "FALKORDB_PASSWORD");
+                ) || (strip_password && key == "FALKORDB_PASSWORD")
+                    || (strip_password && key == "FALKORDB_BROWSER_URL");
                 !face_key
             })
             .chain(std::iter::once(""))

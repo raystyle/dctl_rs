@@ -13,7 +13,7 @@ $ dctl server stop
 Postgres 与 FalkorDB 同一套容器生命周期:
 
 ```console
-$ dctl postgres start        # 需要时拉取 postgres:18,打印生成的密码
+$ dctl postgres start        # 需要时拉取 postgres:18;证书面默认(零口令),--auth password 打印密码
 $ dctl postgres client -q 'SELECT version();'
 $ dctl postgres stop
 ```

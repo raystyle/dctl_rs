@@ -150,12 +150,20 @@ async fn verify_release_checksum(
     let sums_url = format!("{}/{}/SHA256SUMS", RELEASES_BASE_URL, tag);
     let response = client.get(&sums_url).send().await?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        // Transition policy, not a permanent one: once a release with
-        // SHA256SUMS exists, add a version floor (or drop this arm) so a
-        // missing asset can never again mean "skip verification" (fix-review
-        // G1). Transport errors are not 404 and are not passed through.
+        // Version floor (fix-review G1, closed with v0.8.0): releases from
+        // v0.8.0 on always publish SHA256SUMS, so a missing asset there is
+        // tampering or a broken release, never "skip verification".
+        // Pre-floor releases genuinely lack the asset and stay a warning.
+        // Transport errors are not 404 and are not passed through.
+        const CHECKSUM_FLOOR: (u32, u32, u32) = (0, 8, 0);
+        if parse_version(tag).is_some_and(|v| v >= CHECKSUM_FLOOR) {
+            return Err(Error::Download(format!(
+                "release {tag} publishes no SHA256SUMS asset; refusing to update \
+                 without integrity verification"
+            )));
+        }
         eprintln!(
-            "warning: release {tag} publishes no SHA256SUMS asset; \
+            "warning: release {tag} publishes no SHA256SUMS asset (pre-v0.8.0); \
              continuing without integrity verification"
         );
         return Ok(());
@@ -522,6 +530,17 @@ b3a1… dctl-x86_64-unknown-linux-musl-v0.8.0.tar.gz\n\
         assert_eq!(value["action"], "updated");
         assert_eq!(value["current_version"], "0.4.2");
         assert_eq!(value["latest_version"], "0.5.0");
+    }
+
+    #[test]
+    fn checksum_floor_rejects_modern_tags_without_sums() {
+        // The floor is a pure tag comparison on the 404 path; exercising it
+        // through HTTP needs a release-shaped server, so pin the decision
+        // helper the same way the arm reads it.
+        let above = parse_version("v0.8.0").unwrap() >= (0, 8, 0);
+        let below = parse_version("v0.7.0").unwrap() >= (0, 8, 0);
+        assert!(above, "v0.8.0 is at or above the floor");
+        assert!(!below, "v0.7.0 stays below the floor (warning path)");
     }
 
     #[test]

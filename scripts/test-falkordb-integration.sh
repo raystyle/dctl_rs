@@ -139,6 +139,9 @@ case_cert_face_dotenv_shape() {
     grep -q "^FALKORDB_CLIENT_CERT=" .env || { die "no FALKORDB_CLIENT_CERT"; return 1; }
     grep -q "^FALKORDB_CLIENT_KEY=" .env || { die "no FALKORDB_CLIENT_KEY"; return 1; }
     if grep -q "^FALKORDB_PASSWORD=" .env; then die "cert face emitted a password"; return 1; fi
+    # The Browser UI's backend speaks plaintext redis, which the TLS-only
+    # listener closed: the face emits no dead URL.
+    if grep -q "^FALKORDB_BROWSER_URL=" .env; then die "cert face emitted a browser URL"; return 1; fi
     "$CTL" local falkordb stop c >/dev/null 2>&1
     "$CTL" local falkordb remove c >/dev/null 2>&1
 }

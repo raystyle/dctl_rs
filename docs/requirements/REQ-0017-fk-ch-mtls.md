@@ -40,6 +40,7 @@ ADR-0011(accepted)裁定三引擎免密 mTLS;PG 腿已闭环(REQ-0016:证书面�
 - [x] dotenv 证书形;`--auth password` 回落;named user 在证书面报用法错(镜像仅 default 用户)
 - [x] 实弹:CH 电池 10/10(lan-linux2;password 面用例在该机记注 SKIP = 宿主不可达发布口,CI runner 真跑);PG 电池复跑 14/16(F1 修复实证:cert 面 start/dotenv/resume 全绿,两败皆宿主连接类环境限制);宿主 https 腿的错误文案实证(trust chain 与可达性自撰句)
 - 记档:证书面 readiness 刻意不探宿主发布口(发布口解耦设计,S005/电池头在档);宿主客户端是发布口不通的第一发现人,CI runner 与可达环境由电池/实弹覆盖(grok-G1 不采纳的理由)
+- 记档:FK 证书面 Browser 证断(2026-10-08 实测:TLS-only 监听关明文后 Browser 后端连不上、3000 口不起);处置 = 证书面 dotenv 不出 FALKORDB_BROWSER_URL、start 输出 browser 行隐藏并注记
 
 ### 共通
 
