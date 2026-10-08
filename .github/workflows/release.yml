@@ -156,9 +156,41 @@ jobs:
           cd release && sha256sum *.tar.gz > SHA256SUMS
           ls -l
 
+      - name: Collect default image digest manifest
+        # Fleet distribution contract (ai_ccoe/actl): every release carries
+        # the default engine images pinned by digest so the private registry
+        # can pre-mirror them. The list mirrors the source defaults
+        # (DEFAULT_CH_TAG / DEFAULT_FK_TAG / postgres majors); update it in
+        # the same PR that changes a default.
+        run: |
+          {
+            echo "# dctl ${GITHUB_REF_NAME} default image manifest (name:tag@digest)"
+            echo "# Authority: crates/databasectl/src/local/{clickhouse,falkordb,postgres}.rs"
+            echo "# The alpine image backs the privileged data-dir cleanup path."
+            for image in \
+              clickhouse/clickhouse-server:26.8 \
+              falkordb/falkordb:v4.20.6 \
+              falkordb/falkordb:latest \
+              postgres:18 \
+              postgres:17 \
+              postgres:18-alpine \
+              postgres:17-alpine \
+              alpine:latest
+            do
+              digest=$(docker manifest inspect "$image" 2>/dev/null \
+                | grep -m1 '"digest"' | sed 's/.*: //;s/"//')
+              if [ -n "$digest" ]; then
+                echo "$image@$digest"
+              else
+                echo "# UNRESOLVED: $image" >&2
+              fi
+            done
+          } > IMAGES.txt
+          cat IMAGES.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" --generate-notes release/*
+        run: gh release create "$TAG" --generate-notes release/* IMAGES.txt
 
