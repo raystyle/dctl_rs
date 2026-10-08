@@ -248,8 +248,11 @@ impl FakeDocker {
                         } else {
                             r#"["CLICKHOUSE_USER=app","CLICKHOUSE_PASSWORD=stored-secret","CLICKHOUSE_DB=events"]"#.to_string()
                         };
+                        // The certificate face publishes the native port
+                        // from tcp_port_secure 9440 (S005).
+                        let native_key = if tls { "9440/tcp" } else { "9000/tcp" };
                         let body = format!(
-                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":{env}}},"HostConfig":{{"PortBindings":{{"8123/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_http_port}"}}],"9000/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_native_port}"}}]}}}}}}"#
+                            r#"{{"Id":"{CONTAINER}","State":{{{state}}},"Config":{{"Env":{env}}},"HostConfig":{{"PortBindings":{{"8123/tcp":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_http_port}"}}],"{native_key}":[{{"HostIp":"127.0.0.1","HostPort":"{inspect_native_port}"}}]}}}}}}"#
                         );
                         write_json(&mut stream, 200, &body);
                     }

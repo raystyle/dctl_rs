@@ -1605,19 +1605,24 @@ async fn list_project_engine(
                 .find(|p| p.private_port == protocol_port)
                 .and_then(|p| p.public_port)
         });
-        let secondary_private = match engine {
-            ENGINE_FALKORDB => 3000,
-            ENGINE_CLICKHOUSE => 9000,
-            _ => 0,
+        // ClickHouse's native secondary is the secure 9440 on the
+        // certificate face and 9000 on the password face (S005); either
+        // published face is the native port for recovery purposes.
+        let secondary_candidates: &[u16] = match engine {
+            ENGINE_FALKORDB => &[3000],
+            ENGINE_CLICKHOUSE => &[9440, 9000],
+            _ => &[],
         };
-        let secondary_port = if secondary_private == 0 {
+        let secondary_port = if secondary_candidates.is_empty() {
             None
         } else {
             c.ports.as_ref().and_then(|ports| {
-                ports
-                    .iter()
-                    .find(|p| p.private_port == secondary_private)
-                    .and_then(|p| p.public_port)
+                secondary_candidates.iter().find_map(|private| {
+                    ports
+                        .iter()
+                        .find(|p| p.private_port == *private)
+                        .and_then(|p| p.public_port)
+                })
             })
         };
         out.push(DiscoveredContainer {

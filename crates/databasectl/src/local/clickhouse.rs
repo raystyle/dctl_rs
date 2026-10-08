@@ -460,21 +460,42 @@ pub(crate) async fn start(cmd: StartCmd) -> Result<()> {
             .await);
         }
 
-        if tls {
+        let bootstrap = if tls {
             // The entrypoint skipped its database bootstrap (no CLICKHOUSE_DB
             // on this face, S005); the certificate client creates it instead.
+            // A failure rolls the fresh start back like a readiness failure:
+            // leaving a running server without the requested database would
+            // be a half-product the next resume never repairs (review F4).
             if database != DEFAULT_DATABASE {
-                https_query(
-                    "127.0.0.1",
-                    http_port,
-                    DEFAULT_USER,
-                    None,
-                    &format!("CREATE DATABASE IF NOT EXISTS {database}"),
+                Some(
+                    https_query(
+                        "127.0.0.1",
+                        http_port,
+                        DEFAULT_USER,
+                        None,
+                        &format!("CREATE DATABASE IF NOT EXISTS {database}"),
+                    )
+                    .await
+                    .map(|_| ()),
                 )
-                .await?;
+            } else {
+                None
             }
         } else {
             warn_if_credentials_rejected(http_port, &user, &password, &database).await;
+            None
+        };
+        if let Some(Err(primary)) = bootstrap {
+            let metadata_lock = server::lock_metadata()?;
+            return Err(rollback_failed_fresh_start(
+                &docker,
+                &container_id,
+                &info,
+                remove_fresh_data_on_failure,
+                primary,
+                &metadata_lock,
+            )
+            .await);
         }
         let out = output::ClickhouseStartOutput {
             name: user_name,
@@ -728,7 +749,12 @@ async fn resume_existing(
     let http_port = docker::host_port_from_inspect(inspected.as_ref(), "8123/tcp")
         .filter(|port| *port != 0)
         .unwrap_or(prior.http_port);
-    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), "9000/tcp")
+    let native_key = if prior.tls == Some(true) {
+        "9440/tcp"
+    } else {
+        "9000/tcp"
+    };
+    let tcp_port = docker::host_port_from_inspect(inspected.as_ref(), native_key)
         .filter(|port| *port != 0)
         .unwrap_or(prior.tcp_port);
     if http_port == 0 {
@@ -771,7 +797,12 @@ async fn resume_existing(
         let _ = docker::stop_container(docker, &container_id).await;
         return Err(error);
     }
-    warn_if_credentials_rejected(info.http_port, &user, &_password, &database).await;
+    // The credentials warning probes the plaintext HTTP port; on the
+    // certificate face that port is https and no password exists, so the
+    // probe would report a rejection that cannot happen (review F2).
+    if prior.tls != Some(true) {
+        warn_if_credentials_rejected(info.http_port, &user, &_password, &database).await;
+    }
 
     let out = output::ClickhouseStartOutput {
         name: display_name.clone(),
