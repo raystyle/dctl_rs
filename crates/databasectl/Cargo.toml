@@ -55,7 +55,7 @@ fred = { version = "10.1.0", default-features = false, features = ["enable-rustl
 rcgen = "0.14.10"
 tokio-postgres-rustls = "0.14.0"
 rustls-pemfile = "2.2.0"
-rustls = { version = "0.23.45", features = ["std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["std", "ring"] }
 sha2 = "0.10"
 
 [dev-dependencies]
