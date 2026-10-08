@@ -105,7 +105,9 @@ case_cert_face_serves_tls() {
     local pong; pong=$(docker exec "$cid" $FK_TLS_CLI ping 2>&1)
     [[ "$pong" == "PONG" ]] || { die "TLS ping: $pong"; return 1; }
     local one; one=$(docker exec "$cid" $FK_TLS_CLI GRAPH.QUERY g "RETURN 1" 2>&1 | tr -d '\r')
-    echo "$one" | grep -q "(integer) 1" || { die "GRAPH.QUERY over TLS: $one"; return 1; }
+    # Non-interactive redis-cli prints a bare integer line for scalar
+    # replies (no "(integer)" decoration).
+    echo "$one" | grep -qx 1 || { die "GRAPH.QUERY over TLS: $one"; return 1; }
     # Recorded, not failed (review G5): the Browser UI's own listener on
     # 3000 — the server's plaintext redis listener is off on this face, so
     # whether the browser still works is an open product question.
